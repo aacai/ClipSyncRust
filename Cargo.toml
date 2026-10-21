@@ -22,8 +22,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
 futures = "0.3.34"
+async-channel = "2.5.0"
 tokio = { version = "1.54.0", features = ["rt-multi-thread", "macros", "time", "sync"] }
-mqtt5 = { version = "0.48.2", features = ["util", "client"] }
+mqtt5 = { version = "0.48.2", default-features = false }
 tracing = "0.1.44"
 eframe = "0.37.0"
 egui = "0.37.0"

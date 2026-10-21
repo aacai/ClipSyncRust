@@ -44,9 +44,25 @@ pub fn random_iv() -> [u8; IV_SIZE] {
     iv
 }
 
-pub fn aes_gcm_encrypt(key: &[u8], iv: &[u8], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, ()> {
-    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| ())?;
-    let nonce = aes_gcm::Nonce::<<Aes256Gcm as AeadCore>::NonceSize>::try_from(iv).map_err(|_| ())?;
+#[derive(Debug, thiserror::Error)]
+pub enum CryptoError {
+    #[error("aes-256 key must be {KEY_SIZE} bytes")]
+    BadKeyLength,
+    #[error("nonce must be {IV_SIZE} bytes")]
+    BadNonceLength,
+    #[error("aes-gcm rejected the frame")]
+    Aead,
+}
+
+pub fn aes_gcm_encrypt(
+    key: &[u8],
+    iv: &[u8],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| CryptoError::BadKeyLength)?;
+    let nonce = aes_gcm::Nonce::<<Aes256Gcm as AeadCore>::NonceSize>::try_from(iv)
+        .map_err(|_| CryptoError::BadNonceLength)?;
     cipher
         .encrypt(
             &nonce,
@@ -55,12 +71,18 @@ pub fn aes_gcm_encrypt(key: &[u8], iv: &[u8], aad: &[u8], plaintext: &[u8]) -> R
                 aad,
             },
         )
-        .map_err(|_| ())
+        .map_err(|_| CryptoError::Aead)
 }
 
-pub fn aes_gcm_decrypt(key: &[u8], iv: &[u8], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, ()> {
-    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| ())?;
-    let nonce = aes_gcm::Nonce::<<Aes256Gcm as AeadCore>::NonceSize>::try_from(iv).map_err(|_| ())?;
+pub fn aes_gcm_decrypt(
+    key: &[u8],
+    iv: &[u8],
+    aad: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| CryptoError::BadKeyLength)?;
+    let nonce = aes_gcm::Nonce::<<Aes256Gcm as AeadCore>::NonceSize>::try_from(iv)
+        .map_err(|_| CryptoError::BadNonceLength)?;
     cipher
         .decrypt(
             &nonce,
@@ -69,5 +91,5 @@ pub fn aes_gcm_decrypt(key: &[u8], iv: &[u8], aad: &[u8], ciphertext: &[u8]) -> 
                 aad,
             },
         )
-        .map_err(|_| ())
+        .map_err(|_| CryptoError::Aead)
 }

@@ -1,14 +1,15 @@
 use base64::{prelude::BASE64_STANDARD, Engine};
 use clipsync_core::envelope::{ClipEnvelope, ClipPayload, PresenceEnvelope};
 use clipsync_core::protocol::{
-    clip_topic, client_id, parse_topic, presence_topic, room_filter, room_hash, safety_number,
-    safety_prefix, sync_topic, text_mid, file_mid, Channel,
+    client_id, clip_topic, file_mid, parse_topic, presence_topic, room_filter, room_hash,
+    safety_number, safety_prefix, sync_topic, text_mid, Channel,
 };
 use clipsync_core::room::RoomCrypto;
 
 const ROOM: &str = "TESTROOM01";
 const AAD: &[u8] = b"cs/v1/prefixclip";
-const BROWSER_WIRE: &str = "AAECAwQFBgcICQoL+gx2TX+MMFr0F0nlliSlOqTsWYyEZTm3yisCAhw8KjnBqt5N2xJ/xzCxxu9VZLqQH7g=";
+const BROWSER_WIRE: &str =
+    "AAECAwQFBgcICQoL+gx2TX+MMFr0F0nlliSlOqTsWYyEZTm3yisCAhw8KjnBqt5N2xJ/xzCxxu9VZLqQH7g=";
 const BROWSER_TEXT: &str = "{\"text\":\"hello clipsync\",\"len\":15}";
 
 fn key_hex(room: &str, password: &str) -> String {
@@ -94,7 +95,8 @@ fn restore_rejects_wrong_key_size() {
 
 #[test]
 fn safety_number_matches_independent_sha256() {
-    let key = hex::decode("0c507ff2ecd664e9c25d92bc01ab781e257e2a85c7f72b9b911ccdbd1513e16e").unwrap();
+    let key =
+        hex::decode("0c507ff2ecd664e9c25d92bc01ab781e257e2a85c7f72b9b911ccdbd1513e16e").unwrap();
     assert_eq!(safety_number(&key), "157 030 228 012 167 001");
     assert_eq!(safety_prefix("157 030 228 012 167 001"), "157");
     assert_eq!(
@@ -106,7 +108,10 @@ fn safety_number_matches_independent_sha256() {
 #[test]
 fn message_ids_match_independent_sha256() {
     assert_eq!(text_mid(BROWSER_TEXT, "dev-1"), "261a17dceecbce2d");
-    assert_eq!(file_mid("report.pdf", 5 * 1024 * 1024, "dev-1"), "a9fddd59602bfaeb");
+    assert_eq!(
+        file_mid("report.pdf", 5 * 1024 * 1024, "dev-1"),
+        "a9fddd59602bfaeb"
+    );
 }
 
 #[test]
@@ -131,10 +136,16 @@ fn topic_parsing_rejects_foreign_shapes() {
         })
     );
     assert_eq!(
-        parse_topic(&presence_topic(&hash, "device-1")).unwrap().device_id.as_deref(),
+        parse_topic(&presence_topic(&hash, "device-1"))
+            .unwrap()
+            .device_id
+            .as_deref(),
         Some("device-1")
     );
-    assert_eq!(parse_topic(&sync_topic(&hash)).unwrap().channel, Channel::Sync);
+    assert_eq!(
+        parse_topic(&sync_topic(&hash)).unwrap().channel,
+        Channel::Sync
+    );
     assert_eq!(parse_topic(&format!("cs/v1/{hash}/unknown")), None);
     assert_eq!(parse_topic(&format!("other/{hash}/clip")), None);
     assert_eq!(parse_topic(&format!("cs/v1/{hash}/clip/extra")), None);

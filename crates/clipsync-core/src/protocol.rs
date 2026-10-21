@@ -92,6 +92,20 @@ pub fn safety_prefix(safety: &str) -> String {
     safety.split(' ').next().unwrap_or_default().to_string()
 }
 
+/// kotlinx 的 String.length 是 UTF-16 码元数，网页端与 Android 都按这个长度显示。
+pub fn utf16_len(text: &str) -> usize {
+    text.chars()
+        .map(|c| if c as u32 <= 0xFFFF { 1 } else { 2 })
+        .sum()
+}
+
+pub fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or_default()
+}
+
 pub fn sha256_hex_prefix(data: &[u8], hex_chars: usize) -> String {
     hex::encode(&sha256(data)[..hex_chars / 2])
 }

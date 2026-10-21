@@ -2,7 +2,8 @@ use base64::{prelude::BASE64_STANDARD, Engine};
 use zeroize::Zeroizing;
 
 use crate::crypto::{
-    aes_gcm_decrypt, aes_gcm_encrypt, argon2id, random_iv, sha256, IV_SIZE, KEY_SIZE, TAG_SIZE,
+    aes_gcm_decrypt, aes_gcm_encrypt, argon2id, random_iv, sha256, CryptoError, IV_SIZE, KEY_SIZE,
+    TAG_SIZE,
 };
 use crate::protocol::{safety_number, safety_prefix};
 
@@ -18,8 +19,8 @@ pub enum RoomError {
     Base64,
     #[error("ciphertext too short")]
     TooShort,
-    #[error("decryption failed")]
-    Decrypt,
+    #[error("aes-gcm rejected the frame")]
+    Aead(#[from] CryptoError),
 }
 
 pub struct RoomCrypto {
@@ -87,14 +88,16 @@ impl RoomCrypto {
         if iv.len() != IV_SIZE {
             return Err(RoomError::TooShort);
         }
-        let body = aes_gcm_encrypt(&self.key[..], iv, aad, plaintext).map_err(|_| RoomError::Decrypt)?;
+        let body = aes_gcm_encrypt(&self.key[..], iv, aad, plaintext)?;
         let mut out = iv.to_vec();
         out.extend_from_slice(&body);
         Ok(out)
     }
 
     pub fn decrypt(&self, wire: &str, aad: &[u8]) -> Result<Vec<u8>, RoomError> {
-        let raw = BASE64_STANDARD.decode(wire).map_err(|_| RoomError::Base64)?;
+        let raw = BASE64_STANDARD
+            .decode(wire)
+            .map_err(|_| RoomError::Base64)?;
         self.decrypt_bytes(&raw, aad)
     }
 
@@ -102,6 +105,11 @@ impl RoomCrypto {
         if raw.len() < IV_SIZE + TAG_SIZE {
             return Err(RoomError::TooShort);
         }
-        aes_gcm_decrypt(&self.key[..], &raw[..IV_SIZE], aad, &raw[IV_SIZE..]).map_err(|_| RoomError::Decrypt)
+        Ok(aes_gcm_decrypt(
+            &self.key[..],
+            &raw[..IV_SIZE],
+            aad,
+            &raw[IV_SIZE..],
+        )?)
     }
 }
