@@ -1148,7 +1148,7 @@ impl ClipSyncApp {
                 Frame::new()
                     .fill(theme::glass_fill())
                     .stroke(Stroke::new(1.0, theme::p().glass_border))
-                    .corner_radius(CornerRadius::same(22))
+                    .corner_radius(CornerRadius::same(theme::BAR_RADIUS))
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 8],
                         blur: 28,
@@ -1177,6 +1177,12 @@ impl ClipSyncApp {
                         });
                     });
             });
+        theme::frost(
+            ctx,
+            response.response.rect,
+            theme::BAR_RADIUS,
+            theme::frost_layer(),
+        );
         if back {
             self.close_settings();
         }
@@ -2288,6 +2294,12 @@ impl ClipSyncApp {
                     self.header_toolbar(ui);
                 });
             });
+        theme::frost(
+            ctx,
+            response.response.rect,
+            theme::GLASS_RADIUS,
+            theme::frost_layer(),
+        );
         response.response.rect.bottom()
     }
 
@@ -2709,14 +2721,14 @@ impl ClipSyncApp {
                     .is_some_and(|record| record.pinned)
             });
         let pin_tip = if all_pinned { "取消置顶" } else { "置顶" };
-        egui::Area::new(Id::unique("selection-bar"))
+        let response = egui::Area::new(Id::unique("selection-bar"))
             .order(Order::Foreground)
             .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -20.0))
             .show(ctx, |ui| {
                 Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(0x1e, 0x24, 0x2d, 250))
-                    .stroke(Stroke::new(1.0, theme::p().border))
-                    .corner_radius(CornerRadius::same(18))
+                    .fill(theme::p().glass_fill)
+                    .stroke(Stroke::new(1.0, theme::p().glass_border))
+                    .corner_radius(CornerRadius::same(theme::BAR_RADIUS))
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 10],
                         blur: 30,
@@ -2764,6 +2776,12 @@ impl ClipSyncApp {
                         });
                     });
             });
+        theme::frost(
+            ctx,
+            response.response.rect,
+            theme::BAR_RADIUS,
+            theme::frost_layer(),
+        );
     }
 
     fn show_toast(&mut self, ctx: &egui::Context) {
@@ -4398,11 +4416,12 @@ fn transfer_banner(ui: &mut Ui, transfer: &TransferUi) {
         ),
     );
     let painter = ui.painter();
+    theme::frost(ui.ctx(), card, theme::BANNER_RADIUS, painter.layer_id());
     painter.rect(
         card,
-        CornerRadius::same(14),
-        theme::with_alpha(theme::p().card, 170),
-        Stroke::new(1.0, Color32::from_rgba_unmultiplied(0x3a, 0x2a, 0x33, 140)),
+        CornerRadius::same(theme::BANNER_RADIUS),
+        theme::glass_fill(),
+        Stroke::new(1.0, theme::p().glass_border),
         StrokeKind::Inside,
     );
     let kind = if transfer.upload { "上传" } else { "下载" };
