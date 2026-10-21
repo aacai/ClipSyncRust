@@ -28,12 +28,17 @@ pub struct Config {
     pub device_os: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Status {
+    #[default]
     Idle,
     Connecting,
-    Online { safety: String },
-    Offline { reason: Option<String> },
+    Online {
+        safety: String,
+    },
+    Offline {
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +53,7 @@ pub struct Peer {
 pub struct Clip {
     pub mid: String,
     pub text: String,
+    pub sender_id: String,
     pub sender_name: String,
     pub ts: i64,
     pub mine: bool,
@@ -381,6 +387,7 @@ impl<F: LinkFactory> Engine<F> {
         let _ = self.events.send(Event::Clip(Clip {
             mid: envelope.mid,
             text: payload.text,
+            sender_id: envelope.dev,
             sender_name: envelope.name,
             ts: envelope.ts,
             mine: false,
@@ -471,6 +478,7 @@ impl<F: LinkFactory> Engine<F> {
         let clip = Clip {
             mid: envelope.mid.clone(),
             text: text.to_string(),
+            sender_id: envelope.dev.clone(),
             sender_name: envelope.name.clone(),
             ts: envelope.ts,
             mine: true,
