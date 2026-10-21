@@ -1,4 +1,5 @@
 mod app;
+mod autostart;
 mod clipboard;
 mod icons;
 mod jobs;
@@ -9,13 +10,14 @@ mod text_tools;
 mod theme;
 mod transfer;
 mod translate;
+mod update;
 
 use std::net::TcpListener;
 
 use app::ClipSyncApp;
 use clipsync_core::engine;
 use clipsync_core::mqtt::BrokerLinks;
-use settings::Settings;
+use settings::{Preferences, Settings};
 use store::History;
 
 const SINGLE_INSTANCE_PORT: u16 = 48124;
@@ -32,13 +34,21 @@ fn main() -> eframe::Result {
     let engine = engine::spawn(BrokerLinks);
     let history = History::open(paths::app_dir().join("history.json"));
     let settings = Settings::open(paths::app_dir().join("settings.json"), &paths::install_id());
+    let preferences = Preferences::open(paths::app_dir().join("preferences.json"));
 
     eframe::run_native(
         "ClipSync",
         native_options(),
         Box::new(move |ctx| {
             theme::configure(&ctx.egui_ctx);
-            Ok(Box::new(ClipSyncApp::new(engine, history, settings)))
+            theme::apply(&ctx.egui_ctx, preferences.theme());
+            icons::install(&ctx.egui_ctx);
+            Ok(Box::new(ClipSyncApp::new(
+                engine,
+                history,
+                settings,
+                preferences,
+            )))
         }),
     )
 }

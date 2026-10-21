@@ -163,6 +163,19 @@ impl ClipboardWatcher {
         Some(text)
     }
 
+    /// Re-read the pasteboard as the new baseline, so turning watching back on does not
+    /// replay whatever changed while nobody was looking.
+    pub fn reseed(&mut self) {
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            return;
+        };
+        self.filter.mark_seen(clipboard.get_text().ok());
+        self.last_files = file_signature(clipboard);
+        self.last_image = image_fingerprint(clipboard);
+        self.own_files = None;
+        self.own_image = None;
+    }
+
     pub fn write(&mut self, text: &str) {
         self.filter.wrote(text);
         if let Some(clipboard) = self.clipboard.as_mut() {

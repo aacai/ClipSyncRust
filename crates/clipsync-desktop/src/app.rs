@@ -21,12 +21,16 @@ use crate::icons::{self, Icon};
 use crate::jobs::{
     self, DownloadAfter, DownloadRequest, JobContext, JobEvent, UploadRequest, UploadTarget,
 };
-use crate::settings::Settings;
+use crate::settings::{
+    normalize_nickname, Language, Preferences, Settings, ThemeMode, RETENTION_CHOICES,
+};
 use crate::store::{FileInfo, History, Record, KIND_FILE, KIND_TEXT};
 use crate::text_tools::{self, TextOp};
 use crate::theme;
 use crate::transfer::TransferClient;
 use crate::translate::{self, Failure as TranslateFailure, Target as TranslateTarget};
+use crate::update::{self, UpdateEvent, UpdateState};
+use crate::{autostart, paths};
 
 const TOAST_INFO: Duration = Duration::from_secs(4);
 const TOAST_ERROR: Duration = Duration::from_secs(6);
@@ -47,6 +51,7 @@ pub struct ClipSyncApp {
     engine: EngineHandle,
     history: History,
     settings: Settings,
+    preferences: Preferences,
     clipboard: ClipboardWatcher,
     status: Status,
     peers: Vec<Peer>,
@@ -58,13 +63,15 @@ pub struct ClipSyncApp {
     query: String,
     regex: bool,
     case_sensitive: bool,
-    write_incoming: bool,
     last_poll: Instant,
     cursor: Option<String>,
     picked: BTreeSet<String>,
     pick_mode: bool,
     nav_scroll: Option<String>,
     overlay: Option<Overlay>,
+    screen: Screen,
+    theme_mode: ThemeMode,
+    language: Language,
     focus_dialog: bool,
     focus_search: bool,
     toast: Option<Toast>,
@@ -82,8 +89,43 @@ pub struct ClipSyncApp {
     zoom: Option<String>,
     zoom_texture: Option<(String, TextureHandle)>,
     zoom_failed: Option<String>,
+    watch_clipboard: bool,
     watch_files: bool,
     watch_images: bool,
+    update: UpdateState,
+    update_rx: Option<mpsc::Receiver<UpdateEvent>>,
+    autostart_available: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Main,
+    Settings,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsChoice {
+    Theme,
+    Language,
+    Retention,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsAction {
+    Theme,
+    Language,
+    Retention,
+    Nickname,
+    RememberRoom(bool),
+    LaunchAtLogin(bool),
+    WatchClipboard(bool),
+    WatchImages(bool),
+    WatchFiles(bool),
+    DeleteExpired(bool),
+    LeaveRoom,
+    Quit,
+    CheckUpdate,
+    DownloadUpdate,
 }
 
 struct TransferUi {
@@ -116,7 +158,10 @@ enum Overlay {
     Safety,
     ClearAll,
     LeaveRoom,
-    Settings,
+    Choice(SettingsChoice),
+    Nickname {
+        input: String,
+    },
     NewEntry {
         text: String,
     },
@@ -164,6 +209,10 @@ enum DialogAction {
     ApplyOp(String, TextOp),
     AddLocal(String),
     ReplaceText(String, String),
+    SetTheme(ThemeMode),
+    SetLanguage(Language),
+    SetRetention(u32),
+    SaveNickname(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -236,12 +285,24 @@ impl Toast {
 }
 
 impl ClipSyncApp {
-    pub fn new(engine: EngineHandle, history: History, settings: Settings) -> Self {
+    pub fn new(
+        engine: EngineHandle,
+        history: History,
+        settings: Settings,
+        preferences: Preferences,
+    ) -> Self {
         let (job_tx, job_rx) = mpsc::channel();
+        let watch_clipboard = preferences.watch_clipboard();
+        let watch_files = preferences.watch_files();
+        let watch_images = preferences.watch_images();
+        let theme_mode = preferences.theme();
+        let language = preferences.language();
+        let autostart_available = autostart::is_available();
         let mut app = Self {
             engine,
             history,
             settings,
+            preferences,
             clipboard: ClipboardWatcher::new(),
             status: Status::Idle,
             peers: Vec::new(),
@@ -253,13 +314,15 @@ impl ClipSyncApp {
             query: String::new(),
             regex: false,
             case_sensitive: false,
-            write_incoming: true,
             last_poll: Instant::now(),
             cursor: None,
             picked: BTreeSet::new(),
             pick_mode: false,
             nav_scroll: None,
             overlay: None,
+            screen: Screen::Main,
+            theme_mode,
+            language,
             focus_dialog: false,
             focus_search: false,
             toast: None,
@@ -277,17 +340,55 @@ impl ClipSyncApp {
             zoom: None,
             zoom_texture: None,
             zoom_failed: None,
-            watch_files: true,
-            watch_images: true,
+            watch_clipboard,
+            watch_files,
+            watch_images,
+            update: UpdateState::Idle,
+            update_rx: None,
+            autostart_available,
         };
-        if let Some(session) = app.settings.session.clone() {
-            app.room_code = session.room;
-            app.password = session.password;
-            app.join();
+        let restore = app.preferences.remember_room() && app.settings.session.is_some();
+        if !app.preferences.remember_room() {
+            app.settings.forget();
+        }
+        if restore {
+            if let Some(session) = app.settings.session.clone() {
+                app.room_code = session.room;
+                app.password = session.password;
+                app.join();
+            }
         } else {
-            app.room_code = random_room_code();
+            app.room_code = app
+                .preferences
+                .last_room_code()
+                .map(str::to_string)
+                .unwrap_or_else(random_room_code);
+        }
+        if app.preferences.delete_expired() {
+            app.prune_expired();
+        }
+        if autostart_available && app.preferences.launch_at_login() {
+            let _ = autostart::set_enabled(true);
         }
         app
+    }
+
+    fn sender_name(&self) -> String {
+        let nickname = self.preferences.nickname();
+        if nickname.is_empty() {
+            paths::device_name()
+        } else {
+            nickname.to_string()
+        }
+    }
+
+    fn prune_expired(&mut self) {
+        let days = self.preferences.retention_days() as i64;
+        let cutoff = now_millis() - days * 86_400_000;
+        let count = self.history.remove_expired(cutoff);
+        if count > 0 {
+            self.notify(format!("清掉了 {count} 条过期条目"));
+        }
     }
 
     fn drain_events(&mut self) {
@@ -296,7 +397,10 @@ impl ClipSyncApp {
                 Event::Status(status) => {
                     if matches!(status, Status::Online { .. }) {
                         if let Some((room, password)) = self.pending_session.take() {
-                            self.settings.remember(&room, &password);
+                            self.preferences.remember_last_room(&room);
+                            if self.preferences.remember_room() {
+                                self.settings.remember(&room, &password);
+                            }
                         }
                     }
                     if matches!(status, Status::Idle) {
@@ -339,16 +443,9 @@ impl ClipSyncApp {
                 }
                 return;
             }
-            if self.write_incoming {
-                self.clipboard.write(&clip.text);
-            }
+            self.clipboard.write(&clip.text);
             if inserted {
-                let message = if self.write_incoming {
-                    format!("收到 {sender} 的文本，已进剪贴板")
-                } else {
-                    format!("收到 {sender} 的文本")
-                };
-                self.notify(message);
+                self.notify(format!("收到 {sender} 的文本，已进剪贴板"));
             }
         }
     }
@@ -465,13 +562,13 @@ impl ClipSyncApp {
     }
 
     fn poll_clipboard(&mut self) {
-        if self.last_poll.elapsed() < POLL_INTERVAL {
+        if !self.watch_clipboard || self.last_poll.elapsed() < POLL_INTERVAL {
             return;
         }
         self.last_poll = Instant::now();
         match self.clipboard.poll(self.watch_files, self.watch_images) {
             Some(Captured::Text(text)) => {
-                if self.joined {
+                if matches!(self.status, Status::Online { .. }) {
                     self.engine.publish_text(&text);
                 } else {
                     self.record_local(&text);
@@ -534,12 +631,13 @@ impl ClipSyncApp {
         let ts = now_millis();
         let id = new_id();
         let path = crate::paths::write_cache(&id, name, bytes).ok();
+        let sender_name = self.sender_name();
         self.history.add(Record {
             id: id.clone(),
             kind: KIND_FILE.to_string(),
             ts,
             sender_id: crate::paths::install_id(),
-            sender_name: crate::paths::device_name(),
+            sender_name,
             text: name.to_string(),
             file: Some(FileInfo {
                 name: name.to_string(),
@@ -579,12 +677,13 @@ impl ClipSyncApp {
 
     fn record_local(&mut self, text: &str) {
         let ts = now_millis();
+        let sender_name = self.sender_name();
         self.history.add(Record {
             id: new_id(),
             kind: KIND_TEXT.to_string(),
             ts,
             sender_id: crate::paths::install_id(),
-            sender_name: crate::paths::device_name(),
+            sender_name,
             text: text.to_string(),
             file: None,
             pinned: false,
@@ -632,12 +731,13 @@ impl ClipSyncApp {
         self.room_crypto = Some(Arc::new(crypto));
         self.room_hash = room_hash(&room);
         self.pending_session = Some((room.clone(), password.clone()));
+        let device_name = self.sender_name();
         self.engine.join(Config {
             room_id: room,
             password,
             room_key: Some(key),
             device_id: crate::paths::install_id(),
-            device_name: crate::paths::device_name(),
+            device_name,
             device_os: crate::paths::device_os().to_string(),
         });
         self.joined = true;
@@ -664,6 +764,444 @@ impl ClipSyncApp {
         self.pick_mode = false;
         self.picked.clear();
         self.notify("已退出房间");
+    }
+
+    fn open_settings(&mut self) {
+        self.screen = Screen::Settings;
+        self.overlay = None;
+        self.pick_mode = false;
+        self.picked.clear();
+    }
+
+    fn close_settings(&mut self) {
+        self.screen = Screen::Main;
+        self.overlay = None;
+    }
+
+    fn set_theme(&mut self, ctx: &egui::Context, mode: ThemeMode) {
+        self.theme_mode = mode;
+        self.preferences.set_theme(mode);
+        theme::apply(ctx, mode);
+        ctx.request_repaint();
+    }
+
+    fn set_language(&mut self, language: Language) {
+        self.language = language;
+        self.preferences.set_language(language);
+    }
+
+    fn set_remember_room(&mut self, enabled: bool) {
+        self.preferences.set_remember_room(enabled);
+        if !enabled {
+            self.settings.forget();
+        }
+    }
+
+    fn set_watch_clipboard(&mut self, enabled: bool) {
+        self.watch_clipboard = enabled;
+        self.preferences.set_watch_clipboard(enabled);
+        if enabled {
+            self.clipboard.reseed();
+            self.last_poll = Instant::now();
+        }
+    }
+
+    fn set_watch_images(&mut self, enabled: bool) {
+        self.watch_images = enabled;
+        self.preferences.set_watch_images(enabled);
+        if enabled {
+            self.clipboard.reseed();
+        }
+    }
+
+    fn set_watch_files(&mut self, enabled: bool) {
+        self.watch_files = enabled;
+        self.preferences.set_watch_files(enabled);
+        if enabled {
+            self.clipboard.reseed();
+        }
+    }
+
+    fn set_launch_at_login(&mut self, enabled: bool) {
+        if !self.autostart_available {
+            return;
+        }
+        match autostart::set_enabled(enabled) {
+            Ok(()) => self.preferences.set_launch_at_login(enabled),
+            Err(_) => self.notify_error("没能改到系统的登录项里"),
+        }
+    }
+
+    fn set_delete_expired(&mut self, enabled: bool) {
+        self.preferences.set_delete_expired(enabled);
+        if enabled {
+            self.prune_expired();
+        }
+    }
+
+    fn set_retention_days(&mut self, days: u32) {
+        self.preferences.set_retention_days(days);
+        if self.preferences.delete_expired() {
+            self.prune_expired();
+        }
+    }
+
+    fn set_nickname(&mut self, name: &str) {
+        let name = normalize_nickname(name);
+        self.preferences.set_nickname(&name);
+        let sender = self.sender_name();
+        self.engine.rename(&sender);
+    }
+
+    fn check_updates(&mut self) {
+        if matches!(
+            self.update,
+            UpdateState::Checking | UpdateState::Downloading { .. }
+        ) {
+            return;
+        }
+        self.update = UpdateState::Checking;
+        let (sender, receiver) = mpsc::channel();
+        self.update_rx = Some(receiver);
+        std::thread::spawn(move || {
+            let _ = sender.send(UpdateEvent::Checked(update::latest()));
+        });
+    }
+
+    fn download_update(&mut self) {
+        let UpdateState::Available {
+            asset: Some(asset), ..
+        } = &self.update
+        else {
+            return;
+        };
+        let asset = asset.clone();
+        self.update = UpdateState::Downloading {
+            asset: asset.clone(),
+            received: 0,
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.update_rx = Some(receiver);
+        std::thread::spawn(move || {
+            let progress = asset.clone();
+            let result = update::download(&asset.url, |received| {
+                let _ = sender.send(UpdateEvent::Progress(progress.clone(), received));
+            });
+            let _ = sender.send(UpdateEvent::Downloaded(asset, result));
+        });
+    }
+
+    fn drain_updates(&mut self) {
+        let mut events = Vec::new();
+        if let Some(receiver) = &self.update_rx {
+            while let Ok(event) = receiver.try_recv() {
+                events.push(event);
+            }
+        }
+        for event in events {
+            match event {
+                UpdateEvent::Checked(Ok(release)) => {
+                    self.update = if update::is_behind(env!("CARGO_PKG_VERSION"), &release.version)
+                    {
+                        let asset =
+                            update::asset_for(&release, paths::device_os(), &update::arch())
+                                .cloned();
+                        UpdateState::Available { release, asset }
+                    } else {
+                        UpdateState::UpToDate(release.version)
+                    };
+                }
+                UpdateEvent::Checked(Err(message)) => {
+                    self.update = UpdateState::Failed(message);
+                }
+                UpdateEvent::Progress(asset, received) => {
+                    if matches!(self.update, UpdateState::Downloading { .. }) {
+                        self.update = UpdateState::Downloading { asset, received };
+                    }
+                }
+                UpdateEvent::Downloaded(asset, Ok(bytes)) => {
+                    self.update = match paths::save_to_downloads(&asset.name, &bytes) {
+                        Ok(name) => UpdateState::Downloaded(name),
+                        Err(error) => UpdateState::Failed(error.to_string()),
+                    };
+                }
+                UpdateEvent::Downloaded(_, Err(message)) => {
+                    self.update = UpdateState::Failed(message);
+                }
+            }
+        }
+    }
+
+    fn settings_screen(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        let screen = ctx.content_rect();
+        let width = (screen.width() - 20.0).clamp(280.0, 640.0);
+        let bar_bottom = self.settings_bar(ctx);
+        let mut action: Option<SettingsAction> = None;
+
+        egui::CentralPanel::default()
+            .frame(Frame::new())
+            .show(ui, |ui| {
+                let left = screen.center().x - width / 2.0;
+                let rect = Rect::from_min_max(
+                    Pos2::new(left, screen.top()),
+                    Pos2::new(left + width, screen.bottom()),
+                );
+                ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("settings-scroll")
+                        .auto_shrink([false, false])
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                        )
+                        .show(ui, |ui| {
+                            ui.set_width(width);
+                            ui.add_space(bar_bottom - screen.top() + 14.0);
+                            ui.spacing_mut().item_spacing.y = 0.0;
+
+                            settings_group(ui, "外观", |ui| {
+                                if settings_nav_row(
+                                    ui,
+                                    "主题",
+                                    theme_label(self.theme_mode),
+                                ) {
+                                    action = Some(SettingsAction::Theme);
+                                }
+                                settings_divider(ui);
+                                if settings_nav_row(
+                                    ui,
+                                    "语言",
+                                    language_label(self.language),
+                                ) {
+                                    action = Some(SettingsAction::Language);
+                                }
+                            });
+                            ui.add_space(22.0);
+
+                            let joined = self.joined;
+                            let room = self.room_code.clone();
+                            let label = status_label(&self.status);
+                            let color = room_color(&self.status, joined);
+                            let remember = self.preferences.remember_room();
+                            let launch = self.preferences.launch_at_login();
+                            settings_group(ui, "同步", |ui| {
+                                settings_value_row(
+                                    ui,
+                                    "房间",
+                                    if joined { &room } else { "未共享" },
+                                    joined.then_some((label, color.unwrap_or(theme::p().muted))),
+                                    joined,
+                                    if joined { color } else { None },
+                                );
+                                if joined {
+                                    settings_divider(ui);
+                                    if settings_action_row(ui, "退出房间") {
+                                        action = Some(SettingsAction::LeaveRoom);
+                                    }
+                                }
+                                settings_divider(ui);
+                                if settings_switch_row(
+                                    ui,
+                                    "记住房间",
+                                    "重开时自动回到上次的房间。房间码明文存着方便重填，派生密钥和你输入的密码加密后存在本机设置里；离开房间即清除",
+                                    remember,
+                                ) {
+                                    action = Some(SettingsAction::RememberRoom(!remember));
+                                }
+                                if self.autostart_available {
+                                    settings_divider(ui);
+                                    if settings_switch_row(
+                                        ui,
+                                        "开机自动启动",
+                                        "登录后自动开始守剪贴板，先收进托盘不弹主窗口；要界面就点托盘图标",
+                                        launch,
+                                    ) {
+                                        action =
+                                            Some(SettingsAction::LaunchAtLogin(!launch));
+                                    }
+                                }
+                            });
+                            ui.add_space(22.0);
+
+                            let watch = self.watch_clipboard;
+                            let watch_images = self.watch_images;
+                            let watch_files = self.watch_files;
+                            settings_group(ui, "剪贴板", |ui| {
+                                if settings_switch_row(
+                                    ui,
+                                    "记录剪贴板",
+                                    "不进房间也会自动把你复制过的内容留进列表，仅保存在本机；关闭后只记录手动发送的条目",
+                                    watch,
+                                ) {
+                                    action = Some(SettingsAction::WatchClipboard(!watch));
+                                }
+                                if watch {
+                                    settings_divider(ui);
+                                    if settings_switch_row(
+                                        ui,
+                                        "记录截图",
+                                        "复制图片或截图后自动存进列表；在房间里同时发给同伴。超过上限的大图会被跳过",
+                                        watch_images,
+                                    ) {
+                                        action =
+                                            Some(SettingsAction::WatchImages(!watch_images));
+                                    }
+                                    settings_divider(ui);
+                                    if settings_switch_row(
+                                        ui,
+                                        "记录文件",
+                                        "复制文件后自动存进列表；在房间里同时发给同伴。超过上限的文件会被跳过",
+                                        watch_files,
+                                    ) {
+                                        action =
+                                            Some(SettingsAction::WatchFiles(!watch_files));
+                                    }
+                                }
+                            });
+                            ui.add_space(22.0);
+
+                            let delete_expired = self.preferences.delete_expired();
+                            let retention = self.preferences.retention_days();
+                            let nickname = self.sender_name();
+                            settings_group(ui, "关于", |ui| {
+                                settings_value_row(
+                                    ui,
+                                    "版本",
+                                    env!("CARGO_PKG_VERSION"),
+                                    None,
+                                    false,
+                                    None,
+                                );
+                                settings_divider(ui);
+                                if let Some(chosen) = settings_update_row(ui, &self.update) {
+                                    action = Some(chosen);
+                                }
+                                settings_divider(ui);
+                                settings_value_row(
+                                    ui,
+                                    "本地记录",
+                                    &format!("{} 条", self.history.items.len()),
+                                    None,
+                                    false,
+                                    None,
+                                );
+                                settings_divider(ui);
+                                if settings_switch_row(
+                                    ui,
+                                    "删除过期条目",
+                                    "开启后，超过保留时长的条目连同本机缓存一起清掉；置顶的条目不参与",
+                                    delete_expired,
+                                ) {
+                                    action =
+                                        Some(SettingsAction::DeleteExpired(!delete_expired));
+                                }
+                                if delete_expired {
+                                    settings_divider(ui);
+                                    if settings_nav_row(
+                                        ui,
+                                        "保留时长",
+                                        &format!("{retention} 天"),
+                                    ) {
+                                        action = Some(SettingsAction::Retention);
+                                    }
+                                }
+                                settings_divider(ui);
+                                if settings_nav_row(ui, "昵称", &nickname) {
+                                    action = Some(SettingsAction::Nickname);
+                                }
+                                settings_divider(ui);
+                                settings_value_row(
+                                    ui,
+                                    "所属系统",
+                                    paths::device_os(),
+                                    None,
+                                    false,
+                                    None,
+                                );
+                                settings_divider(ui);
+                                if settings_action_row(ui, "退出 ClipSync") {
+                                    action = Some(SettingsAction::Quit);
+                                }
+                            });
+                            ui.add_space(30.0);
+                        });
+                });
+            });
+
+        if let Some(action) = action {
+            self.apply_settings_action(ctx, action);
+        }
+    }
+
+    fn settings_bar(&mut self, ctx: &egui::Context) -> f32 {
+        let screen = ctx.content_rect();
+        let width = (screen.width() - 20.0).clamp(280.0, 640.0);
+        let pos = Pos2::new(
+            screen.center().x - width / 2.0,
+            screen.top() + theme::TOP_INSET + 4.0,
+        );
+        let mut back = false;
+        let response = egui::Area::new(Id::unique("settings-bar"))
+            .order(Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                ui.set_width(width);
+                Frame::new()
+                    .fill(theme::glass_fill())
+                    .stroke(Stroke::new(1.0, theme::p().glass_border))
+                    .corner_radius(CornerRadius::same(22))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 8],
+                        blur: 28,
+                        spread: 0,
+                        color: Color32::from_black_alpha(if theme::p().dark { 70 } else { 36 }),
+                    })
+                    .inner_margin(Margin {
+                        left: 8,
+                        right: 16,
+                        top: 9,
+                        bottom: 9,
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            if icons::icon_button(ui, Icon::ArrowBack, true, "返回").clicked() {
+                                back = true;
+                            }
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new("设置")
+                                    .size(16.0)
+                                    .strong()
+                                    .color(theme::p().text),
+                            );
+                        });
+                    });
+            });
+        if back {
+            self.close_settings();
+        }
+        response.response.rect.bottom()
+    }
+
+    fn apply_settings_action(&mut self, ctx: &egui::Context, action: SettingsAction) {
+        match action {
+            SettingsAction::Theme => self.open(Overlay::Choice(SettingsChoice::Theme)),
+            SettingsAction::Language => self.open(Overlay::Choice(SettingsChoice::Language)),
+            SettingsAction::Retention => self.open(Overlay::Choice(SettingsChoice::Retention)),
+            SettingsAction::Nickname => self.open(Overlay::Nickname {
+                input: self.preferences.nickname().to_string(),
+            }),
+            SettingsAction::RememberRoom(enabled) => self.set_remember_room(enabled),
+            SettingsAction::LaunchAtLogin(enabled) => self.set_launch_at_login(enabled),
+            SettingsAction::WatchClipboard(enabled) => self.set_watch_clipboard(enabled),
+            SettingsAction::WatchImages(enabled) => self.set_watch_images(enabled),
+            SettingsAction::WatchFiles(enabled) => self.set_watch_files(enabled),
+            SettingsAction::DeleteExpired(enabled) => self.set_delete_expired(enabled),
+            SettingsAction::LeaveRoom => self.open(Overlay::LeaveRoom),
+            SettingsAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            SettingsAction::CheckUpdate => self.check_updates(),
+            SettingsAction::DownloadUpdate => self.download_update(),
+        }
     }
 
     fn copy_to_clipboard(&mut self, text: &str, message: &str) {
@@ -1307,6 +1845,14 @@ impl ClipSyncApp {
             }
             return;
         }
+        if self.screen == Screen::Settings {
+            if self.overlay.is_none()
+                && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
+            {
+                self.close_settings();
+            }
+            return;
+        }
         if self.overlay.is_some() || egui::Popup::is_any_open(ctx) {
             return;
         }
@@ -1575,18 +2121,26 @@ impl ClipSyncApp {
 
 impl eframe::App for ClipSyncApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if !cfg!(target_os = "macos") {
-            ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
+        if self.theme_mode == ThemeMode::System
+            && theme::resolve_dark(ctx, self.theme_mode) != theme::p().dark
+        {
+            theme::apply(ctx, self.theme_mode);
         }
         self.drain_events();
         self.drain_jobs();
+        self.drain_updates();
         self.poll_clipboard();
         self.poll_translation();
         self.expire_toast();
+        let update_busy = matches!(
+            self.update,
+            UpdateState::Checking | UpdateState::Downloading { .. }
+        );
         let wait = if self.toast.is_some()
             || self.translate_rx.is_some()
             || self.transfer.is_some()
             || !self.pending_downloads.is_empty()
+            || update_busy
         {
             Duration::from_millis(120)
         } else {
@@ -1598,10 +2152,17 @@ impl eframe::App for ClipSyncApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.shortcuts(&ctx);
-        self.ensure_thumbnails(&ctx);
-        self.ensure_zoom(&ctx);
         theme::paint_background(&ctx, ctx.content_rect());
         self.paint_window_chrome(ui);
+        if self.screen == Screen::Settings {
+            self.settings_screen(ui, &ctx);
+            self.show_toast(&ctx);
+            self.show_overlay(&ctx);
+            self.history.flush();
+            return;
+        }
+        self.ensure_thumbnails(&ctx);
+        self.ensure_zoom(&ctx);
         self.header_bottom = self.header(&ctx);
 
         let mut events = Vec::new();
@@ -1740,8 +2301,8 @@ impl ClipSyncApp {
             if self.joined {
                 let room = self.room_code.clone();
                 let pill = Frame::new()
-                    .fill(theme::CARD)
-                    .stroke(Stroke::new(1.0, theme::with_alpha(theme::BORDER, 153)))
+                    .fill(theme::p().card)
+                    .stroke(Stroke::new(1.0, theme::with_alpha(theme::p().border, 153)))
                     .corner_radius(CornerRadius::same(6))
                     .inner_margin(Margin::symmetric(7, 3))
                     .show(ui, |ui| {
@@ -1749,12 +2310,12 @@ impl ClipSyncApp {
                             ui.spacing_mut().item_spacing.x = 5.0;
                             let (key_rect, _) =
                                 ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
-                            icons::paint(ui.painter(), key_rect, Icon::Key, theme::ACCENT);
+                            icons::paint(ui.painter(), key_rect, Icon::Key, theme::p().accent);
                             ui.label(
                                 RichText::new(&room)
                                     .monospace()
                                     .size(14.0)
-                                    .color(theme::TEXT),
+                                    .color(theme::p().text),
                             );
                         });
                     });
@@ -1770,14 +2331,14 @@ impl ClipSyncApp {
                     RichText::new("本地记录")
                         .size(14.5)
                         .strong()
-                        .color(theme::TEXT),
+                        .color(theme::p().text),
                 );
             }
             ui.add_space(8.0);
             ui.label(
                 RichText::new(status_label(&self.status))
                     .size(11.5)
-                    .color(theme::MUTED),
+                    .color(theme::p().muted),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
@@ -1786,7 +2347,7 @@ impl ClipSyncApp {
                     self.open(Overlay::LeaveRoom);
                 }
                 if icons::icon_button(ui, Icon::Settings, true, "设置").clicked() {
-                    self.open(Overlay::Settings);
+                    self.open_settings();
                 }
                 if icons::icon_button(ui, Icon::Help, true, "使用说明").clicked() {
                     self.open(Overlay::Help);
@@ -1816,14 +2377,14 @@ impl ClipSyncApp {
                 Vec2::splat(16.0),
             ),
             Icon::Devices,
-            theme::MUTED,
+            theme::p().muted,
         );
         ui.painter().text(
             Pos2::new(rect.right() - 10.0, rect.center().y),
             Align2::RIGHT_CENTER,
             self.peers.len().to_string(),
             FontId::proportional(11.0),
-            theme::MUTED,
+            theme::p().muted,
         );
         response
             .on_hover_cursor(CursorIcon::PointingHand)
@@ -1852,8 +2413,8 @@ impl ClipSyncApp {
         let row = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             let (shield_rect, _) = ui.allocate_exact_size(Vec2::splat(13.0), Sense::hover());
-            icons::paint(ui.painter(), shield_rect, Icon::Shield, theme::ACCENT);
-            ui.label(RichText::new(text).size(11.5).color(theme::MUTED));
+            icons::paint(ui.painter(), shield_rect, Icon::Shield, theme::p().accent);
+            ui.label(RichText::new(text).size(11.5).color(theme::p().muted));
         });
         let response = ui
             .interact(
@@ -1908,7 +2469,7 @@ impl ClipSyncApp {
             } else {
                 "清空历史"
             };
-            if icons::icon_button_tinted(ui, Icon::Trash, theme::RED, can_delete, delete_tip)
+            if icons::icon_button_tinted(ui, Icon::Trash, theme::p().red, can_delete, delete_tip)
                 .clicked()
             {
                 self.ask_delete();
@@ -1921,7 +2482,7 @@ impl ClipSyncApp {
         let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 52.0), Sense::hover());
         let focused = ui.ctx().memory(|memory| memory.has_focus(search_id()));
         let border = if focused {
-            theme::ACCENT.gamma_multiply(0.6)
+            theme::p().accent.gamma_multiply(0.6)
         } else {
             Color32::from_white_alpha(12)
         };
@@ -1940,7 +2501,7 @@ impl ClipSyncApp {
                 Vec2::splat(18.0),
             ),
             Icon::Search,
-            theme::MUTED,
+            theme::p().muted,
         );
 
         let chip_h = 26.0;
@@ -2016,7 +2577,7 @@ impl ClipSyncApp {
                 ui.painter(),
                 Rect::from_center_size(clear_rect.center(), Vec2::splat(14.0)),
                 Icon::Close,
-                theme::MUTED,
+                theme::p().muted,
             );
             if clear_response
                 .on_hover_cursor(CursorIcon::PointingHand)
@@ -2036,7 +2597,7 @@ impl ClipSyncApp {
             if banner(
                 ui,
                 Icon::Key,
-                theme::ACCENT,
+                theme::p().accent,
                 false,
                 "未共享：复制的内容只留在本机，进房间后才会同步给其他设备",
                 Some("共享"),
@@ -2045,7 +2606,14 @@ impl ClipSyncApp {
             }
         } else if matches!(self.status, Status::Offline { .. }) {
             let text = format!("与房间 {} 的连接已断开", self.room_code);
-            if banner(ui, Icon::Warning, theme::AMBER, false, &text, Some("重连")) {
+            if banner(
+                ui,
+                Icon::Warning,
+                theme::p().amber,
+                false,
+                &text,
+                Some("重连"),
+            ) {
                 events.push(AppEvent::Retry);
             }
         }
@@ -2054,13 +2622,13 @@ impl ClipSyncApp {
                 "同屋的 {} 安全码与本机不一致：多半是某一端的房间密码打错了，两边收不到彼此的剪贴板",
                 self.mismatch.join("、")
             );
-            banner(ui, Icon::Warning, theme::RED, true, &text, None);
+            banner(ui, Icon::Warning, theme::p().red, true, &text, None);
         }
         if self.invalid_regex() {
             banner(
                 ui,
                 Icon::Warning,
-                theme::RED,
+                theme::p().red,
                 true,
                 "正则表达式写错了，暂时搜不出结果",
                 None,
@@ -2087,7 +2655,7 @@ impl ClipSyncApp {
                 ui.painter(),
                 Rect::from_center_size(rect.center(), Vec2::splat(26.0)),
                 Icon::Clipboard,
-                theme::ACCENT,
+                theme::p().accent,
             );
             ui.add_space(14.0);
             if self.query.trim().is_empty() {
@@ -2095,13 +2663,13 @@ impl ClipSyncApp {
                     RichText::new("还没有剪贴板记录")
                         .size(16.0)
                         .strong()
-                        .color(theme::TEXT),
+                        .color(theme::p().text),
                 );
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new("复制过的内容会自动出现在这里，并在同房间的设备间同步")
                         .size(12.0)
-                        .color(theme::MUTED),
+                        .color(theme::p().muted),
                 );
                 ui.add_space(16.0);
                 if matches!(self.status, Status::Online { .. })
@@ -2114,13 +2682,13 @@ impl ClipSyncApp {
                     RichText::new(format!("没有匹配「{}」的记录", self.query.trim()))
                         .size(16.0)
                         .strong()
-                        .color(theme::TEXT),
+                        .color(theme::p().text),
                 );
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new("换个词试试，或关掉正则再搜")
                         .size(12.0)
-                        .color(theme::MUTED),
+                        .color(theme::p().muted),
                 );
             }
         });
@@ -2147,7 +2715,7 @@ impl ClipSyncApp {
             .show(ctx, |ui| {
                 Frame::new()
                     .fill(Color32::from_rgba_unmultiplied(0x1e, 0x24, 0x2d, 250))
-                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .stroke(Stroke::new(1.0, theme::p().border))
                     .corner_radius(CornerRadius::same(18))
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 10],
@@ -2162,7 +2730,7 @@ impl ClipSyncApp {
                             ui.label(
                                 RichText::new(format!("已选 {count} 条"))
                                     .size(12.0)
-                                    .color(theme::MUTED),
+                                    .color(theme::p().muted),
                             );
                             ui.add_space(4.0);
                             let enabled = count > 0;
@@ -2181,7 +2749,7 @@ impl ClipSyncApp {
                             if icons::icon_button_tinted(
                                 ui,
                                 Icon::Trash,
-                                theme::RED,
+                                theme::p().red,
                                 enabled,
                                 "删除所选",
                             )
@@ -2206,14 +2774,14 @@ impl ClipSyncApp {
         let mut undo_clicked = false;
         let error = toast.kind == ToastKind::Error;
         let fill = if error {
-            theme::ERROR_CONTAINER
+            theme::p().error_container
         } else {
-            theme::INVERSE_SURFACE
+            theme::p().inverse_surface
         };
         let text_color = if error {
-            theme::ON_ERROR_CONTAINER
+            theme::p().on_error_container
         } else {
-            theme::INVERSE_TEXT
+            theme::p().inverse_text
         };
         egui::Area::new(Id::unique("toast"))
             .order(Order::Foreground)
@@ -2267,6 +2835,8 @@ impl ClipSyncApp {
             Overlay::Safety => 440.0,
             Overlay::Transform { .. } => 460.0,
             Overlay::Translate { .. } => 520.0,
+            Overlay::Choice(_) => 360.0,
+            Overlay::Nickname { .. } => 400.0,
             _ => 420.0,
         };
         let response = egui::Modal::new(Id::unique("clip-dialog"))
@@ -2360,7 +2930,7 @@ impl ClipSyncApp {
                                             Align2::CENTER_CENTER,
                                             (index + 1).to_string(),
                                             FontId::proportional(10.5),
-                                            theme::ACCENT,
+                                            theme::p().accent,
                                         );
                                         ui.add_space(2.0);
                                         ui.vertical(|ui| {
@@ -2368,7 +2938,7 @@ impl ClipSyncApp {
                                             ui.label(
                                                 RichText::new(*step)
                                                     .size(12.0)
-                                                    .color(theme::MUTED),
+                                                    .color(theme::p().muted),
                                             );
                                         });
                                     });
@@ -2395,7 +2965,7 @@ impl ClipSyncApp {
                                     RichText::new(safety)
                                         .monospace()
                                         .size(20.0)
-                                        .color(theme::ACCENT),
+                                        .color(theme::p().accent),
                                 );
                                 hint(ui, "本机安全码 · 两台设备逐位相同才算同一把钥匙");
                             }
@@ -2413,19 +2983,19 @@ impl ClipSyncApp {
                                         ui.label(
                                             RichText::new(&peer.name)
                                                 .size(12.5)
-                                                .color(theme::TEXT),
+                                                .color(theme::p().text),
                                         );
                                         ui.label(
                                             RichText::new(&peer.os)
                                                 .size(10.5)
-                                                .color(theme::FAINT),
+                                                .color(theme::p().faint),
                                         );
                                     });
                                     ui.with_layout(
                                         Layout::right_to_left(Align::Center),
                                         |ui| {
                                             let (label, color) = if !connected {
-                                                ("未知", theme::FAINT)
+                                                ("未知", theme::p().faint)
                                             } else if safety
                                                 .as_deref()
                                                 .is_some_and(|mine| {
@@ -2433,11 +3003,11 @@ impl ClipSyncApp {
                                                         && mine.starts_with(&peer.safety)
                                                 })
                                             {
-                                                ("一致", theme::GREEN)
+                                                ("一致", theme::p().green)
                                             } else if peer.safety.is_empty() {
-                                                ("未知", theme::FAINT)
+                                                ("未知", theme::p().faint)
                                             } else {
-                                                ("不一致", theme::RED)
+                                                ("不一致", theme::p().red)
                                             };
                                             ui.label(
                                                 RichText::new(label)
@@ -2474,7 +3044,7 @@ impl ClipSyncApp {
                                 "只删除本机保存的这些条目，房间另一端的历史与已经收到的文件不受影响。",
                             )
                             .size(12.5)
-                            .color(theme::MUTED),
+                            .color(theme::p().muted),
                         );
                         ui.add_space(18.0);
                         ui.horizontal(|ui| {
@@ -2497,7 +3067,7 @@ impl ClipSyncApp {
                                 self.room_code
                             ))
                             .size(12.5)
-                            .color(theme::MUTED),
+                            .color(theme::p().muted),
                         );
                         ui.add_space(18.0);
                         ui.horizontal(|ui| {
@@ -2511,59 +3081,142 @@ impl ClipSyncApp {
                             });
                         });
                     }
-                    Overlay::Settings => {
-                        dialog_header(ui, Icon::Settings, "设置");
-                        ui.add_space(12.0);
-                        section_label(ui, "同步");
-                        toggle_row(ui, "收到后写入剪贴板", &mut self.write_incoming);
-                        hint(ui, "关掉后收到的文本只进历史，不动本机剪贴板。");
-                        ui.add_space(12.0);
-                        section_label(ui, "房间");
-                        ui.horizontal(|ui| {
-                            if self.joined {
-                                ui.label(
-                                    RichText::new(self.room_code.clone())
-                                        .monospace()
-                                        .size(12.5)
-                                        .color(theme::TEXT),
-                                );
-                                ui.label(
-                                    RichText::new(status_label(&self.status))
-                                        .size(11.0)
-                                        .color(theme::MUTED),
-                                );
-                            } else {
-                                ui.label(
-                                    RichText::new("未共享")
-                                        .size(12.5)
-                                        .color(theme::MUTED),
+                    Overlay::Choice(choice) => {
+                        let (title, icon, labels, selected) = match choice {
+                            SettingsChoice::Theme => (
+                                "主题",
+                                Icon::Settings,
+                                vec!["跟随系统".to_string(), "浅色".to_string(), "深色".to_string()],
+                                match self.theme_mode {
+                                    ThemeMode::System => 0,
+                                    ThemeMode::Light => 1,
+                                    ThemeMode::Dark => 2,
+                                },
+                            ),
+                            SettingsChoice::Language => (
+                                "语言",
+                                Icon::Translate,
+                                vec![
+                                    "跟随系统".to_string(),
+                                    "简体中文".to_string(),
+                                    "English".to_string(),
+                                ],
+                                match self.language {
+                                    Language::System => 0,
+                                    Language::Chinese => 1,
+                                    Language::English => 2,
+                                },
+                            ),
+                            SettingsChoice::Retention => (
+                                "保留时长",
+                                Icon::Trash,
+                                RETENTION_CHOICES
+                                    .iter()
+                                    .map(|days| format!("{days} 天"))
+                                    .collect(),
+                                RETENTION_CHOICES
+                                    .iter()
+                                    .position(|days| {
+                                        *days == self.preferences.retention_days()
+                                    })
+                                    .unwrap_or(1),
+                            ),
+                        };
+                        dialog_header(ui, icon, title);
+                        ui.add_space(8.0);
+                        for (index, label) in labels.into_iter().enumerate() {
+                            let (rect, response) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 36.0),
+                                Sense::click(),
+                            );
+                            if response.hovered() {
+                                ui.painter().rect_filled(
+                                    rect,
+                                    CornerRadius::same(8),
+                                    theme::p().hover,
                                 );
                             }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if self.joined {
-                                    if secondary_button(ui, "退出房间").clicked() {
-                                        action = DialogAction::Open(Overlay::LeaveRoom);
+                            let dot = Rect::from_center_size(
+                                Pos2::new(rect.left() + 14.0, rect.center().y),
+                                Vec2::splat(16.0),
+                            );
+                            let active = index == selected;
+                            ui.painter().circle_stroke(
+                                dot.center(),
+                                7.0,
+                                Stroke::new(
+                                    1.5,
+                                    if active {
+                                        theme::p().accent
+                                    } else {
+                                        theme::p().faint
+                                    },
+                                ),
+                            );
+                            if active {
+                                ui.painter().circle_filled(dot.center(), 3.6, theme::p().accent);
+                            }
+                            ui.painter().text(
+                                Pos2::new(rect.left() + 32.0, rect.center().y),
+                                Align2::LEFT_CENTER,
+                                &label,
+                                FontId::proportional(13.5),
+                                theme::p().text,
+                            );
+                            if response.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                action = match choice {
+                                    SettingsChoice::Theme => DialogAction::SetTheme(match index {
+                                        1 => ThemeMode::Light,
+                                        2 => ThemeMode::Dark,
+                                        _ => ThemeMode::System,
+                                    }),
+                                    SettingsChoice::Language => {
+                                        DialogAction::SetLanguage(match index {
+                                            1 => Language::Chinese,
+                                            2 => Language::English,
+                                            _ => Language::System,
+                                        })
                                     }
-                                    if secondary_button(ui, "切换房间").clicked() {
-                                        action = DialogAction::Open(Overlay::Share);
-                                    }
-                                } else if accent_button(ui, "进入房间").clicked() {
-                                    action = DialogAction::Open(Overlay::Share);
-                                }
-                            });
-                        });
-                        ui.add_space(12.0);
-                        section_label(ui, "本机");
-                        info_row(ui, "设备名称", &crate::paths::device_name());
-                        info_row(ui, "所属系统", crate::paths::device_os());
-                        info_row(ui, "版本", env!("CARGO_PKG_VERSION"));
-                        ui.add_space(12.0);
-                        hint(ui, "房间密码加密保存在本机；离开房间即清除。");
-                        ui.add_space(14.0);
+                                    SettingsChoice::Retention => DialogAction::SetRetention(
+                                        RETENTION_CHOICES[index],
+                                    ),
+                                };
+                            }
+                        }
+                        ui.add_space(6.0);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if secondary_button(ui, "知道了").clicked() {
+                            if secondary_button(ui, "取消").clicked() {
                                 close = true;
                             }
+                        });
+                    }
+                    Overlay::Nickname { input } => {
+                        dialog_header(ui, Icon::Edit, "昵称");
+                        ui.add_space(10.0);
+                        let edit = ui.add_sized(
+                            Vec2::new(ui.available_width(), 34.0),
+                            TextEdit::singleline(input)
+                                .hint_text("给这台设备起个名字")
+                                .margin(Margin::symmetric(10, 8))
+                                .font(FontId::proportional(13.0)),
+                        );
+                        if focus {
+                            edit.request_focus();
+                        }
+                        hint(ui, "同屋设备看到的就是它；留空则使用系统设备名");
+                        let save = ui.input_mut(|input| {
+                            input.consume_key(Modifiers::COMMAND, Key::Enter)
+                        });
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if accent_button(ui, "保存").clicked() || save {
+                                    action = DialogAction::SaveNickname(input.clone());
+                                }
+                                if secondary_button(ui, "取消").clicked() {
+                                    close = true;
+                                }
+                            });
                         });
                     }
                     Overlay::NewEntry { text } => {
@@ -2671,7 +3324,7 @@ impl ClipSyncApp {
                                     72,
                                 ))
                                 .size(10.5)
-                                .color(theme::MUTED),
+                                .color(theme::p().muted),
                             );
                             ui.add_space(6.0);
                             hint(ui, "处理结果会直接替换这条内容");
@@ -2716,7 +3369,7 @@ impl ClipSyncApp {
                         result,
                         failure,
                     } => {
-                        dialog_header(ui, Icon::Globe, "中英互译");
+                        dialog_header(ui, Icon::Translate, "中英互译");
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
@@ -2752,12 +3405,12 @@ impl ClipSyncApp {
                                     translate::MAX_TRANSLATE_CHARS, length
                                 ))
                                 .size(10.5)
-                                .color(theme::RED),
+                                .color(theme::p().red),
                             );
                         }
                         if let Some(error) = failure {
                             ui.add_space(4.0);
-                            ui.label(RichText::new(error.as_str()).size(10.5).color(theme::RED));
+                            ui.label(RichText::new(error.as_str()).size(10.5).color(theme::p().red));
                         }
                         if let Some(translated) = result {
                             ui.add_space(10.0);
@@ -2858,7 +3511,7 @@ impl ClipSyncApp {
                                         RichText::new(body)
                                             .monospace()
                                             .size(12.0)
-                                            .color(theme::TEXT),
+                                            .color(theme::p().text),
                                     );
                                     if !record.note.is_empty() {
                                         ui.add_space(10.0);
@@ -2866,7 +3519,7 @@ impl ClipSyncApp {
                                         ui.label(
                                             RichText::new(&record.note)
                                                 .size(11.5)
-                                                .color(theme::MUTED),
+                                                .color(theme::p().muted),
                                         );
                                     }
                                     ui.add_space(10.0);
@@ -2897,7 +3550,7 @@ impl ClipSyncApp {
                                     ui.label(
                                         RichText::new(meta)
                                             .size(11.0)
-                                            .color(theme::MUTED),
+                                            .color(theme::p().muted),
                                     );
                                     ui.add_space(6.0);
                                     field_label(ui, "记录 ID");
@@ -2905,7 +3558,7 @@ impl ClipSyncApp {
                                         RichText::new(&record.id)
                                             .monospace()
                                             .size(10.5)
-                                            .color(theme::FAINT),
+                                            .color(theme::p().faint),
                                     );
                                 });
                             ui.add_space(14.0);
@@ -2923,7 +3576,7 @@ impl ClipSyncApp {
                             ui.label(
                                 RichText::new("这条记录已经不在了。")
                                     .size(12.5)
-                                    .color(theme::MUTED),
+                                    .color(theme::p().muted),
                             );
                             ui.add_space(14.0);
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2934,7 +3587,7 @@ impl ClipSyncApp {
                         }
                     }
                     Overlay::MoveTo { id, input, error } => {
-                        dialog_header(ui, Icon::Move, "移动到指定位置");
+                        dialog_header(ui, Icon::Position, "移动到指定位置");
                         ui.add_space(12.0);
                         let info = self.history.move_info(id);
                         if let Some(info) = info {
@@ -2970,7 +3623,7 @@ impl ClipSyncApp {
                                         info.from, info.to
                                     ))
                                     .size(10.5)
-                                    .color(theme::RED),
+                                    .color(theme::p().red),
                                 );
                             }
                             let enter = ui.input(|input_state| {
@@ -3086,6 +3739,23 @@ impl ClipSyncApp {
                 }
                 keep = false;
             }
+            DialogAction::SetTheme(mode) => {
+                self.set_theme(ctx, mode);
+                keep = false;
+            }
+            DialogAction::SetLanguage(language) => {
+                self.set_language(language);
+                ctx.request_repaint();
+                keep = false;
+            }
+            DialogAction::SetRetention(days) => {
+                self.set_retention_days(days);
+                keep = false;
+            }
+            DialogAction::SaveNickname(name) => {
+                self.set_nickname(&name);
+                keep = false;
+            }
         }
         if keep && self.overlay.is_none() {
             self.overlay = Some(overlay);
@@ -3177,7 +3847,7 @@ impl ClipSyncApp {
                             Align2::CENTER_CENTER,
                             "正在加载…",
                             FontId::proportional(13.0),
-                            theme::MUTED,
+                            theme::p().muted,
                         );
                     }
                 }
@@ -3253,14 +3923,24 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
         0.0,
         TextFormat {
             font_id: font.clone(),
-            color: if empty { theme::FAINT } else { theme::TEXT },
+            color: if empty {
+                theme::p().faint
+            } else {
+                theme::p().text
+            },
             ..Default::default()
         },
     );
     let galley = ui.ctx().fonts_mut(|fonts| fonts.layout_job(body));
     let text_h = galley.size().y.max(20.0);
-    let content_h = (text_h + 21.0).max(if thumb.is_some() { 32.0 } else { 0.0 });
-    let height = 9.0 + content_h + 9.0;
+    let line_center = first_line_center(&galley);
+    let (top_pad, thumb_top) = if thumb.is_some() {
+        ((9.0 + 16.0 - line_center).max(10.0), 9.0)
+    } else {
+        (10.0, 0.0)
+    };
+    let content_h = text_h + 21.0;
+    let height = top_pad + content_h + 9.0;
     let (outer, _) = ui.allocate_exact_size(Vec2::new(avail, height + 8.0), Sense::hover());
     let card = Rect::from_min_max(
         Pos2::new(outer.left() + theme::ROW_INSET, outer.top() + 4.0),
@@ -3271,6 +3951,8 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
     );
     let id = ui.scope_id().with(("clip-row", record.id.as_str()));
     let card_response = ui.interact(card, id.with("card"), Sense::click());
+    let text_y = card.top() + top_pad;
+    let line_y = text_y + line_center;
     if scroll_to {
         ui.scroll_to_rect(card, Some(Align::Center));
     }
@@ -3283,7 +3965,7 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
     } else if cursor {
         Color32::from_white_alpha(9)
     } else {
-        theme::with_alpha(theme::CARD, 128)
+        theme::with_alpha(theme::p().card, 128)
     };
     let border = if picked {
         Color32::from_rgba_unmultiplied(0xf4, 0xa8, 0xc0, 130)
@@ -3306,31 +3988,38 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
     );
 
     if pick_mode {
-        let center = Pos2::new(card.left() + left_pad + 9.0, card.top() + 19.0);
+        let center = Pos2::new(card.left() + left_pad + 9.0, line_y);
         painter.circle_stroke(
             center,
             8.0,
-            Stroke::new(1.4, if picked { theme::ACCENT } else { theme::MUTED }),
+            Stroke::new(
+                1.4,
+                if picked {
+                    theme::p().accent
+                } else {
+                    theme::p().muted
+                },
+            ),
         );
         if picked {
-            painter.circle_filled(center, 7.0, theme::ACCENT);
+            painter.circle_filled(center, 7.0, theme::p().accent);
             icons::paint(
                 &painter,
                 Rect::from_center_size(center, Vec2::splat(11.0)),
                 Icon::Check,
-                theme::ACCENT_TEXT,
+                theme::p().accent_text,
             );
         }
     } else {
         painter.text(
-            Pos2::new(card.left() + left_pad + number_w, card.top() + 10.0),
-            Align2::RIGHT_TOP,
+            Pos2::new(card.left() + left_pad + number_w, line_y),
+            Align2::RIGHT_CENTER,
             position.to_string(),
             FontId::proportional(13.0),
             if record.pinned {
-                theme::AMBER
+                theme::p().amber
             } else {
-                theme::MUTED
+                theme::p().muted
             },
         );
     }
@@ -3338,7 +4027,10 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
     let mut zoom_clicked = false;
     if let Some(texture) = thumb {
         let thumb_rect = Rect::from_min_size(
-            Pos2::new(card.left() + left_pad + number_w + 8.0, card.top() + 9.0),
+            Pos2::new(
+                card.left() + left_pad + number_w + 8.0,
+                card.top() + thumb_top,
+            ),
             Vec2::splat(32.0),
         );
         let thumb_response = ui.interact(thumb_rect, id.with("thumb"), Sense::click());
@@ -3357,11 +4049,8 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
         }
     }
 
-    let text_pos = Pos2::new(
-        card.left() + left_pad + number_w + thumb_gap,
-        card.top() + 10.0,
-    );
-    painter.galley(text_pos, galley, theme::TEXT);
+    let text_pos = Pos2::new(card.left() + left_pad + number_w + thumb_gap, text_y);
+    painter.galley(text_pos, galley, theme::p().text);
 
     let mut meta = relative_time(record.ts, now);
     if !record.sender_name.is_empty() {
@@ -3395,15 +4084,16 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
         Pos2::new(text_pos.x, text_pos.y + text_h + 5.0),
         &meta,
         FontId::proportional(11.5),
-        theme::MUTED,
+        theme::p().muted,
         card.right() - text_pos.x - 12.0,
     );
 
     let action_size = 30.0;
+    let action_top = card.top() + (line_y - card.top() - action_size / 2.0).max(7.0);
     let mut right = card.right() - 8.0;
     let place = |right: &mut f32| {
         let rect = Rect::from_min_size(
-            Pos2::new(*right - action_size, card.top() + 7.0),
+            Pos2::new(*right - action_size, action_top),
             Vec2::splat(action_size),
         );
         *right -= action_size + 2.0;
@@ -3428,9 +4118,9 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
         Rect::from_center_size(more_rect.center(), Vec2::splat(17.0)),
         Icon::More,
         if more_response.hovered() {
-            theme::TEXT
+            theme::p().text
         } else {
-            theme::MUTED
+            theme::p().muted
         },
     );
 
@@ -3449,7 +4139,7 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
             if menu_item(ui, Icon::Edit, "文本处理", !is_file, false) {
                 menu_choice = Some(MenuAction::Transform);
             }
-            if menu_item(ui, Icon::Globe, "中英互译", !is_file, false) {
+            if menu_item(ui, Icon::Translate, "中英互译", !is_file, false) {
                 menu_choice = Some(MenuAction::Translate);
             }
             if menu_item(ui, Icon::Duplicate, "生成副本", true, false) {
@@ -3483,7 +4173,13 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
             if menu_item(ui, Icon::Bottom, "移到最底部", can_down, false) {
                 menu_choice = Some(MenuAction::MoveBottom);
             }
-            if menu_item(ui, Icon::Move, "移动到指定位置…", can_up || can_down, false) {
+            if menu_item(
+                ui,
+                Icon::Position,
+                "移动到指定位置…",
+                can_up || can_down,
+                false,
+            ) {
                 menu_choice = Some(MenuAction::MoveTo);
             }
             menu_separator(ui);
@@ -3584,11 +4280,11 @@ fn row_action(
         Rect::from_center_size(rect.center(), Vec2::splat(16.0)),
         icon,
         if !enabled {
-            theme::FAINT
+            theme::p().faint
         } else if response.hovered() {
-            theme::TEXT
+            theme::p().text
         } else {
-            theme::MUTED
+            theme::p().muted
         },
     );
     if enabled {
@@ -3629,9 +4325,9 @@ fn banner(
         Color32::from_rgba_unmultiplied(0x3a, 0x2a, 0x33, 140)
     };
     let text_color = if error {
-        theme::ON_ERROR_CONTAINER
+        theme::p().on_error_container
     } else {
-        theme::TEXT
+        theme::p().text
     };
     ui.painter().rect(
         card,
@@ -3705,7 +4401,7 @@ fn transfer_banner(ui: &mut Ui, transfer: &TransferUi) {
     painter.rect(
         card,
         CornerRadius::same(14),
-        theme::with_alpha(theme::CARD, 170),
+        theme::with_alpha(theme::p().card, 170),
         Stroke::new(1.0, Color32::from_rgba_unmultiplied(0x3a, 0x2a, 0x33, 140)),
         StrokeKind::Inside,
     );
@@ -3716,7 +4412,7 @@ fn transfer_banner(ui: &mut Ui, transfer: &TransferUi) {
         Pos2::new(card.left() + 12.0, card.top() + 7.0),
         &format!("{kind} {} · {percent}%", transfer.name),
         FontId::proportional(11.5),
-        theme::TEXT,
+        theme::p().text,
         card.width() - 24.0,
     );
     let bar = Rect::from_min_max(
@@ -3728,13 +4424,13 @@ fn transfer_banner(ui: &mut Ui, transfer: &TransferUi) {
         bar.min,
         Pos2::new(bar.left() + bar.width() * transfer.fraction(), bar.bottom()),
     );
-    painter.rect_filled(filled, CornerRadius::same(2), theme::ACCENT);
+    painter.rect_filled(filled, CornerRadius::same(2), theme::p().accent);
 }
 
 fn menu_frame() -> Frame {
     Frame::new()
-        .fill(theme::SURFACE_HIGH)
-        .stroke(Stroke::new(1.0, theme::BORDER))
+        .fill(theme::p().surface_high)
+        .stroke(Stroke::new(1.0, theme::p().border))
         .corner_radius(CornerRadius::same(12))
         .inner_margin(Margin::same(6))
         .shadow(egui::epaint::Shadow {
@@ -3749,11 +4445,11 @@ fn menu_item(ui: &mut Ui, icon: Icon, label: &str, enabled: bool, danger: bool) 
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
     let color = if !enabled {
-        theme::FAINT
+        theme::p().faint
     } else if danger {
-        theme::RED
+        theme::p().red
     } else {
-        theme::TEXT
+        theme::p().text
     };
     if response.hovered() && enabled {
         ui.painter().rect_filled(
@@ -3774,11 +4470,11 @@ fn menu_item(ui: &mut Ui, icon: Icon, label: &str, enabled: bool, danger: bool) 
         ),
         icon,
         if !enabled {
-            theme::FAINT
+            theme::p().faint
         } else if danger {
-            theme::RED
+            theme::p().red
         } else {
-            theme::MUTED
+            theme::p().muted
         },
     );
     ui.painter().text(
@@ -3803,7 +4499,7 @@ fn menu_separator(ui: &mut Ui) {
     ui.painter().hline(
         (rect.left() + 8.0)..=(rect.right() - 8.0),
         rect.center().y,
-        Stroke::new(1.0, theme::BORDER),
+        Stroke::new(1.0, theme::p().border),
     );
 }
 
@@ -3818,7 +4514,7 @@ fn transform_button(ui: &mut Ui, op: TextOp, width: f32) -> egui::Response {
         rect,
         CornerRadius::same(9),
         fill,
-        Stroke::new(1.0, theme::BORDER),
+        Stroke::new(1.0, theme::p().border),
         StrokeKind::Inside,
     );
     ui.painter().text(
@@ -3826,7 +4522,7 @@ fn transform_button(ui: &mut Ui, op: TextOp, width: f32) -> egui::Response {
         Align2::CENTER_CENTER,
         op.label(),
         FontId::proportional(12.0),
-        theme::TEXT,
+        theme::p().text,
     );
     response.on_hover_cursor(CursorIcon::PointingHand)
 }
@@ -3835,7 +4531,7 @@ fn direction_chip(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
     let font = FontId::proportional(12.0);
     let galley = ui
         .ctx()
-        .fonts_mut(|fonts| fonts.layout_no_wrap(label.to_string(), font, theme::TEXT));
+        .fonts_mut(|fonts| fonts.layout_no_wrap(label.to_string(), font, theme::p().text));
     let width = galley.size().x + 28.0;
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click());
     let fill = if selected {
@@ -3852,7 +4548,7 @@ fn direction_chip(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
             if selected {
                 Color32::from_rgba_unmultiplied(0xf4, 0xa8, 0xc0, 150)
             } else {
-                theme::BORDER
+                theme::p().border
             },
         ),
         StrokeKind::Inside,
@@ -3864,9 +4560,9 @@ fn direction_chip(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
         ),
         galley,
         if selected {
-            theme::ACCENT
+            theme::p().accent
         } else {
-            theme::MUTED
+            theme::p().muted
         },
     );
     response.on_hover_cursor(CursorIcon::PointingHand)
@@ -3875,7 +4571,7 @@ fn direction_chip(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
 fn read_only_box(ui: &mut Ui, text: &str) {
     Frame::new()
         .fill(Color32::from_white_alpha(5))
-        .stroke(Stroke::new(1.0, theme::BORDER))
+        .stroke(Stroke::new(1.0, theme::p().border))
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::same(9))
         .show(ui, |ui| {
@@ -3886,7 +4582,7 @@ fn read_only_box(ui: &mut Ui, text: &str) {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.add(
-                        egui::Label::new(RichText::new(text).size(12.0).color(theme::TEXT))
+                        egui::Label::new(RichText::new(text).size(12.0).color(theme::p().text))
                             .wrap()
                             .selectable(true),
                     );
@@ -3895,7 +4591,7 @@ fn read_only_box(ui: &mut Ui, text: &str) {
 }
 
 fn link_button(ui: &mut Ui, label: &str) -> egui::Response {
-    ui.add(egui::Button::new(RichText::new(label).size(12.0).color(theme::ACCENT)).frame(false))
+    ui.add(egui::Button::new(RichText::new(label).size(12.0).color(theme::p().accent)).frame(false))
         .on_hover_cursor(CursorIcon::PointingHand)
 }
 
@@ -3935,7 +4631,11 @@ fn paint_chip(ui: &Ui, rect: Rect, label: &str, active: bool, font: FontId) {
         Align2::CENTER_CENTER,
         label,
         font,
-        if active { theme::ACCENT } else { theme::MUTED },
+        if active {
+            theme::p().accent
+        } else {
+            theme::p().muted
+        },
     );
 }
 
@@ -3946,88 +4646,36 @@ fn dialog_header(ui: &mut Ui, icon: Icon, title: &str) {
             ui.painter(),
             Rect::from_center_size(rect.center(), Vec2::splat(20.0)),
             icon,
-            theme::ACCENT,
+            theme::p().accent,
         );
-        ui.label(RichText::new(title).size(18.0).strong().color(theme::TEXT));
+        ui.label(
+            RichText::new(title)
+                .size(18.0)
+                .strong()
+                .color(theme::p().text),
+        );
     });
 }
 
 fn field_label(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).size(11.0).color(theme::MUTED));
+    ui.label(RichText::new(text).size(11.0).color(theme::p().muted));
 }
 
 fn hint(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).size(10.5).color(theme::FAINT));
-}
-
-fn section_label(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).size(10.0).strong().color(theme::FAINT));
-    ui.add_space(4.0);
+    ui.label(RichText::new(text).size(10.5).color(theme::p().faint));
 }
 
 fn bullet(ui: &mut Ui, text: &str) {
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(Vec2::new(10.0, 16.0), Sense::hover());
         ui.painter()
-            .circle_filled(rect.center(), 2.0, theme::ACCENT);
+            .circle_filled(rect.center(), 2.0, theme::p().accent);
         ui.vertical(|ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(text).size(11.0).color(theme::MUTED));
+            ui.label(RichText::new(text).size(11.0).color(theme::p().muted));
         });
     });
     ui.add_space(6.0);
-}
-
-fn info_row(ui: &mut Ui, label: &str, value: &str) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).size(11.5).color(theme::MUTED));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new(value).size(11.5).color(theme::TEXT));
-        });
-    });
-    ui.add_space(2.0);
-}
-
-fn toggle_row(ui: &mut Ui, label: &str, value: &mut bool) {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
-    ui.painter().text(
-        Pos2::new(rect.left(), rect.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        FontId::proportional(12.5),
-        theme::TEXT,
-    );
-    let switch = Rect::from_center_size(
-        Pos2::new(rect.right() - 18.0, rect.center().y),
-        Vec2::new(36.0, 20.0),
-    );
-    ui.painter().rect_filled(
-        switch,
-        CornerRadius::same(10),
-        if *value {
-            theme::ACCENT
-        } else {
-            Color32::from_white_alpha(18)
-        },
-    );
-    let knob_x = if *value {
-        switch.right() - 10.0
-    } else {
-        switch.left() + 10.0
-    };
-    ui.painter().circle_filled(
-        Pos2::new(knob_x, switch.center().y),
-        7.0,
-        if *value {
-            theme::ACCENT_TEXT
-        } else {
-            theme::MUTED
-        },
-    );
-    if response.clicked() {
-        *value = !*value;
-    }
 }
 
 fn accent_button(ui: &mut Ui, label: &str) -> egui::Response {
@@ -4036,12 +4684,12 @@ fn accent_button(ui: &mut Ui, label: &str) -> egui::Response {
 
 fn accent_button_enabled(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
     let button = egui::Button::new(RichText::new(label).size(13.0).strong().color(if enabled {
-        theme::ACCENT_TEXT
+        theme::p().accent_text
     } else {
-        theme::FAINT
+        theme::p().faint
     }))
     .fill(if enabled {
-        theme::ACCENT
+        theme::p().accent
     } else {
         Color32::from_white_alpha(8)
     })
@@ -4052,7 +4700,7 @@ fn accent_button_enabled(ui: &mut Ui, label: &str, enabled: bool) -> egui::Respo
 
 fn secondary_button(ui: &mut Ui, label: &str) -> egui::Response {
     ui.add(
-        egui::Button::new(RichText::new(label).size(13.0).color(theme::MUTED))
+        egui::Button::new(RichText::new(label).size(13.0).color(theme::p().muted))
             .fill(Color32::from_white_alpha(7))
             .stroke(Stroke::new(1.0, Color32::from_white_alpha(14)))
             .corner_radius(CornerRadius::same(10))
@@ -4066,9 +4714,9 @@ fn danger_button(ui: &mut Ui, label: &str) -> egui::Response {
             RichText::new(label)
                 .size(13.0)
                 .strong()
-                .color(theme::ON_RED),
+                .color(theme::p().on_red),
         )
-        .fill(theme::RED)
+        .fill(theme::p().red)
         .corner_radius(CornerRadius::same(10))
         .min_size(Vec2::new(84.0, 32.0)),
     )
@@ -4076,10 +4724,10 @@ fn danger_button(ui: &mut Ui, label: &str) -> egui::Response {
 
 fn status_color(status: &Status) -> Color32 {
     match status {
-        Status::Idle => theme::FAINT,
-        Status::Connecting => theme::AMBER,
-        Status::Online { .. } => theme::GREEN,
-        Status::Offline { .. } => theme::RED,
+        Status::Idle => theme::p().faint,
+        Status::Connecting => theme::p().amber,
+        Status::Online { .. } => theme::p().green,
+        Status::Offline { .. } => theme::p().red,
     }
 }
 
@@ -4093,6 +4741,17 @@ fn status_label(status: &Status) -> &'static str {
 }
 
 fn paint_line(ui: &Ui, pos: Pos2, text: &str, font: FontId, color: Color32, max_width: f32) {
+    let galley = line_galley(ui, text, font, color, max_width);
+    ui.painter().galley(pos, galley, color);
+}
+
+fn line_galley(
+    ui: &Ui,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    max_width: f32,
+) -> Arc<egui::Galley> {
     let mut job = egui::text::LayoutJob {
         wrap: TextWrapping {
             max_width,
@@ -4111,8 +4770,441 @@ fn paint_line(ui: &Ui, pos: Pos2, text: &str, font: FontId, color: Color32, max_
             ..Default::default()
         },
     );
-    let galley = ui.ctx().fonts_mut(|fonts| fonts.layout_job(job));
-    ui.painter().galley(pos, galley, color);
+    ui.ctx().fonts_mut(|fonts| fonts.layout_job(job))
+}
+
+/// Centre of the first line's inked glyphs, galley-local: what thumbnails and
+/// badges are levelled against, since a glyph box is taller than its ink.
+fn first_line_center(galley: &egui::Galley) -> f32 {
+    let Some(row) = galley.rows.first() else {
+        return 0.0;
+    };
+    let local = if row.visuals.mesh_bounds.is_finite() {
+        row.visuals.mesh_bounds.center().y
+    } else {
+        row.height() * 0.5
+    };
+    row.pos.y + local
+}
+
+struct RowLine {
+    galley: Arc<egui::Galley>,
+    color: Color32,
+    baseline: f32,
+    center: f32,
+}
+
+fn row_line(ui: &Ui, text: &str, font: FontId, color: Color32, max_width: f32) -> RowLine {
+    let size = font.size;
+    let galley = line_galley(ui, text, font, color, max_width);
+    let baseline = galley
+        .rows
+        .first()
+        .and_then(|row| {
+            row.glyphs
+                .iter()
+                .find(|glyph| !glyph.chr.is_whitespace())
+                .map(|glyph| row.pos.y + glyph.pos.y)
+        })
+        .unwrap_or(size * 0.8);
+    let center = if galley.mesh_bounds.is_finite() {
+        (galley.mesh_bounds.min.y + galley.mesh_bounds.max.y) / 2.0
+    } else {
+        baseline - size * 0.36
+    };
+    RowLine {
+        galley,
+        color,
+        baseline,
+        center,
+    }
+}
+
+fn baseline_at(line: &RowLine, center_y: f32) -> f32 {
+    center_y - line.center + line.baseline
+}
+
+fn paint_line_at(ui: &Ui, left: f32, baseline: f32, line: RowLine) {
+    ui.painter().galley(
+        Pos2::new(left, baseline - line.baseline),
+        line.galley,
+        line.color,
+    );
+}
+
+fn paint_line_before(ui: &Ui, right: f32, baseline: f32, line: RowLine) -> f32 {
+    let left = right - line.galley.size().x;
+    ui.painter().galley(
+        Pos2::new(left, baseline - line.baseline),
+        line.galley.clone(),
+        line.color,
+    );
+    left
+}
+
+fn room_color(status: &Status, joined: bool) -> Option<Color32> {
+    match status {
+        Status::Online { .. } => Some(theme::p().green),
+        Status::Connecting => Some(theme::p().amber),
+        _ if !joined => None,
+        _ => Some(theme::p().red),
+    }
+}
+
+fn theme_label(mode: ThemeMode) -> &'static str {
+    match mode {
+        ThemeMode::System => "跟随系统",
+        ThemeMode::Light => "浅色",
+        ThemeMode::Dark => "深色",
+    }
+}
+
+fn language_label(language: Language) -> &'static str {
+    match language {
+        Language::System => "跟随系统",
+        Language::Chinese => "简体中文",
+        Language::English => "English",
+    }
+}
+
+const SETTINGS_ROW_HEIGHT: f32 = 54.0;
+const SETTINGS_SWITCH_HEIGHT: f32 = 56.0;
+
+fn settings_group(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 23.0), Sense::hover());
+    paint_line(
+        ui,
+        Pos2::new(rect.left() + 18.0, rect.top() + 2.0),
+        title,
+        FontId::proportional(11.5),
+        theme::p().accent,
+        rect.width() - 36.0,
+    );
+    let dark = theme::p().dark;
+    Frame::new()
+        .fill(theme::with_alpha(
+            theme::p().surface,
+            if dark { 199 } else { 224 },
+        ))
+        .stroke(Stroke::new(
+            1.0,
+            theme::with_alpha(theme::p().glass_border, 128),
+        ))
+        .corner_radius(CornerRadius::same(16))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 0.0;
+            add(ui);
+        });
+}
+
+fn settings_divider(ui: &mut Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().hline(
+        (rect.left() + 16.0)..=(rect.right() - 16.0),
+        rect.center().y,
+        Stroke::new(1.0, theme::with_alpha(theme::p().border, 102)),
+    );
+}
+
+fn settings_row(ui: &mut Ui, height: f32, clickable: bool) -> (Rect, egui::Response) {
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), height),
+        if clickable {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    if clickable && response.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(8), theme::p().hover);
+    }
+    (rect, response)
+}
+
+fn settings_nav_row(ui: &mut Ui, title: &str, value: &str) -> bool {
+    let (rect, response) = settings_row(ui, SETTINGS_ROW_HEIGHT, true);
+    let center = rect.center().y;
+    let chevron = Rect::from_center_size(Pos2::new(rect.right() - 25.0, center), Vec2::splat(18.0));
+    icons::paint(ui.painter(), chevron, Icon::ChevronRight, theme::p().faint);
+    let value = row_line(
+        ui,
+        value,
+        FontId::proportional(13.0),
+        theme::p().muted,
+        200.0,
+    );
+    let value_left = chevron.left() - 2.0 - value.galley.size().x;
+    let title = row_line(
+        ui,
+        title,
+        FontId::proportional(15.0),
+        theme::p().text,
+        (value_left - 12.0 - rect.left() - 16.0).max(40.0),
+    );
+    let baseline = baseline_at(&title, center);
+    paint_line_at(ui, rect.left() + 16.0, baseline, title);
+    paint_line_at(ui, value_left, baseline, value);
+    response.on_hover_cursor(CursorIcon::PointingHand).clicked()
+}
+
+fn settings_value_row(
+    ui: &mut Ui,
+    title: &str,
+    value: &str,
+    detail: Option<(&str, Color32)>,
+    monospace: bool,
+    value_color: Option<Color32>,
+) {
+    let (rect, _) = settings_row(ui, SETTINGS_ROW_HEIGHT, false);
+    let center = rect.center().y;
+    let color = value_color.unwrap_or(theme::p().muted);
+    let value_font = if monospace {
+        FontId::monospace(13.0)
+    } else {
+        FontId::proportional(13.0)
+    };
+    let value = row_line(ui, value, value_font, color, 200.0);
+    let mut title_limit = rect.right() - 16.0 - value.galley.size().x - 12.0;
+    let detail = detail.map(|(detail, detail_color)| {
+        row_line(ui, detail, FontId::proportional(11.5), detail_color, 120.0)
+    });
+    if let Some(detail) = &detail {
+        title_limit = title_limit - detail.galley.size().x - 9.0;
+    }
+    let title = row_line(
+        ui,
+        title,
+        FontId::proportional(15.0),
+        theme::p().text,
+        (title_limit - rect.left() - 16.0).max(40.0),
+    );
+    let baseline = baseline_at(&title, center);
+    paint_line_at(ui, rect.left() + 16.0, baseline, title);
+    let mut right = rect.right() - 16.0;
+    right = paint_line_before(ui, right, baseline, value);
+    if let Some(detail) = detail {
+        paint_line_before(ui, right - 9.0, baseline, detail);
+    }
+}
+
+fn settings_action_row(ui: &mut Ui, title: &str) -> bool {
+    let (rect, response) = settings_row(ui, SETTINGS_ROW_HEIGHT, true);
+    let center = rect.center().y;
+    let chevron = Rect::from_center_size(Pos2::new(rect.right() - 25.0, center), Vec2::splat(18.0));
+    icons::paint(ui.painter(), chevron, Icon::ChevronRight, theme::p().faint);
+    let title = row_line(
+        ui,
+        title,
+        FontId::proportional(15.0),
+        theme::p().red,
+        chevron.left() - 12.0 - rect.left() - 16.0,
+    );
+    paint_line_at(ui, rect.left() + 16.0, baseline_at(&title, center), title);
+    response.on_hover_cursor(CursorIcon::PointingHand).clicked()
+}
+
+fn settings_switch_row(ui: &mut Ui, title: &str, summary: &str, checked: bool) -> bool {
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), SETTINGS_SWITCH_HEIGHT),
+        Sense::hover(),
+    );
+    let title_center = rect.top() + 20.0;
+    let switch_id = title;
+    let title = row_line(
+        ui,
+        title,
+        FontId::proportional(15.0),
+        theme::p().text,
+        (rect.width() - 32.0 - 36.0 - 12.0).max(60.0),
+    );
+    paint_line_at(
+        ui,
+        rect.left() + 16.0,
+        baseline_at(&title, title_center),
+        title,
+    );
+    paint_line(
+        ui,
+        Pos2::new(rect.left() + 16.0, rect.top() + 33.0),
+        summary,
+        FontId::proportional(10.5),
+        theme::p().muted,
+        rect.width() - 32.0,
+    );
+    let track = Rect::from_min_size(
+        Pos2::new(rect.right() - 16.0 - 36.0, title_center - 10.0),
+        Vec2::new(36.0, 20.0),
+    );
+    let response = ui
+        .interact(
+            track.expand(4.0),
+            Id::unique(("settings-switch", switch_id)),
+            Sense::click(),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand);
+    ui.painter().rect_filled(
+        track,
+        CornerRadius::same(10),
+        if checked {
+            theme::p().accent
+        } else {
+            theme::p().switch_off
+        },
+    );
+    let knob_x = if checked {
+        track.right() - 10.0
+    } else {
+        track.left() + 10.0
+    };
+    ui.painter().circle_filled(
+        Pos2::new(knob_x, track.center().y),
+        7.0,
+        if checked {
+            theme::p().accent_text
+        } else {
+            theme::p().muted
+        },
+    );
+    response.clicked()
+}
+
+fn settings_update_row(ui: &mut Ui, state: &UpdateState) -> Option<SettingsAction> {
+    let (rect, _) = settings_row(ui, SETTINGS_ROW_HEIGHT, false);
+    let center = rect.center().y;
+    let busy = matches!(
+        state,
+        UpdateState::Checking | UpdateState::Downloading { .. }
+    );
+    let asset = match state {
+        UpdateState::Available { asset, .. } => asset.as_ref(),
+        _ => None,
+    };
+    let refresh = Rect::from_center_size(
+        Pos2::new(rect.right() - 16.0 - 15.0, center),
+        Vec2::splat(30.0),
+    );
+    let download = Rect::from_center_size(
+        Pos2::new(refresh.left() - 2.0 - 15.0, center),
+        Vec2::splat(30.0),
+    );
+    let label_right = if asset.is_some() {
+        download.left() - 6.0
+    } else {
+        refresh.left() - 6.0
+    };
+    let status = row_line(
+        ui,
+        &update_label(state),
+        FontId::proportional(11.5),
+        update_color(state),
+        220.0,
+    );
+    let title = row_line(
+        ui,
+        "检查更新",
+        FontId::proportional(15.0),
+        theme::p().text,
+        (label_right - status.galley.size().x - 12.0 - rect.left() - 16.0).max(60.0),
+    );
+    let baseline = baseline_at(&title, center);
+    paint_line_at(ui, rect.left() + 16.0, baseline, title);
+    paint_line_before(ui, label_right, baseline, status);
+
+    let mut action = None;
+    if asset.is_some()
+        && settings_icon_action(ui, download, Icon::Download, !busy, "下载更新").clicked()
+    {
+        action = Some(SettingsAction::DownloadUpdate);
+    }
+    if settings_icon_action(ui, refresh, Icon::Refresh, !busy, "检查更新").clicked() {
+        action = Some(SettingsAction::CheckUpdate);
+    }
+    if matches!(state, UpdateState::Available { asset: None, .. }) {
+        settings_footnote(ui, "这台机器没有对应的安装包");
+    }
+    if matches!(state, UpdateState::Idle) {
+        settings_footnote(ui, "安装包放进系统下载目录，装好重启就是新版本");
+    }
+    action
+}
+
+fn settings_icon_action(
+    ui: &mut Ui,
+    rect: Rect,
+    icon: Icon,
+    enabled: bool,
+    tip: &str,
+) -> egui::Response {
+    let response = ui.interact(
+        rect,
+        Id::unique(("settings-icon", tip)),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    if enabled && response.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(9), theme::p().hover);
+    }
+    icons::paint(
+        ui.painter(),
+        Rect::from_center_size(rect.center(), Vec2::splat(18.0)),
+        icon,
+        if enabled {
+            theme::p().muted
+        } else {
+            theme::p().faint
+        },
+    );
+    let response = if enabled {
+        response.on_hover_cursor(CursorIcon::PointingHand)
+    } else {
+        response
+    };
+    response.on_hover_text(tip)
+}
+
+fn settings_footnote(ui: &mut Ui, text: &str) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
+    paint_line(
+        ui,
+        Pos2::new(rect.left() + 16.0, rect.top() + 1.0),
+        text,
+        FontId::proportional(10.5),
+        theme::p().muted,
+        rect.width() - 32.0,
+    );
+}
+
+fn update_label(state: &UpdateState) -> String {
+    match state {
+        UpdateState::Idle => "还没检查过".to_string(),
+        UpdateState::Checking => "正在检查…".to_string(),
+        UpdateState::UpToDate(version) => format!("已是最新（{version}）"),
+        UpdateState::Available { release, .. } => {
+            format!("发现新版本 {}", release.version)
+        }
+        UpdateState::Downloading { asset, received } => format!(
+            "下载中 {} / {}",
+            human_size(*received),
+            human_size(asset.size)
+        ),
+        UpdateState::Downloaded(name) => format!("已下载 {name}"),
+        UpdateState::Failed(message) => format!("更新失败：{message}"),
+    }
+}
+
+fn update_color(state: &UpdateState) -> Color32 {
+    match state {
+        UpdateState::Failed(_) => theme::p().red,
+        UpdateState::Available { .. } => theme::p().amber,
+        UpdateState::Downloaded(_) => theme::p().green,
+        _ => theme::p().muted,
+    }
 }
 
 fn truncate_chars(text: &str, max: usize) -> String {

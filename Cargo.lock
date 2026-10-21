@@ -877,6 +877,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "sys-locale",
  "tokio",
  "tray-icon",
  "ureq",

@@ -372,6 +372,42 @@ impl History {
         self.remove(&ids)
     }
 
+    pub fn remove_expired(&mut self, before: i64) -> usize {
+        let doomed: Vec<String> = self
+            .items
+            .iter()
+            .filter(|item| !item.pinned && item.ts < before)
+            .map(|item| item.id.clone())
+            .collect();
+        if doomed.is_empty() {
+            return 0;
+        }
+        let (removed, kept): (Vec<Record>, Vec<Record>) = self
+            .items
+            .drain(..)
+            .partition(|item| doomed.contains(&item.id));
+        self.items = kept;
+        let mut paths: Vec<String> = removed
+            .iter()
+            .filter_map(|item| item.file.as_ref()?.local_path.clone())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        for path in paths {
+            let shared = self.items.iter().any(|item| {
+                item.file
+                    .as_ref()
+                    .and_then(|file| file.local_path.as_deref())
+                    == Some(path.as_str())
+            });
+            if !shared {
+                crate::paths::delete_cache(Some(&path));
+            }
+        }
+        self.dirty = true;
+        removed.len()
+    }
+
     pub fn undo(&mut self) -> Option<Vec<Record>> {
         let batch = self.trash.pop()?;
         self.items.extend(batch.iter().cloned());
@@ -744,6 +780,26 @@ mod tests {
         assert!(history.items.is_empty());
         history.undo();
         assert_eq!(history.items.len(), 2);
+    }
+
+    #[test]
+    fn expired_entries_leave_without_an_undo_step_and_keep_pinned_ones() {
+        let mut history = history("expired");
+        history.add(record_at("old", "old", 100));
+        history.add(record_at("keep", "keep", 400));
+        history.add(file_record("file", "photo.png", "sha-a", 100));
+        let path = crate::paths::write_cache("expired", "photo.png", b"png").unwrap();
+        history.mark_cached("file", &path);
+        history.toggle_pin("file");
+        assert_eq!(history.remove_expired(300), 1);
+        let ids: Vec<&str> = history.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, vec!["file", "keep"]);
+        assert_eq!(history.undo_depth(), 0);
+        assert!(std::path::Path::new(&path).exists());
+        assert_eq!(history.remove_expired(300), 0);
+        history.toggle_pin("file");
+        assert_eq!(history.remove_expired(300), 1);
+        assert!(!std::path::Path::new(&path).exists());
     }
 
     #[test]
