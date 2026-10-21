@@ -947,6 +947,8 @@ impl ClipSyncApp {
                     Pos2::new(left + width, screen.bottom()),
                 );
                 ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+                    // 视口从卡片下沿开始：内容不再滚进毛玻璃后面
+                    ui.add_space(bar_bottom - screen.top() + 14.0);
                     egui::ScrollArea::vertical()
                         .id_salt("settings-scroll")
                         .auto_shrink([false, false])
@@ -955,7 +957,6 @@ impl ClipSyncApp {
                         )
                         .show(ui, |ui| {
                             ui.set_width(width);
-                            ui.add_space(bar_bottom - screen.top() + 14.0);
                             ui.spacing_mut().item_spacing.y = 0.0;
 
                             settings_group(ui, "外观", |ui| {
@@ -2125,8 +2126,8 @@ impl ClipSyncApp {
     }
 }
 
-impl eframe::App for ClipSyncApp {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl ClipSyncApp {
+    fn tick(&mut self, ctx: &egui::Context) {
         if self.theme_mode == ThemeMode::System
             && theme::resolve_dark(ctx, self.theme_mode) != theme::p().dark
         {
@@ -2155,7 +2156,7 @@ impl eframe::App for ClipSyncApp {
         ctx.request_repaint_after(wait);
     }
 
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn draw(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         self.shortcuts(&ctx);
         theme::paint_background(&ctx, ctx.content_rect());
@@ -2184,13 +2185,13 @@ impl eframe::App for ClipSyncApp {
                     Pos2::new(left + width, screen.bottom()),
                 );
                 ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+                    // 视口从卡片下沿开始：列表内容不再滚进毛玻璃后面
+                    ui.add_space(self.header_bottom - screen.top() + 12.0);
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .show(ui, |ui| {
                             ui.set_width(width);
-                            let top = self.header_bottom - screen.top() + 12.0;
-                            ui.add_space(top);
                             self.banners(ui, &mut events);
                             let visible =
                                 self.history
@@ -2244,6 +2245,16 @@ impl eframe::App for ClipSyncApp {
         self.ensure_zoom(&ctx);
         self.show_zoom(&ctx);
         self.history.flush();
+    }
+}
+
+impl eframe::App for ClipSyncApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.tick(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
     }
 }
 
@@ -5412,5 +5423,99 @@ mod tests {
                 .chars()
                 .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit()));
         }
+    }
+
+    #[test]
+    fn list_viewport_clips_below_the_glass_header() {
+        use clipsync_core::{engine, mqtt::BrokerLinks};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+
+        let dir = std::env::temp_dir().join(format!("clipsync-viewport-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = super::ClipSyncApp::new(
+            engine::spawn(BrokerLinks),
+            super::History::open(dir.join("history.json")),
+            super::Settings::open(dir.join("settings.json"), "viewport-test"),
+            super::Preferences::open(dir.join("preferences.json")),
+        );
+        for index in 0..24 {
+            app.history.add(super::Record {
+                id: format!("id{index}"),
+                kind: super::KIND_TEXT.to_string(),
+                ts: 1_730_000_000_000,
+                sender_id: String::new(),
+                sender_name: "test".to_string(),
+                text: format!("第 {index} 条记录"),
+                file: None,
+                pinned: false,
+                order: 0,
+                note: String::new(),
+            });
+        }
+
+        let ctx = egui::Context::default();
+        super::theme::configure(&ctx);
+        super::theme::apply(&ctx, super::ThemeMode::Dark);
+        super::icons::install(&ctx);
+
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(920.0, 620.0));
+        let mut first = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        first.events = vec![egui::Event::PointerMoved(egui::pos2(460.0, 400.0))];
+        let mut output = ctx.run_ui(first, |ui| app.draw(ui));
+        output.textures_delta.clear();
+
+        let mut scroll = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        scroll.events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -1_200.0),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
+            modifiers: egui::Modifiers::default(),
+        });
+        let mut list_layer = egui::LayerId::background();
+        let mut clips = Vec::new();
+        let mut output = ctx.run_ui(scroll, |ui| {
+            app.draw(ui);
+            list_layer = ui.layer_id();
+            ui.ctx().graphics(|layers| {
+                if let Some(list) = layers.get(list_layer) {
+                    clips = list.all_entries().map(|entry| entry.clip_rect).collect();
+                }
+            });
+        });
+        output.textures_delta.clear();
+
+        let header_bottom = app.header_bottom;
+        let scrolled: Vec<_> = clips
+            .iter()
+            .filter(|rect| rect.min.y > screen.top() + 0.5)
+            .collect();
+        assert!(
+            !scrolled.is_empty(),
+            "the scrolled list painted nothing inside a clipped viewport"
+        );
+        for rect in scrolled {
+            assert!(
+                rect.min.y >= header_bottom - 0.5,
+                "list viewport starts at {:.1}, above the header bottom {:.1}",
+                rect.min.y,
+                header_bottom,
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
