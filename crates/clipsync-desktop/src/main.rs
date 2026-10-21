@@ -17,7 +17,7 @@ use std::net::TcpListener;
 use app::ClipSyncApp;
 use clipsync_core::engine;
 use clipsync_core::mqtt::BrokerLinks;
-use settings::{Preferences, Settings};
+use settings::{Preferences, Settings, ThemeMode};
 use store::History;
 
 const SINGLE_INSTANCE_PORT: u16 = 48124;
@@ -40,9 +40,7 @@ fn main() -> eframe::Result {
         "ClipSync",
         native_options(),
         Box::new(move |ctx| {
-            theme::configure(&ctx.egui_ctx);
-            theme::apply(&ctx.egui_ctx, preferences.theme());
-            icons::install(&ctx.egui_ctx);
+            configure_shell(&ctx.egui_ctx, preferences.theme());
             Ok(Box::new(ClipSyncApp::new(
                 engine,
                 history,
@@ -51,6 +49,12 @@ fn main() -> eframe::Result {
             )))
         }),
     )
+}
+
+fn configure_shell(ctx: &egui::Context, mode: ThemeMode) {
+    theme::configure(ctx);
+    theme::apply(ctx, mode);
+    icons::install(ctx);
 }
 
 fn native_options() -> eframe::NativeOptions {
@@ -62,5 +66,30 @@ fn native_options() -> eframe::NativeOptions {
             .with_titlebar_shown(false)
             .with_title_shown(false),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A panic here kills the process outright: the startup closure runs inside winit's
+    // `extern "C"` launch callback, so it aborts with an empty faulting stack.
+    #[test]
+    fn startup_style_renders_both_themes() {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let ctx = egui::Context::default();
+            configure_shell(&ctx, mode);
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.label("Aa09 中文");
+                theme::frost(
+                    ui.ctx(),
+                    ui.max_rect(),
+                    theme::GLASS_RADIUS,
+                    theme::frost_layer(),
+                );
+            });
+            output.textures_delta.clear();
+        }
     }
 }
