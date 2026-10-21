@@ -1,6 +1,10 @@
+use std::io::Cursor;
+use std::path::PathBuf;
 use std::time::Duration;
 
-use arboard::Clipboard;
+use arboard::{Clipboard, ImageData};
+use clipsync_core::crypto::sha256_hex;
+use clipsync_core::files::MAX_FILE_BYTES;
 
 pub const POLL_INTERVAL: Duration = Duration::from_millis(800);
 
@@ -49,27 +53,107 @@ impl CopyFilter {
     pub fn published(&mut self, text: &str) {
         self.published = Some(text.to_string());
     }
+
+    fn mark_seen(&mut self, text: Option<String>) {
+        if let Some(text) = meaningful(text) {
+            self.captured = Some(text);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipFile {
+    pub path: PathBuf,
+    pub name: String,
+    pub size: i64,
+}
+
+impl ClipFile {
+    pub fn mime(&self) -> &'static str {
+        clipsync_core::files::mime_for_name(&self.name)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ClipImage {
+    pub png: Vec<u8>,
+    pub hash: String,
+    pub name: String,
+}
+
+impl ClipImage {
+    pub fn mime(&self) -> &'static str {
+        "image/png"
+    }
+}
+
+pub enum Captured {
+    Text(String),
+    Files(Vec<ClipFile>),
+    Image(ClipImage),
 }
 
 pub struct ClipboardWatcher {
     clipboard: Option<Clipboard>,
     filter: CopyFilter,
+    last_files: Option<String>,
+    own_files: Option<String>,
+    last_image: Option<String>,
+    own_image: Option<String>,
 }
 
 impl ClipboardWatcher {
     pub fn new() -> Self {
         let mut clipboard = Clipboard::new().ok();
         let baseline = clipboard.as_mut().and_then(|clip| clip.get_text().ok());
+        let last_files = clipboard.as_mut().and_then(file_signature);
+        let last_image = clipboard.as_mut().and_then(image_fingerprint);
         Self {
             clipboard,
             filter: CopyFilter::new(baseline),
+            last_files,
+            own_files: None,
+            last_image,
+            own_image: None,
         }
     }
 
-    /// Some(text) only when the local user copied something we have not already broadcast.
-    pub fn poll(&mut self) -> Option<String> {
-        let text = self.clipboard.as_mut()?.get_text().ok();
-        self.filter.observe(text)
+    /// Files first: Finder also puts a text path on the pasteboard, and treating that
+    /// as text would sync the path instead of the file.
+    pub fn poll(&mut self, watch_files: bool, watch_images: bool) -> Option<Captured> {
+        let clipboard = self.clipboard.as_mut()?;
+
+        if watch_files {
+            let files = read_files(clipboard);
+            if !files.is_empty() {
+                let signature = signature_of(&files);
+                if Some(&signature) == self.last_files.as_ref()
+                    || Some(&signature) == self.own_files.as_ref()
+                {
+                    return None;
+                }
+                self.last_files = Some(signature);
+                return Some(Captured::Files(files));
+            }
+        }
+
+        let text = clipboard.get_text().ok();
+        if text.as_ref().is_some_and(|text| !text.trim().is_empty()) {
+            return self.filter.observe(text).map(Captured::Text);
+        }
+        self.filter.mark_seen(text);
+
+        if watch_images {
+            let image = read_image(clipboard)?;
+            if Some(&image.hash) == self.last_image.as_ref()
+                || Some(&image.hash) == self.own_image.as_ref()
+            {
+                return None;
+            }
+            self.last_image = Some(image.hash.clone());
+            return Some(Captured::Image(image));
+        }
+        None
     }
 
     /// The current clipboard text, for an explicit "send clipboard" action.
@@ -89,11 +173,116 @@ impl ClipboardWatcher {
     pub fn note_published(&mut self, text: &str) {
         self.filter.published(text);
     }
+
+    pub fn write_files(&mut self, paths: &[PathBuf]) -> bool {
+        if paths.is_empty() {
+            return false;
+        }
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            return false;
+        };
+        if clipboard.set().file_list(paths).is_err() {
+            return false;
+        }
+        let files = read_files(clipboard);
+        self.own_files = Some(signature_of(&files));
+        true
+    }
+
+    pub fn write_image(&mut self, png: &[u8]) -> Result<(), String> {
+        let decoded = image::load_from_memory(png).map_err(|error| error.to_string())?;
+        let rgba = decoded.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        let bytes = rgba.into_raw();
+        let hash = image_hash(&bytes, width, height);
+        let clipboard = self.clipboard.as_mut().ok_or("剪贴板不可用")?;
+        clipboard
+            .set_image(ImageData {
+                width: width as usize,
+                height: height as usize,
+                bytes: bytes.into(),
+            })
+            .map_err(|error| error.to_string())?;
+        self.own_image = Some(hash);
+        Ok(())
+    }
+}
+
+fn read_files(clipboard: &mut Clipboard) -> Vec<ClipFile> {
+    let Ok(paths) = clipboard.get().file_list() else {
+        return Vec::new();
+    };
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let meta = std::fs::metadata(&path).ok()?;
+            if !meta.is_file() || meta.len() == 0 {
+                return None;
+            }
+            let name = path.file_name()?.to_string_lossy().to_string();
+            Some(ClipFile {
+                path,
+                name,
+                size: meta.len() as i64,
+            })
+        })
+        .collect()
+}
+
+fn file_signature(clipboard: &mut Clipboard) -> Option<String> {
+    let files = read_files(clipboard);
+    (!files.is_empty()).then(|| signature_of(&files))
+}
+
+fn signature_of(files: &[ClipFile]) -> String {
+    files
+        .iter()
+        .map(|file| format!("{}:{}", file.name, file.size))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn read_image(clipboard: &mut Clipboard) -> Option<ClipImage> {
+    let image = clipboard.get_image().ok()?;
+    let width = image.width;
+    let height = image.height;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let rgba = image.bytes.into_owned();
+    let hash = image_hash(&rgba, width as u32, height as u32);
+    let dynamic = image::RgbaImage::from_raw(width as u32, height as u32, rgba.clone())?;
+    let mut png = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(dynamic)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .ok()?;
+    let png = png.into_inner();
+    if png.len() as i64 > MAX_FILE_BYTES {
+        return None;
+    }
+    Some(ClipImage {
+        png,
+        name: format!("image-{}.png", &hash[..8]),
+        hash,
+    })
+}
+
+fn image_fingerprint(clipboard: &mut Clipboard) -> Option<String> {
+    read_image(clipboard).map(|image| image.hash)
+}
+
+pub fn image_hash(rgba: &[u8], width: u32, height: u32) -> String {
+    let mut bytes = Vec::with_capacity(rgba.len() + 8);
+    bytes.extend_from_slice(&width.to_le_bytes());
+    bytes.extend_from_slice(&height.to_le_bytes());
+    bytes.extend_from_slice(rgba);
+    sha256_hex(&bytes)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::CopyFilter;
+    use super::{image_hash, signature_of, ClipFile, CopyFilter};
+    use std::path::PathBuf;
 
     #[test]
     fn startup_baseline_is_not_a_copy() {
@@ -134,5 +323,33 @@ mod tests {
         let mut filter = CopyFilter::new(None);
         filter.published("sent");
         assert_eq!(filter.observe(Some("sent".to_string())), None);
+    }
+
+    #[test]
+    fn file_signature_changes_with_name_or_size() {
+        let files = vec![
+            ClipFile {
+                path: PathBuf::from("/tmp/a.png"),
+                name: "a.png".into(),
+                size: 10,
+            },
+            ClipFile {
+                path: PathBuf::from("/tmp/b.pdf"),
+                name: "b.pdf".into(),
+                size: 20,
+            },
+        ];
+        assert_eq!(signature_of(&files), "a.png:10|b.pdf:20");
+        let mut changed = files.clone();
+        changed[1].size = 21;
+        assert_ne!(signature_of(&files), signature_of(&changed));
+    }
+
+    #[test]
+    fn image_hash_covers_dimensions_and_pixels() {
+        let a = image_hash(&[1, 2, 3, 4], 1, 1);
+        assert_eq!(a, image_hash(&[1, 2, 3, 4], 1, 1));
+        assert_ne!(a, image_hash(&[1, 2, 3, 5], 1, 1));
+        assert_ne!(a, image_hash(&[1, 2, 3, 4], 2, 1));
     }
 }

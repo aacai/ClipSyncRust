@@ -118,10 +118,11 @@ pub struct History {
 
 impl History {
     pub fn open(path: PathBuf) -> Self {
-        let items = std::fs::read_to_string(&path)
+        let mut items = std::fs::read_to_string(&path)
             .ok()
             .and_then(|raw| serde_json::from_str::<Vec<Record>>(&raw).ok())
             .unwrap_or_default();
+        items.sort_by(ordering);
         Self {
             path,
             items,
@@ -208,16 +209,6 @@ impl History {
         file.local_path = Some(path.to_string());
         self.dirty = true;
         true
-    }
-
-    pub fn cache_path(&self, id: &str) -> Option<String> {
-        self.items
-            .iter()
-            .find(|item| item.id == id)?
-            .file
-            .as_ref()?
-            .local_path
-            .clone()
     }
 
     pub fn file(&self, id: &str) -> Option<FileInfo> {
@@ -344,7 +335,34 @@ impl History {
             return 0;
         }
         let count = removed.len();
-        self.push_trash(removed);
+        let mut doomed: Vec<String> = removed
+            .iter()
+            .filter_map(|item| item.file.as_ref()?.local_path.clone())
+            .collect();
+        doomed.sort();
+        doomed.dedup();
+        for path in doomed {
+            let shared = self.items.iter().any(|item| {
+                item.file
+                    .as_ref()
+                    .and_then(|file| file.local_path.as_deref())
+                    == Some(path.as_str())
+            });
+            if !shared {
+                crate::paths::delete_cache(Some(&path));
+            }
+        }
+        let cleared = removed
+            .into_iter()
+            .map(|mut item| {
+                if let Some(file) = item.file.as_mut() {
+                    file.cached = false;
+                    file.local_path = None;
+                }
+                item
+            })
+            .collect();
+        self.push_trash(cleared);
         self.dirty = true;
         count
     }
@@ -536,6 +554,30 @@ mod tests {
         record_at(id, text, 1)
     }
 
+    fn file_record(id: &str, name: &str, sha: &str, ts: i64) -> Record {
+        Record {
+            id: id.to_string(),
+            kind: super::KIND_FILE.to_string(),
+            ts,
+            sender_id: "me".to_string(),
+            sender_name: "Me".to_string(),
+            text: name.to_string(),
+            file: Some(super::FileInfo {
+                name: name.to_string(),
+                mime: "image/png".to_string(),
+                size: 42,
+                sha256: sha.to_string(),
+                link: "https://example.test/a.bin".to_string(),
+                expires_at: ts + 1_000,
+                cached: false,
+                local_path: None,
+            }),
+            pinned: false,
+            order: 0,
+            note: String::new(),
+        }
+    }
+
     fn scratch(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("clipsync-history-{name}.json"))
     }
@@ -616,6 +658,25 @@ mod tests {
         assert_eq!(history.items.len(), 1);
         assert_eq!(history.items[0].order, 0);
         assert_eq!(history.items[0].note, "");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn loading_sorts_pinned_then_rank() {
+        let path = scratch("sorted-load");
+        cleanup(&path);
+        std::fs::write(
+            &path,
+            r#"[
+                {"id":"new","kind":"text","ts":300,"text":"new","pinned":false},
+                {"id":"pinned","kind":"text","ts":100,"text":"pinned","pinned":true},
+                {"id":"old","kind":"text","ts":200,"text":"old","pinned":false}
+            ]"#,
+        )
+        .unwrap();
+        let history = History::open(path.clone());
+        let ids: Vec<&str> = history.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, vec!["pinned", "new", "old"]);
         cleanup(&path);
     }
 
@@ -708,6 +769,63 @@ mod tests {
         assert_eq!(history.search("^clip.*sync$", false, true).len(), 0);
         assert_eq!(history.search("daily", false, false).len(), 1);
         assert!(history.search("[", true, false).is_empty());
+    }
+
+    #[test]
+    fn file_updates_keep_the_local_cache_when_the_bytes_match() {
+        let mut history = history("file-merge");
+        history.add(file_record("f", "photo.png", "sha-a", 100));
+        let path = crate::paths::write_cache("file-merge", "photo.png", b"png").unwrap();
+        history.mark_cached("f", &path);
+        let incoming = file_record("f", "photo.png", "sha-a", 200);
+        assert!(!history.add(incoming));
+        let file = history.file("f").unwrap();
+        assert!(file.cached);
+        assert_eq!(file.local_path.as_deref(), Some(path.as_str()));
+        assert_eq!(history.items.len(), 1);
+        history.remove(&["f".to_string()]);
+        crate::paths::delete_cache(Some(&path));
+    }
+
+    #[test]
+    fn the_same_file_with_another_id_is_deduped_by_hash() {
+        let mut history = history("file-dup");
+        history.add(file_record("a", "photo.png", "sha-a", 100));
+        history.add(file_record("b", "photo.png", "sha-a", 200));
+        assert_eq!(history.items.len(), 1);
+        assert_eq!(history.items[0].id, "a");
+        assert_eq!(history.items[0].ts, 200);
+    }
+
+    #[test]
+    fn deleting_a_file_drops_the_cache_and_undo_comes_back_uncached() {
+        let mut history = history("file-cache");
+        history.add(file_record("f", "photo.png", "sha-a", 100));
+        let path = crate::paths::write_cache("file-delete", "photo.png", b"png").unwrap();
+        history.mark_cached("f", &path);
+        history.remove(&["f".to_string()]);
+        assert!(!std::path::Path::new(&path).exists());
+        history.undo().expect("batch");
+        let file = history.file("f").unwrap();
+        assert!(!file.cached);
+        assert_eq!(file.local_path, None);
+    }
+
+    #[test]
+    fn a_duplicate_shares_the_cache_until_the_last_reference_is_gone() {
+        let mut history = history("file-shared");
+        history.add(file_record("f", "photo.png", "sha-a", 100));
+        let path = crate::paths::write_cache("file-shared", "photo.png", b"png").unwrap();
+        history.mark_cached("f", &path);
+        history.duplicate("f", "copy".to_string(), 200);
+        history.remove(&["copy".to_string()]);
+        assert!(std::path::Path::new(&path).exists());
+        assert_eq!(
+            history.file("f").unwrap().local_path.as_deref(),
+            Some(path.as_str())
+        );
+        history.remove(&["f".to_string()]);
+        crate::paths::delete_cache(Some(&path));
     }
 
     #[test]

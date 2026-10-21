@@ -57,57 +57,51 @@ pub fn downloads_dir() -> PathBuf {
     dirs::download_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
-pub fn sanitize_file_name(raw: &str) -> String {
-    let base = raw.rsplit('/').next().unwrap_or("");
-    let base = base.rsplit('\\').next().unwrap_or("");
-    let cleaned: String = base
-        .chars()
-        .map(|ch| {
-            if (ch as u32) < 0x20 || "\"*/:<>?\\|".contains(ch) {
-                '_'
-            } else {
-                ch
-            }
-        })
-        .collect::<String>()
-        .trim()
-        .trim_end_matches('.')
-        .chars()
-        .take(120)
-        .collect();
-    let stem = cleaned
-        .rsplit_once('.')
-        .map(|(stem, _)| stem)
-        .unwrap_or(cleaned.as_str());
-    const RESERVED: [&str; 22] = [
-        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
-        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
-    ];
-    if RESERVED.contains(&stem.to_lowercase().as_str()) {
-        format!("_{cleaned}")
+pub use clipsync_core::files::{numbered_name, sanitize_file_name};
+
+pub fn cache_dir() -> PathBuf {
+    app_dir().join("cache")
+}
+
+pub fn write_cache(id: &str, name: &str, bytes: &[u8]) -> std::io::Result<String> {
+    let safe = sanitize_file_name(name);
+    let name = if safe.is_empty() {
+        "file"
     } else {
-        cleaned
+        safe.as_str()
+    };
+    let dir = cache_dir().join(id);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(name);
+    std::fs::write(&path, bytes)?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+pub fn delete_cache(path: Option<&str>) {
+    let Some(path) = path else {
+        return;
+    };
+    let _ = std::fs::remove_file(path);
+    if let Some(parent) = Path::new(path).parent() {
+        if parent.starts_with(cache_dir()) {
+            let _ = std::fs::remove_dir(parent);
+        }
     }
 }
 
-pub fn numbered_name(name: &str, exists: impl Fn(&str) -> bool) -> String {
-    if !exists(name) {
-        return name.to_string();
-    }
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => (stem, Some(ext)),
-        _ => (name, None),
+pub fn open_path(path: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "start", ""]);
+        command
     };
-    for index in 1..1000 {
-        let candidate = match ext {
-            Some(ext) => format!("{stem} ({index}).{ext}"),
-            None => format!("{stem} ({index})"),
-        };
-        if !exists(&candidate) {
-            return candidate;
-        }
-    }
-    name.to_string()
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = std::process::Command::new("xdg-open");
+    command.arg(path).spawn()?;
+    Ok(())
 }
 
 pub fn save_to_downloads(name: &str, bytes: &[u8]) -> std::io::Result<String> {
@@ -123,17 +117,6 @@ pub fn save_to_downloads(name: &str, bytes: &[u8]) -> std::io::Result<String> {
     let written = numbered_name(&safe, |candidate| dir.join(candidate).exists());
     std::fs::write(dir.join(&written), bytes)?;
     Ok(written)
-}
-
-pub fn downloads_path(name: &str) -> PathBuf {
-    downloads_dir().join(name)
-}
-
-pub fn ensure_parent(path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

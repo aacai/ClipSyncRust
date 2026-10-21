@@ -1,11 +1,13 @@
 mod app;
 mod clipboard;
 mod icons;
+mod jobs;
 mod paths;
 mod settings;
 mod store;
 mod text_tools;
 mod theme;
+mod transfer;
 mod translate;
 
 use std::net::TcpListener;

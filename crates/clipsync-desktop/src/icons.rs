@@ -38,6 +38,9 @@ pub enum Icon {
     Move,
     Shield,
     Globe,
+    Attach,
+    Download,
+    OpenInNew,
 }
 
 pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -253,6 +256,38 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 ],
                 false,
             );
+        }
+        Attach => {
+            pen.line((16.5, 5.4), (16.5, 17.0));
+            pen.arc(12.0, 17.0, 4.5, 0.0, 180.0);
+            pen.line((7.5, 17.0), (7.5, 5.0));
+            pen.arc(12.0, 5.0, 4.5, 180.0, 360.0);
+            pen.line((9.2, 6.2), (9.2, 15.4));
+            pen.arc(10.95, 15.4, 1.75, 0.0, 180.0);
+            pen.line((12.7, 15.4), (12.7, 6.2));
+            pen.line((9.2, 6.2), (12.7, 6.2));
+        }
+        Download => {
+            pen.line((12.0, 3.4), (12.0, 15.0));
+            pen.polyline(&[(7.6, 10.7), (12.0, 15.1), (16.4, 10.7)], false);
+            pen.polyline(
+                &[(4.2, 16.6), (4.2, 20.2), (19.8, 20.2), (19.8, 16.6)],
+                false,
+            );
+        }
+        OpenInNew => {
+            pen.polyline(
+                &[
+                    (12.4, 4.0),
+                    (5.0, 4.0),
+                    (5.0, 19.2),
+                    (20.0, 19.2),
+                    (20.0, 11.6),
+                ],
+                false,
+            );
+            pen.line((11.2, 12.8), (20.0, 4.0));
+            pen.polyline(&[(14.7, 4.0), (20.0, 4.0), (20.0, 9.3)], false);
         }
     }
 }
