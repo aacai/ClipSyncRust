@@ -947,8 +947,8 @@ impl ClipSyncApp {
                     Pos2::new(left + width, screen.bottom()),
                 );
                 ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-                    // 视口从卡片下沿开始：内容不再滚进毛玻璃后面
-                    ui.add_space(bar_bottom - screen.top() + 14.0);
+                    let bar_top = screen.top() + theme::TOP_INSET + 4.0;
+                    ui.add_space(bar_top - screen.top());
                     egui::ScrollArea::vertical()
                         .id_salt("settings-scroll")
                         .auto_shrink([false, false])
@@ -957,6 +957,7 @@ impl ClipSyncApp {
                         )
                         .show(ui, |ui| {
                             ui.set_width(width);
+                            ui.add_space(bar_bottom - bar_top + 14.0);
                             ui.spacing_mut().item_spacing.y = 0.0;
 
                             settings_group(ui, "外观", |ui| {
@@ -2185,13 +2186,15 @@ impl ClipSyncApp {
                     Pos2::new(left + width, screen.bottom()),
                 );
                 ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-                    // 视口从卡片下沿开始：列表内容不再滚进毛玻璃后面
-                    ui.add_space(self.header_bottom - screen.top() + 12.0);
+                    let header_top = screen.top() + theme::TOP_INSET + theme::CONTENT_MARGIN;
+                    // 视口裁剪在卡片顶沿：内容可以滑到毛玻璃后面，但不会露出卡片上方
+                    ui.add_space(header_top - screen.top());
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .show(ui, |ui| {
                             ui.set_width(width);
+                            ui.add_space(self.header_bottom - header_top + 12.0);
                             self.banners(ui, &mut events);
                             let visible =
                                 self.history
@@ -5426,7 +5429,7 @@ mod tests {
     }
 
     #[test]
-    fn list_viewport_clips_below_the_glass_header() {
+    fn list_viewport_clips_at_the_glass_header_top() {
         use clipsync_core::{engine, mqtt::BrokerLinks};
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -5489,7 +5492,7 @@ mod tests {
         let mut clips = Vec::new();
         let mut output = ctx.run_ui(scroll, |ui| {
             app.draw(ui);
-            list_layer = ui.layer_id();
+            list_layer = egui::LayerId::background();
             ui.ctx().graphics(|layers| {
                 if let Some(list) = layers.get(list_layer) {
                     clips = list.all_entries().map(|entry| entry.clip_rect).collect();
@@ -5498,21 +5501,18 @@ mod tests {
         });
         output.textures_delta.clear();
 
-        let header_bottom = app.header_bottom;
-        let scrolled: Vec<_> = clips
-            .iter()
-            .filter(|rect| rect.min.y > screen.top() + 0.5)
-            .collect();
+        let header_top = screen.top() + super::theme::TOP_INSET + super::theme::CONTENT_MARGIN;
+        let top = screen.top();
+        let scrolled: Vec<_> = clips.iter().filter(|rect| rect.min.y > top + 0.5).collect();
         assert!(
             !scrolled.is_empty(),
-            "the scrolled list painted nothing inside a clipped viewport"
+            "no clipped list shape below y={top}, header top at {header_top}, clips={clips:?}"
         );
         for rect in scrolled {
             assert!(
-                rect.min.y >= header_bottom - 0.5,
-                "list viewport starts at {:.1}, above the header bottom {:.1}",
+                (rect.min.y - header_top).abs() <= 0.5,
+                "list viewport starts at {:.1}, expected the glass header top {header_top:.1}",
                 rect.min.y,
-                header_bottom,
             );
         }
 
