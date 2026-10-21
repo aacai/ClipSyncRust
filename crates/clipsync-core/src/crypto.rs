@@ -1,5 +1,5 @@
 use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
+    aead::{Aead, AeadCore, KeyInit, Payload},
     Aes256Gcm,
 };
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -46,10 +46,10 @@ pub fn random_iv() -> [u8; IV_SIZE] {
 
 pub fn aes_gcm_encrypt(key: &[u8], iv: &[u8], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, ()> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| ())?;
-    let nonce = aes_gcm::Nonce::<Aes256Gcm>::from_slice(iv);
+    let nonce = aes_gcm::Nonce::<<Aes256Gcm as AeadCore>::NonceSize>::try_from(iv).map_err(|_| ())?;
     cipher
         .encrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: plaintext,
                 aad,
@@ -60,10 +60,10 @@ pub fn aes_gcm_encrypt(key: &[u8], iv: &[u8], aad: &[u8], plaintext: &[u8]) -> R
 
 pub fn aes_gcm_decrypt(key: &[u8], iv: &[u8], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, ()> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| ())?;
-    let nonce = aes_gcm::Nonce::<Aes256Gcm>::from_slice(iv);
+    let nonce = aes_gcm::Nonce::<<Aes256Gcm as AeadCore>::NonceSize>::try_from(iv).map_err(|_| ())?;
     cipher
         .decrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: ciphertext,
                 aad,

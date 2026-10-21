@@ -59,11 +59,11 @@ impl RoomCrypto {
     }
 
     pub fn key_material(&self) -> Zeroizing<Vec<u8>> {
-        Zeroizing::new(self.key.to_vec())
+        Zeroizing::new(self.key[..].to_vec())
     }
 
     pub fn safety_number(&self) -> String {
-        safety_number(&self.key)
+        safety_number(&self.key[..])
     }
 
     pub fn safety_prefix(&self) -> String {
@@ -87,7 +87,7 @@ impl RoomCrypto {
         if iv.len() != IV_SIZE {
             return Err(RoomError::TooShort);
         }
-        let body = aes_gcm_encrypt(&self.key, iv, aad, plaintext).map_err(|_| RoomError::Decrypt)?;
+        let body = aes_gcm_encrypt(&self.key[..], iv, aad, plaintext).map_err(|_| RoomError::Decrypt)?;
         let mut out = iv.to_vec();
         out.extend_from_slice(&body);
         Ok(out)
@@ -102,6 +102,6 @@ impl RoomCrypto {
         if raw.len() < IV_SIZE + TAG_SIZE {
             return Err(RoomError::TooShort);
         }
-        aes_gcm_decrypt(&self.key, &raw[..IV_SIZE], aad, &raw[IV_SIZE..]).map_err(|_| RoomError::Decrypt)
+        aes_gcm_decrypt(&self.key[..], &raw[..IV_SIZE], aad, &raw[IV_SIZE..]).map_err(|_| RoomError::Decrypt)
     }
 }
