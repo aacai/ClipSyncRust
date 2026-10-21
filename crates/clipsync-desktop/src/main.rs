@@ -4,7 +4,9 @@ mod icons;
 mod paths;
 mod settings;
 mod store;
+mod text_tools;
 mod theme;
+mod translate;
 
 use std::net::TcpListener;
 

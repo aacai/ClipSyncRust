@@ -37,6 +37,7 @@ pub enum Icon {
     Bottom,
     Move,
     Shield,
+    Globe,
 }
 
 pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -234,6 +235,24 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 true,
             );
             pen.polyline(&[(8.2, 12.0), (11.0, 14.8), (16.0, 8.8)], false);
+        }
+        Globe => {
+            pen.circle(12.0, 12.0, 8.6);
+            pen.line((3.4, 12.0), (20.6, 12.0));
+            pen.polyline(
+                &[
+                    (12.0, 3.4),
+                    (8.6, 6.4),
+                    (8.0, 11.0),
+                    (9.6, 16.0),
+                    (12.0, 20.6),
+                    (14.2, 16.0),
+                    (16.0, 11.0),
+                    (15.2, 6.6),
+                    (12.0, 3.4),
+                ],
+                false,
+            );
         }
     }
 }

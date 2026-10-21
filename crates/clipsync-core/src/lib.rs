@@ -1,14 +1,17 @@
 pub mod crypto;
 pub mod engine;
 pub mod envelope;
+pub mod files;
 pub mod link;
 pub mod mqtt;
 pub mod protocol;
 pub mod room;
 pub mod secrets;
 
-pub use engine::{Clip, Config, EngineHandle, Event, LinkFactory, Peer, Status};
-pub use envelope::{ClipEnvelope, ClipPayload, PresenceEnvelope};
+pub use engine::{
+    Clip, Config, EngineHandle, Event, FileAttachment, FileUpload, LinkFactory, Peer, Status,
+};
+pub use envelope::{ClipEnvelope, ClipPayload, FilePayload, PresenceEnvelope};
 pub use link::{LinkEvent, MqttLink};
 pub use mqtt::{BrokerLink, BrokerLinks};
 pub use protocol::{Channel, RoomTopic};

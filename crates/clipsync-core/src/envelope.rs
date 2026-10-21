@@ -21,6 +21,17 @@ pub struct ClipPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilePayload {
+    pub name: String,
+    pub mime: String,
+    pub size: i64,
+    pub sha256: String,
+    pub link: String,
+    #[serde(rename = "expiresAt")]
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PresenceEnvelope {
     #[serde(default = "protocol_version")]
     pub v: i32,

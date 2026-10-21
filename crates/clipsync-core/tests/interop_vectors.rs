@@ -1,5 +1,5 @@
 use base64::{prelude::BASE64_STANDARD, Engine};
-use clipsync_core::envelope::{ClipEnvelope, ClipPayload, PresenceEnvelope};
+use clipsync_core::envelope::{ClipEnvelope, ClipPayload, FilePayload, PresenceEnvelope};
 use clipsync_core::protocol::{
     client_id, clip_topic, file_mid, parse_topic, presence_topic, room_filter, room_hash,
     safety_number, safety_prefix, sync_topic, text_mid, Channel,
@@ -195,6 +195,25 @@ fn clip_json_is_byte_identical_to_kotlin() {
         .unwrap(),
         "{\"text\":\"hello clipsync\",\"len\":15}"
     );
+}
+
+#[test]
+fn file_json_is_byte_identical_to_kotlin() {
+    let wire = serde_json::to_string(&FilePayload {
+        name: "photo.png".into(),
+        mime: "image/png".into(),
+        size: 42,
+        sha256: "ab".into(),
+        link: "https://litterbox.catbox.moe/x.bin".into(),
+        expires_at: 1700000000000,
+    })
+    .unwrap();
+    assert_eq!(
+        wire,
+        "{\"name\":\"photo.png\",\"mime\":\"image/png\",\"size\":42,\"sha256\":\"ab\",\"link\":\"https://litterbox.catbox.moe/x.bin\",\"expiresAt\":1700000000000}"
+    );
+    let parsed: FilePayload = serde_json::from_str(&wire).unwrap();
+    assert_eq!(parsed.expires_at, 1700000000000);
 }
 
 #[test]

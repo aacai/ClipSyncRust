@@ -3,13 +3,14 @@ use std::sync::{Arc, Mutex};
 
 use async_channel::{unbounded, Receiver, Sender};
 
-use clipsync_core::engine::{self, Config, Event, LinkFactory, Status};
+use clipsync_core::engine::{self, Config, Event, FileUpload, LinkFactory, Status};
+use clipsync_core::files::MAX_FILE_BYTES;
 use clipsync_core::link::{LinkEvent, MqttLink};
 use clipsync_core::protocol::{
-    clip_topic, presence_topic, room_filter, room_hash, sync_topic, PROTOCOL_VERSION,
+    clip_topic, file_mid, presence_topic, room_filter, room_hash, sync_topic, PROTOCOL_VERSION,
 };
 use clipsync_core::room::RoomCrypto;
-use clipsync_core::{ClipEnvelope, ClipPayload, PresenceEnvelope};
+use clipsync_core::{ClipEnvelope, ClipPayload, FilePayload, PresenceEnvelope};
 
 const ROOM: &str = "TESTROOM01";
 const ME: &str = "dev-me";
@@ -220,6 +221,30 @@ impl Harness {
             dev: dev.to_string(),
             name: name.to_string(),
             kind: "text".to_string(),
+            ct,
+        };
+        (topic, serde_json::to_string(&envelope).unwrap())
+    }
+
+    fn file_clip(
+        &self,
+        dev: &str,
+        name: &str,
+        payload: &FilePayload,
+        with: &RoomCrypto,
+    ) -> (String, String) {
+        let topic = clip_topic(&self.hash);
+        let json = serde_json::to_string(payload).unwrap();
+        let ct = with
+            .encrypt(json.as_bytes(), topic.as_bytes())
+            .expect("encrypt");
+        let envelope = ClipEnvelope {
+            v: PROTOCOL_VERSION,
+            mid: "fedcba9876543210".to_string(),
+            ts: clipsync_core::protocol::now_millis(),
+            dev: dev.to_string(),
+            name: name.to_string(),
+            kind: "file".to_string(),
             ct,
         };
         (topic, serde_json::to_string(&envelope).unwrap())
@@ -473,6 +498,157 @@ async fn a_copy_is_recorded_even_when_the_wire_is_down() {
             .count(),
         0
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn publish_file_sends_encrypted_metadata_and_announces_the_record() {
+    let mut h = Harness::start().await;
+    h.online().await;
+
+    let bytes = b"hello";
+    let sha = clipsync_core::crypto::sha256_hex(bytes);
+    let upload = FileUpload {
+        mid: file_mid("report.pdf", bytes.len(), ME),
+        ts: 1_700_000_000_000,
+        name: "report.pdf".into(),
+        mime: "application/pdf".into(),
+        size: bytes.len() as i64,
+        sha256: sha.clone(),
+        link: "https://litterbox.catbox.moe/cs-abc.bin".into(),
+        expires_at: 1_700_259_200_000,
+    };
+    h.engine.publish_file(upload.clone(), true);
+
+    match h.next().await {
+        Event::Clip(clip) => {
+            assert!(clip.mine);
+            assert_eq!(clip.text, "report.pdf");
+            let file = clip.file.expect("announced clip carries its file");
+            assert_eq!(file.sha256, sha);
+            assert_eq!(file.link, upload.link);
+        }
+        other => panic!("expected the local file clip, got {other:?}"),
+    }
+
+    let published = h.broker.published();
+    let (topic, wire) = published
+        .iter()
+        .rev()
+        .find(|(topic, _)| topic == &clip_topic(&h.hash))
+        .expect("file envelope was published");
+    let envelope: ClipEnvelope = serde_json::from_str(wire).unwrap();
+    assert_eq!(envelope.kind, "file");
+    assert_eq!(envelope.mid, upload.mid);
+    assert_eq!(envelope.ts, upload.ts);
+    let plain = crypto().decrypt(&envelope.ct, topic.as_bytes()).unwrap();
+    let payload: FilePayload = serde_json::from_str(&String::from_utf8(plain).unwrap()).unwrap();
+    assert_eq!(payload.name, "report.pdf");
+    assert_eq!(payload.size, bytes.len() as i64);
+    assert_eq!(payload.expires_at, upload.expires_at);
+}
+
+#[tokio::test(start_paused = true)]
+async fn resend_publishes_without_adding_a_second_record() {
+    let mut h = Harness::start().await;
+    h.online().await;
+    let upload = FileUpload {
+        mid: "fedcba9876543210".into(),
+        ts: 42,
+        name: "queued.png".into(),
+        mime: "image/png".into(),
+        size: 3,
+        sha256: "ab".into(),
+        link: "https://litterbox.catbox.moe/cs-x.bin".into(),
+        expires_at: 99,
+    };
+    h.engine.publish_file(upload, false);
+    for _ in 0..100 {
+        if h.broker
+            .published()
+            .iter()
+            .any(|(topic, _)| topic == &clip_topic(&h.hash))
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let (topic, wire) = h
+        .broker
+        .published()
+        .into_iter()
+        .find(|(topic, _)| topic == &clip_topic(&h.hash))
+        .expect("resent envelope was published");
+    let envelope: ClipEnvelope = serde_json::from_str(&wire).unwrap();
+    assert_eq!(envelope.kind, "file");
+    assert_eq!(envelope.ts, 42);
+    let _ = topic;
+
+    h.broker.inject(LinkEvent::Message {
+        topic: clip_topic(&h.hash),
+        payload: "not json".to_string(),
+    });
+    let (topic, wire) = h.clip("peer", "Peer", "after", &crypto());
+    h.broker.inject(LinkEvent::Message {
+        topic,
+        payload: wire,
+    });
+    match h.next().await {
+        Event::Clip(clip) => assert_eq!(clip.text, "after"),
+        other => panic!("resend should not emit a clip, got {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn incoming_file_metadata_becomes_a_file_clip() {
+    let mut h = Harness::start().await;
+    h.online().await;
+    let payload = FilePayload {
+        name: "../../etc/photo.png".into(),
+        mime: "image/png".into(),
+        size: 8,
+        sha256: "abc".into(),
+        link: "https://litterbox.catbox.moe/cs-y.bin".into(),
+        expires_at: 123,
+    };
+    let (topic, wire) = h.file_clip("peer", "Pixel", &payload, &crypto());
+    h.broker.inject(LinkEvent::Message {
+        topic,
+        payload: wire,
+    });
+    match h.next().await {
+        Event::Clip(clip) => {
+            assert!(!clip.mine);
+            assert_eq!(clip.text, "photo.png");
+            assert_eq!(clip.mid, "fedcba9876543210");
+            let file = clip.file.expect("file metadata is attached");
+            assert_eq!(file.name, "../../etc/photo.png");
+            assert_eq!(file.link, payload.link);
+        }
+        other => panic!("expected the incoming file, got {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn oversized_incoming_file_is_reported_and_dropped() {
+    let mut h = Harness::start().await;
+    h.online().await;
+    let payload = FilePayload {
+        name: "huge.iso".into(),
+        mime: "application/octet-stream".into(),
+        size: MAX_FILE_BYTES + 1,
+        sha256: "abc".into(),
+        link: "https://litterbox.catbox.moe/cs-z.bin".into(),
+        expires_at: 123,
+    };
+    let (topic, wire) = h.file_clip("peer", "Pixel", &payload, &crypto());
+    h.broker.inject(LinkEvent::Message {
+        topic,
+        payload: wire,
+    });
+    match h.next().await {
+        Event::FileTooLarge(name) => assert_eq!(name, "huge.iso"),
+        other => panic!("expected a too-large report, got {other:?}"),
+    }
 }
 
 async fn wait_peers(h: &mut Harness, want: usize) {

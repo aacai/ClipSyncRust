@@ -9,6 +9,23 @@ use clipsync_core::engine::Clip;
 pub const MAX_ITEMS: usize = 500;
 pub const MAX_UNDO: usize = 20;
 pub const KIND_TEXT: &str = "text";
+pub const KIND_FILE: &str = "file";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileInfo {
+    pub name: String,
+    pub mime: String,
+    pub size: i64,
+    pub sha256: String,
+    #[serde(default)]
+    pub link: String,
+    #[serde(default)]
+    pub expires_at: i64,
+    #[serde(default)]
+    pub cached: bool,
+    #[serde(default)]
+    pub local_path: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
@@ -23,6 +40,8 @@ pub struct Record {
     #[serde(default)]
     pub text: String,
     #[serde(default)]
+    pub file: Option<FileInfo>,
+    #[serde(default)]
     pub pinned: bool,
     #[serde(default)]
     pub order: i64,
@@ -36,13 +55,28 @@ fn default_kind() -> String {
 
 impl Record {
     pub fn from_clip(clip: &Clip) -> Self {
+        let file = clip.file.as_ref().map(|file| FileInfo {
+            name: file.name.clone(),
+            mime: file.mime.clone(),
+            size: file.size,
+            sha256: file.sha256.clone(),
+            link: file.link.clone(),
+            expires_at: file.expires_at,
+            cached: false,
+            local_path: None,
+        });
         Self {
             id: clip.mid.clone(),
-            kind: KIND_TEXT.to_string(),
+            kind: if file.is_some() {
+                KIND_FILE.to_string()
+            } else {
+                KIND_TEXT.to_string()
+            },
             ts: clip.ts,
             sender_id: clip.sender_id.clone(),
             sender_name: clip.sender_name.clone(),
             text: clip.text.clone(),
+            file,
             pinned: false,
             order: 0,
             note: String::new(),
@@ -101,6 +135,19 @@ impl History {
             existing.ts = record.ts;
             existing.kind = record.kind;
             existing.text = record.text;
+            if let Some(incoming) = record.file {
+                let cached = existing
+                    .file
+                    .as_ref()
+                    .filter(|current| current.sha256 == incoming.sha256)
+                    .map(|current| (current.cached, current.local_path.clone()));
+                let mut merged = incoming;
+                if let Some((cached, path)) = cached {
+                    merged.cached = cached;
+                    merged.local_path = path;
+                }
+                existing.file = Some(merged);
+            }
             existing.pinned = record.pinned;
             self.dirty = true;
             self.sort();
@@ -144,6 +191,51 @@ impl History {
             return false;
         }
         item.note = note.to_string();
+        self.dirty = true;
+        true
+    }
+
+    pub fn mark_cached(&mut self, id: &str, path: &str) -> bool {
+        let Some(file) = self
+            .items
+            .iter_mut()
+            .find(|item| item.id == id)
+            .and_then(|item| item.file.as_mut())
+        else {
+            return false;
+        };
+        file.cached = true;
+        file.local_path = Some(path.to_string());
+        self.dirty = true;
+        true
+    }
+
+    pub fn cache_path(&self, id: &str) -> Option<String> {
+        self.items
+            .iter()
+            .find(|item| item.id == id)?
+            .file
+            .as_ref()?
+            .local_path
+            .clone()
+    }
+
+    pub fn file(&self, id: &str) -> Option<FileInfo> {
+        self.items.iter().find(|item| item.id == id)?.file.clone()
+    }
+
+    pub fn fill_file_meta(&mut self, id: &str, link: &str, sha256: &str, expires_at: i64) -> bool {
+        let Some(file) = self
+            .items
+            .iter_mut()
+            .find(|item| item.id == id)
+            .and_then(|item| item.file.as_mut())
+        else {
+            return false;
+        };
+        file.link = link.to_string();
+        file.sha256 = sha256.to_string();
+        file.expires_at = expires_at;
         self.dirty = true;
         true
     }
@@ -328,7 +420,20 @@ impl History {
                     "senderId": item.sender_id,
                     "senderName": item.sender_name,
                     "text": item.text,
-                    "file": null,
+                    "file": item.file.as_ref().map(|file| json!({
+                        "id": item.id,
+                        "name": file.name,
+                        "mime": file.mime,
+                        "size": file.size,
+                        "sha256": file.sha256,
+                        "link": file.link,
+                        "expiresAt": file.expires_at,
+                        "ts": item.ts,
+                        "senderId": item.sender_id,
+                        "senderName": item.sender_name,
+                        "cached": file.cached,
+                        "localPath": file.local_path,
+                    })),
                     "pinned": item.pinned,
                     "order": item.order,
                     "note": item.note,
@@ -377,11 +482,35 @@ impl History {
 }
 
 fn same_content(a: &Record, b: &Record) -> bool {
-    a.kind == b.kind && a.kind == KIND_TEXT && a.text == b.text
+    if a.kind != b.kind {
+        return false;
+    }
+    match a.kind.as_str() {
+        KIND_TEXT => a.text == b.text,
+        KIND_FILE => {
+            let sa = a
+                .file
+                .as_ref()
+                .map(|file| file.sha256.as_str())
+                .unwrap_or("");
+            let sb = b
+                .file
+                .as_ref()
+                .map(|file| file.sha256.as_str())
+                .unwrap_or("");
+            !sa.is_empty() && sa == sb
+        }
+        _ => a.text == b.text && a.file == b.file,
+    }
 }
 
 fn item_matches(item: &Record, matches: impl Fn(&str) -> bool) -> bool {
-    matches(&item.text) || (!item.note.is_empty() && matches(&item.note))
+    if matches(&item.text) || (!item.note.is_empty() && matches(&item.note)) {
+        return true;
+    }
+    item.file
+        .as_ref()
+        .is_some_and(|file| matches(&file.name) || matches(&file.mime))
 }
 
 #[cfg(test)]
@@ -396,6 +525,7 @@ mod tests {
             sender_id: "me".to_string(),
             sender_name: "Me".to_string(),
             text: text.to_string(),
+            file: None,
             pinned: false,
             order: 0,
             note: String::new(),

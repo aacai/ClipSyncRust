@@ -4,11 +4,12 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::envelope::{ClipEnvelope, ClipPayload, PresenceEnvelope};
+use crate::envelope::{ClipEnvelope, ClipPayload, FilePayload, PresenceEnvelope};
+use crate::files::{sanitize_file_name, MAX_FILE_BYTES};
 use crate::link::{self, LinkEvent, LinkHandle, MqttLink};
 use crate::protocol::{
     clip_topic, now_millis, parse_topic, presence_topic, room_filter, room_hash, safety_prefix,
-    sync_topic, text_mid, utf16_len, Channel, PROTOCOL_VERSION,
+    sync_topic, text_mid, utf16_len, Channel, KIND_FILE, PROTOCOL_VERSION,
 };
 use crate::room::RoomCrypto;
 
@@ -50,6 +51,16 @@ pub struct Peer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileAttachment {
+    pub name: String,
+    pub mime: String,
+    pub size: i64,
+    pub sha256: String,
+    pub link: String,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Clip {
     pub mid: String,
     pub text: String,
@@ -57,6 +68,19 @@ pub struct Clip {
     pub sender_name: String,
     pub ts: i64,
     pub mine: bool,
+    pub file: Option<FileAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileUpload {
+    pub mid: String,
+    pub ts: i64,
+    pub name: String,
+    pub mime: String,
+    pub size: i64,
+    pub sha256: String,
+    pub link: String,
+    pub expires_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +89,7 @@ pub enum Event {
     Clip(Clip),
     Peers(Vec<Peer>),
     KeyMismatch(Vec<String>),
+    FileTooLarge(String),
 }
 
 #[derive(Debug)]
@@ -72,6 +97,7 @@ pub enum Command {
     Join(Config),
     Leave,
     PublishText(String),
+    PublishFile { file: FileUpload, announce: bool },
     Rename(String),
     RetryNow,
 }
@@ -93,6 +119,10 @@ impl EngineHandle {
 
     pub fn publish_text(&self, text: &str) {
         let _ = self.commands.send(Command::PublishText(text.to_string()));
+    }
+
+    pub fn publish_file(&self, file: FileUpload, announce: bool) {
+        let _ = self.commands.send(Command::PublishFile { file, announce });
     }
 
     pub fn rename(&self, name: &str) {
@@ -216,6 +246,7 @@ impl<F: LinkFactory> Engine<F> {
                 self.set_status(Status::Idle, recovery);
             }
             Command::PublishText(text) => self.publish_text(&text).await,
+            Command::PublishFile { file, announce } => self.publish_file(file, announce).await,
             Command::Rename(name) => {
                 let name = name.trim().to_string();
                 let changed = match self.desired.as_mut() {
@@ -368,7 +399,7 @@ impl<F: LinkFactory> Engine<F> {
         let Ok(envelope) = serde_json::from_str::<ClipEnvelope>(raw) else {
             return;
         };
-        if envelope.v != PROTOCOL_VERSION || envelope.kind != KIND_TEXT {
+        if envelope.v != PROTOCOL_VERSION {
             return;
         }
         if envelope.dev == config.device_id {
@@ -376,6 +407,13 @@ impl<F: LinkFactory> Engine<F> {
         }
         if let Some(peer) = self.peers.get(&envelope.dev) {
             self.seen.insert(peer.id.clone(), Instant::now());
+        }
+        if envelope.kind == KIND_FILE {
+            self.on_file_clip(&envelope, crypto, topic);
+            return;
+        }
+        if envelope.kind != KIND_TEXT {
+            return;
         }
         let Ok(plain) = crypto.decrypt(&envelope.ct, topic.as_bytes()) else {
             return;
@@ -391,6 +429,40 @@ impl<F: LinkFactory> Engine<F> {
             sender_name: envelope.name,
             ts: envelope.ts,
             mine: false,
+            file: None,
+        }));
+    }
+
+    fn on_file_clip(&self, envelope: &ClipEnvelope, crypto: &RoomCrypto, topic: &str) {
+        let Ok(plain) = crypto.decrypt(&envelope.ct, topic.as_bytes()) else {
+            return;
+        };
+        let Ok(payload) = serde_json::from_str::<FilePayload>(&String::from_utf8_lossy(&plain))
+        else {
+            return;
+        };
+        if payload.size > MAX_FILE_BYTES {
+            let _ = self
+                .events
+                .send(Event::FileTooLarge(sanitize_file_name(&payload.name)));
+            return;
+        }
+        let display = sanitize_file_name(&payload.name);
+        let _ = self.events.send(Event::Clip(Clip {
+            mid: envelope.mid.clone(),
+            text: display,
+            sender_id: envelope.dev.clone(),
+            sender_name: envelope.name.clone(),
+            ts: envelope.ts,
+            mine: false,
+            file: Some(FileAttachment {
+                name: payload.name,
+                mime: payload.mime,
+                size: payload.size,
+                sha256: payload.sha256,
+                link: payload.link,
+                expires_at: payload.expires_at,
+            }),
         }));
     }
 
@@ -482,9 +554,62 @@ impl<F: LinkFactory> Engine<F> {
             sender_name: envelope.name.clone(),
             ts: envelope.ts,
             mine: true,
+            file: None,
         };
         // 先发历史：那条复制不能因为发不出去就当没发生过。
         let _ = self.events.send(Event::Clip(clip));
+        if let Some(handle) = self.link.clone() {
+            let _ = handle.publish(&topic, &wire).await;
+        }
+    }
+
+    async fn publish_file(&mut self, file: FileUpload, announce: bool) {
+        let (Some(config), Some(crypto)) = (self.desired.clone(), self.crypto.as_ref()) else {
+            return;
+        };
+        let topic = clip_topic(&self.hash);
+        let payload = FilePayload {
+            name: file.name.clone(),
+            mime: file.mime.clone(),
+            size: file.size,
+            sha256: file.sha256.clone(),
+            link: file.link.clone(),
+            expires_at: file.expires_at,
+        };
+        let Ok(json) = serde_json::to_string(&payload) else {
+            return;
+        };
+        let Ok(ct) = crypto.encrypt(json.as_bytes(), topic.as_bytes()) else {
+            return;
+        };
+        let envelope = ClipEnvelope {
+            mid: file.mid.clone(),
+            ts: file.ts,
+            dev: config.device_id.clone(),
+            name: config.device_name.clone(),
+            kind: KIND_FILE.to_string(),
+            ct,
+            ..Default::default()
+        };
+        let wire = serde_json::to_string(&envelope).unwrap();
+        if announce {
+            let _ = self.events.send(Event::Clip(Clip {
+                mid: file.mid,
+                text: file.name,
+                sender_id: envelope.dev.clone(),
+                sender_name: envelope.name.clone(),
+                ts: envelope.ts,
+                mine: true,
+                file: Some(FileAttachment {
+                    name: payload.name,
+                    mime: payload.mime,
+                    size: payload.size,
+                    sha256: payload.sha256,
+                    link: payload.link,
+                    expires_at: payload.expires_at,
+                }),
+            }));
+        }
         if let Some(handle) = self.link.clone() {
             let _ = handle.publish(&topic, &wire).await;
         }

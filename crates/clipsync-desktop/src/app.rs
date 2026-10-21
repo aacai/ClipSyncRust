@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::text::TextWrapping;
@@ -14,7 +15,9 @@ use crate::clipboard::{ClipboardWatcher, POLL_INTERVAL};
 use crate::icons::{self, Icon};
 use crate::settings::Settings;
 use crate::store::{History, Record, KIND_TEXT};
+use crate::text_tools::{self, TextOp};
 use crate::theme;
+use crate::translate::{self, Failure as TranslateFailure, Target as TranslateTarget};
 
 const TOAST_INFO: Duration = Duration::from_secs(4);
 const TOAST_ERROR: Duration = Duration::from_secs(6);
@@ -55,6 +58,7 @@ pub struct ClipSyncApp {
     focus_search: bool,
     toast: Option<Toast>,
     header_bottom: f32,
+    translate_rx: Option<mpsc::Receiver<Result<String, translate::TranslationError>>>,
 }
 
 #[derive(Clone)]
@@ -75,6 +79,17 @@ enum Overlay {
     Note {
         id: String,
         text: String,
+    },
+    Transform {
+        id: String,
+    },
+    Translate {
+        id: String,
+        source: String,
+        target: TranslateTarget,
+        running: bool,
+        result: Option<String>,
+        failure: Option<String>,
     },
     Detail {
         id: String,
@@ -97,13 +112,19 @@ enum DialogAction {
     SaveNote(String, String),
     MoveTo(String, usize),
     Copy(String),
+    ApplyOp(String, TextOp),
+    AddLocal(String),
+    ReplaceText(String, String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuAction {
     Edit,
     Note,
+    Transform,
+    Translate,
     Duplicate,
+    SaveText,
     Detail,
     MoveUp,
     MoveDown,
@@ -184,6 +205,7 @@ impl ClipSyncApp {
             focus_search: false,
             toast: None,
             header_bottom: theme::TOP_INSET + 160.0,
+            translate_rx: None,
         };
         if let Some(session) = app.settings.session.clone() {
             app.room_code = session.room;
@@ -212,6 +234,10 @@ impl ClipSyncApp {
                 Event::Peers(peers) => self.peers = peers,
                 Event::KeyMismatch(names) => self.mismatch = names,
                 Event::Clip(clip) => self.on_clip(clip),
+                Event::FileTooLarge(name) => self.notify_error(format!(
+                    "收到超过 {}MB 的文件，已忽略：{name}",
+                    clipsync_core::files::max_mb()
+                )),
             }
         }
         self.history.flush();
@@ -221,15 +247,21 @@ impl ClipSyncApp {
         let incoming = !clip.mine;
         let inserted = self.history.add(Record::from_clip(&clip));
         if incoming {
+            let sender = if clip.sender_name.trim().is_empty() {
+                "同屋设备"
+            } else {
+                clip.sender_name.as_str()
+            };
+            if clip.file.is_some() {
+                if inserted {
+                    self.notify(format!("收到 {sender} 的文件：{}", clip.text));
+                }
+                return;
+            }
             if self.write_incoming {
                 self.clipboard.write(&clip.text);
             }
             if inserted {
-                let sender = if clip.sender_name.trim().is_empty() {
-                    "同屋设备"
-                } else {
-                    clip.sender_name.as_str()
-                };
                 let message = if self.write_incoming {
                     format!("收到 {sender} 的文本，已进剪贴板")
                 } else {
@@ -263,6 +295,7 @@ impl ClipSyncApp {
             sender_id: crate::paths::install_id(),
             sender_name: crate::paths::device_name(),
             text: text.to_string(),
+            file: None,
             pinned: false,
             order: 0,
             note: String::new(),
@@ -495,6 +528,81 @@ impl ClipSyncApp {
     fn duplicate_record(&mut self, id: &str) {
         if self.history.duplicate(id, new_id(), now_millis()) {
             self.notify("已生成 1 个副本");
+        }
+    }
+
+    fn save_text_record(&mut self, id: &str) {
+        let Some(text) = self
+            .history
+            .items
+            .iter()
+            .find(|record| record.id == id)
+            .map(|record| record.text.clone())
+        else {
+            return;
+        };
+        let name = format!("text-{}.txt", &new_id()[..8]);
+        match crate::paths::save_to_downloads(&name, text.as_bytes()) {
+            Ok(written) => self.notify(format!("已存到下载目录：{written}")),
+            Err(error) => self.notify_error(format!("保存失败：{error}")),
+        }
+    }
+
+    fn add_local_text(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        self.history.add(Record {
+            id: new_id(),
+            kind: KIND_TEXT.to_string(),
+            ts: now_millis(),
+            sender_id: crate::paths::install_id(),
+            sender_name: crate::paths::device_name(),
+            text: text.to_string(),
+            file: None,
+            pinned: false,
+            order: 0,
+            note: String::new(),
+        });
+        self.history.flush();
+    }
+
+    fn poll_translation(&mut self) {
+        let Some(receiver) = self.translate_rx.take() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(outcome) => {
+                if let Some(Overlay::Translate {
+                    running,
+                    result,
+                    failure,
+                    ..
+                }) = self.overlay.as_mut()
+                {
+                    *running = false;
+                    match outcome {
+                        Ok(text) => {
+                            *failure = None;
+                            *result = Some(text);
+                        }
+                        Err(error) => {
+                            *result = None;
+                            *failure = Some(translate_failure_text(&error));
+                        }
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => self.translate_rx = Some(receiver),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                if let Some(Overlay::Translate {
+                    running, failure, ..
+                }) = self.overlay.as_mut()
+                {
+                    *running = false;
+                    *failure = Some("翻译失败，请稍后再试".to_string());
+                }
+            }
         }
     }
 
@@ -792,7 +900,31 @@ impl ClipSyncApp {
                     self.open(Overlay::Note { id, text: note });
                 }
             }
+            MenuAction::Transform => {
+                if self.history.items.iter().any(|record| record.id == id) {
+                    self.open(Overlay::Transform { id });
+                }
+            }
+            MenuAction::Translate => {
+                if let Some(text) = self
+                    .history
+                    .items
+                    .iter()
+                    .find(|record| record.id == id)
+                    .map(|record| record.text.clone())
+                {
+                    self.open(Overlay::Translate {
+                        id,
+                        target: translate::detect_target(&text),
+                        source: text,
+                        running: false,
+                        result: None,
+                        failure: None,
+                    });
+                }
+            }
             MenuAction::Duplicate => self.duplicate_record(&id),
+            MenuAction::SaveText => self.save_text_record(&id),
             MenuAction::Detail => self.open(Overlay::Detail { id }),
             MenuAction::MoveUp => {
                 if self.history.move_item(&id, -1) {
@@ -874,8 +1006,9 @@ impl eframe::App for ClipSyncApp {
         }
         self.drain_events();
         self.poll_clipboard();
+        self.poll_translation();
         self.expire_toast();
-        let wait = if self.toast.is_some() {
+        let wait = if self.toast.is_some() || self.translate_rx.is_some() {
             Duration::from_millis(120)
         } else {
             POLL_INTERVAL
@@ -1530,6 +1663,8 @@ impl ClipSyncApp {
             Overlay::Help => 470.0,
             Overlay::Detail { .. } => 500.0,
             Overlay::Safety => 440.0,
+            Overlay::Transform { .. } => 460.0,
+            Overlay::Translate { .. } => 520.0,
             _ => 420.0,
         };
         let response = egui::Modal::new(Id::unique("clip-dialog"))
@@ -1913,6 +2048,164 @@ impl ClipSyncApp {
                             });
                         });
                     }
+                    Overlay::Transform { id } => {
+                        dialog_header(ui, Icon::Edit, "文本处理");
+                        ui.add_space(10.0);
+                        let source = self
+                            .history
+                            .items
+                            .iter()
+                            .find(|record| &record.id == id)
+                            .map(|record| record.text.clone());
+                        if let Some(source) = source {
+                            let preview = text_tools::first_line(&source);
+                            ui.label(
+                                RichText::new(truncate_chars(
+                                    if preview.is_empty() {
+                                        "（空文本）"
+                                    } else {
+                                        &preview
+                                    },
+                                    72,
+                                ))
+                                .size(10.5)
+                                .color(theme::MUTED),
+                            );
+                            ui.add_space(6.0);
+                            hint(ui, "处理结果会直接替换这条内容");
+                            ui.add_space(4.0);
+                            let mut choice: Option<TextOp> = None;
+                            for pair in text_tools::OPS.chunks(2) {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    let width = (ui.available_width() - 6.0) / 2.0;
+                                    for op in pair {
+                                        if transform_button(ui, *op, width).clicked() {
+                                            choice = Some(*op);
+                                        }
+                                    }
+                                });
+                                ui.add_space(2.0);
+                            }
+                            if let Some(op) = choice {
+                                action = DialogAction::ApplyOp(id.clone(), op);
+                            }
+                            ui.add_space(8.0);
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if secondary_button(ui, "取消").clicked() {
+                                    close = true;
+                                }
+                            });
+                        } else {
+                            hint(ui, "这条记录已经不在了。");
+                            ui.add_space(12.0);
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if secondary_button(ui, "关闭").clicked() {
+                                    close = true;
+                                }
+                            });
+                        }
+                    }
+                    Overlay::Translate {
+                        id,
+                        source,
+                        target,
+                        running,
+                        result,
+                        failure,
+                    } => {
+                        dialog_header(ui, Icon::Globe, "中英互译");
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            if direction_chip(
+                                ui,
+                                "译成英文",
+                                *target == TranslateTarget::English,
+                            )
+                            .clicked()
+                            {
+                                *target = TranslateTarget::English;
+                            }
+                            if direction_chip(
+                                ui,
+                                "译成中文",
+                                *target == TranslateTarget::Chinese,
+                            )
+                            .clicked()
+                            {
+                                *target = TranslateTarget::Chinese;
+                            }
+                        });
+                        ui.add_space(10.0);
+                        field_label(ui, "原文");
+                        ui.add_space(4.0);
+                        read_only_box(ui, source);
+                        let length = source.encode_utf16().count();
+                        if length > translate::MAX_TRANSLATE_CHARS {
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(format!(
+                                    "一次最多翻 {} 字，这条 {} 字",
+                                    translate::MAX_TRANSLATE_CHARS, length
+                                ))
+                                .size(10.5)
+                                .color(theme::RED),
+                            );
+                        }
+                        if let Some(error) = failure {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(error.as_str()).size(10.5).color(theme::RED));
+                        }
+                        if let Some(translated) = result {
+                            ui.add_space(10.0);
+                            field_label(ui, "译文");
+                            ui.add_space(4.0);
+                            read_only_box(ui, translated.as_str());
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if link_button(ui, "复制译文").clicked() {
+                                    action = DialogAction::Copy(translated.clone());
+                                }
+                                if link_button(ui, "另存为新条目").clicked() {
+                                    action = DialogAction::AddLocal(translated.clone());
+                                }
+                                if link_button(ui, "替换原文").clicked() {
+                                    action =
+                                        DialogAction::ReplaceText(id.clone(), translated.clone());
+                                }
+                            });
+                        }
+                        ui.add_space(14.0);
+                        let too_long = length > translate::MAX_TRANSLATE_CHARS;
+                        ui.horizontal(|ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if accent_button_enabled(
+                                    ui,
+                                    if *running { "翻译中…" } else { "翻译" },
+                                    !*running && !too_long,
+                                )
+                                .clicked()
+                                {
+                                    *running = true;
+                                    *failure = None;
+                                    let text = source.clone();
+                                    let direction = *target;
+                                    let (sender, receiver) = mpsc::channel();
+                                    self.translate_rx = Some(receiver);
+                                    std::thread::spawn(move || {
+                                        let _ = sender.send(translate::translate(&text, direction));
+                                    });
+                                }
+                                if *running {
+                                    ui.add(egui::Spinner::new().size(14.0));
+                                }
+                                if secondary_button(ui, "取消").clicked() {
+                                    close = true;
+                                }
+                            });
+                        });
+                    }
                     Overlay::Detail { id } => {
                         dialog_header(ui, Icon::Info, "条目详情");
                         ui.add_space(10.0);
@@ -2125,6 +2418,30 @@ impl ClipSyncApp {
             DialogAction::Copy(text) => {
                 self.copy_to_clipboard(&text, "已复制");
             }
+            DialogAction::ApplyOp(id, op) => {
+                if let Some(text) = self
+                    .history
+                    .items
+                    .iter()
+                    .find(|record| record.id == id)
+                    .map(|record| text_tools::apply(&record.text, op))
+                {
+                    if self.history.update_text(&id, &text) {
+                        self.notify("已改好 1 条");
+                    }
+                }
+                keep = false;
+            }
+            DialogAction::AddLocal(text) => {
+                self.add_local_text(&text);
+                keep = false;
+            }
+            DialogAction::ReplaceText(id, text) => {
+                if self.history.update_text(&id, &text) {
+                    self.notify("已改好 1 条");
+                }
+                keep = false;
+            }
         }
         if keep && self.overlay.is_none() {
             self.overlay = Some(overlay);
@@ -2329,8 +2646,17 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
             if menu_item(ui, Icon::Note, "写备注", false) {
                 menu_choice = Some(MenuAction::Note);
             }
+            if menu_item(ui, Icon::Edit, "文本处理", false) {
+                menu_choice = Some(MenuAction::Transform);
+            }
+            if menu_item(ui, Icon::Globe, "中英互译", false) {
+                menu_choice = Some(MenuAction::Translate);
+            }
             if menu_item(ui, Icon::Duplicate, "生成副本", false) {
                 menu_choice = Some(MenuAction::Duplicate);
+            }
+            if menu_item(ui, Icon::Export, "存到下载目录", false) {
+                menu_choice = Some(MenuAction::SaveText);
             }
             if menu_item(ui, Icon::Info, "查看详情", false) {
                 menu_choice = Some(MenuAction::Detail);
@@ -2565,6 +2891,109 @@ fn menu_separator(ui: &mut Ui) {
         rect.center().y,
         Stroke::new(1.0, theme::BORDER),
     );
+}
+
+fn transform_button(ui: &mut Ui, op: TextOp, width: f32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 36.0), Sense::click());
+    let fill = if response.hovered() {
+        Color32::from_white_alpha(10)
+    } else {
+        Color32::from_white_alpha(4)
+    };
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(9),
+        fill,
+        Stroke::new(1.0, theme::BORDER),
+        StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        op.label(),
+        FontId::proportional(12.0),
+        theme::TEXT,
+    );
+    response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+fn direction_chip(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
+    let font = FontId::proportional(12.0);
+    let galley = ui
+        .ctx()
+        .fonts_mut(|fonts| fonts.layout_no_wrap(label.to_string(), font, theme::TEXT));
+    let width = galley.size().x + 28.0;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click());
+    let fill = if selected {
+        Color32::from_rgba_unmultiplied(0xf4, 0xa8, 0xc0, 34)
+    } else {
+        Color32::from_white_alpha(5)
+    };
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(9),
+        fill,
+        Stroke::new(
+            1.0,
+            if selected {
+                Color32::from_rgba_unmultiplied(0xf4, 0xa8, 0xc0, 150)
+            } else {
+                theme::BORDER
+            },
+        ),
+        StrokeKind::Inside,
+    );
+    ui.painter().galley(
+        Pos2::new(
+            rect.center().x - galley.size().x / 2.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        if selected {
+            theme::ACCENT
+        } else {
+            theme::MUTED
+        },
+    );
+    response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+fn read_only_box(ui: &mut Ui, text: &str) {
+    Frame::new()
+        .fill(Color32::from_white_alpha(5))
+        .stroke(Stroke::new(1.0, theme::BORDER))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::same(9))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            egui::ScrollArea::vertical()
+                .max_height(160.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.add(
+                        egui::Label::new(RichText::new(text).size(12.0).color(theme::TEXT))
+                            .wrap()
+                            .selectable(true),
+                    );
+                });
+        });
+}
+
+fn link_button(ui: &mut Ui, label: &str) -> egui::Response {
+    ui.add(egui::Button::new(RichText::new(label).size(12.0).color(theme::ACCENT)).frame(false))
+        .on_hover_cursor(CursorIcon::PointingHand)
+}
+
+fn translate_failure_text(error: &translate::TranslationError) -> String {
+    match error.failure {
+        TranslateFailure::Request => format!("翻译请求没发出去：{}", error.detail),
+        TranslateFailure::Malformed => "翻译服务的回复看不懂".to_string(),
+        TranslateFailure::Empty => "翻译服务没给出内容".to_string(),
+        TranslateFailure::Rejected => {
+            format!("翻译服务拒绝了这个请求：{}", error.detail)
+        }
+    }
 }
 
 fn paint_chip(ui: &Ui, rect: Rect, label: &str, active: bool, font: FontId) {
