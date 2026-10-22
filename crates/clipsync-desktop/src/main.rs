@@ -4,6 +4,7 @@ mod clipboard;
 mod icons;
 mod jobs;
 mod paths;
+mod screenshot;
 mod settings;
 mod store;
 mod text_tools;
@@ -46,6 +47,7 @@ fn main() -> eframe::Result {
                 history,
                 settings,
                 preferences,
+                screenshot::Hotkeys::new(&ctx.egui_ctx),
             )))
         }),
     )

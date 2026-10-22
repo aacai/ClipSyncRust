@@ -67,6 +67,7 @@ struct StoredPreferences {
     launch_at_login: bool,
     delete_expired: bool,
     retention_days: u32,
+    screenshot_hotkey: String,
     last_room_code: Option<String>,
 }
 
@@ -108,6 +109,7 @@ impl Default for StoredPreferences {
             launch_at_login: false,
             delete_expired: false,
             retention_days: DEFAULT_RETENTION_DAYS,
+            screenshot_hotkey: crate::screenshot::DEFAULT_HOTKEY.to_string(),
             last_room_code: None,
         }
     }
@@ -169,6 +171,10 @@ impl Preferences {
 
     pub fn retention_days(&self) -> u32 {
         self.stored.retention_days
+    }
+
+    pub fn screenshot_hotkey(&self) -> &str {
+        &self.stored.screenshot_hotkey
     }
 
     pub fn last_room_code(&self) -> Option<&str> {
@@ -235,6 +241,11 @@ impl Preferences {
 
     pub fn set_retention_days(&mut self, days: u32) {
         self.stored.retention_days = days;
+        self.save();
+    }
+
+    pub fn set_screenshot_hotkey(&mut self, spec: &str) {
+        self.stored.screenshot_hotkey = spec.to_string();
         self.save();
     }
 
@@ -443,6 +454,7 @@ mod tests {
         assert!(!loaded.launch_at_login());
         assert!(!loaded.delete_expired());
         assert_eq!(loaded.retention_days(), 30);
+        assert_eq!(loaded.screenshot_hotkey(), "Alt+A");
         assert_eq!(loaded.nickname(), "");
         assert_eq!(loaded.last_room_code(), None);
         cleanup(&path);
@@ -465,6 +477,7 @@ mod tests {
             loaded.set_launch_at_login(true);
             loaded.set_delete_expired(true);
             loaded.set_retention_days(7);
+            loaded.set_screenshot_hotkey("Control+Shift+S");
             loaded.remember_last_room(" ROOM-1 ");
         }
         let loaded = super::Preferences::open(path.clone());
@@ -479,6 +492,7 @@ mod tests {
         assert!(loaded.launch_at_login());
         assert!(loaded.delete_expired());
         assert_eq!(loaded.retention_days(), 7);
+        assert_eq!(loaded.screenshot_hotkey(), "Control+Shift+S");
         assert_eq!(loaded.last_room_code(), Some("ROOM-1"));
         assert!(!path.with_extension("tmp").exists());
         cleanup(&path);
@@ -499,6 +513,7 @@ mod tests {
         assert!(loaded.watch_images());
         // 老文件里没有这个键，得按 compose 的默认值来，不能当成用户关过
         assert!(loaded.auto_copy());
+        assert_eq!(loaded.screenshot_hotkey(), "Alt+A");
         cleanup(&path);
     }
 

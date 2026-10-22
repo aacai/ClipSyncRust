@@ -29,3 +29,5 @@ hex = { workspace = true }
 regex = { workspace = true }
 getrandom = { workspace = true }
 zeroize = { workspace = true }
+global-hotkey = { workspace = true }
+xcap = { workspace = true }

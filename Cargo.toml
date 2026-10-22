@@ -36,3 +36,5 @@ arboard = "3.7.0"
 tray-icon = "0.26.1"
 dirs = "7.0.0"
 sys-locale = "0.3.2"
+global-hotkey = "0.9.0"
+xcap = { version = "0.9.8", features = ["image"] }
