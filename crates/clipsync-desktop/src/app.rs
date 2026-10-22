@@ -2550,7 +2550,7 @@ impl ClipSyncApp {
                 self.toggle_pick_mode();
             }
             let can_undo = self.history.undo_depth() > 0;
-            if icons::icon_button(ui, Icon::Undo, can_undo, "撤销").clicked() {
+            if icons::icon_button(ui, Icon::Undo, can_undo, "撤销删除").clicked() {
                 self.undo();
             }
             ui.add_space(4.0);
@@ -2829,7 +2829,7 @@ impl ClipSyncApp {
                             );
                             ui.add_space(4.0);
                             let enabled = count > 0;
-                            if icons::icon_button(ui, Icon::Copy, enabled, "复制所选").clicked()
+                            if icons::icon_button(ui, Icon::Copy, enabled, "复制到剪贴板").clicked()
                             {
                                 self.copy_selection();
                             }
@@ -4240,7 +4240,9 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
     let copy_rect = copyable.then(|| place(&mut right));
     let send_rect = (!is_file).then(|| place(&mut right));
 
-    let more_response = ui.interact(more_rect, id.with("more"), Sense::click());
+    let more_response = ui
+        .interact(more_rect, id.with("more"), Sense::click())
+        .on_hover_text("更多操作");
     if more_response.hovered() {
         painter.rect_filled(
             more_rect,
@@ -4623,10 +4625,7 @@ fn menu_item(ui: &mut Ui, icon: Icon, label: &str, enabled: bool, danger: bool) 
     if enabled {
         response.on_hover_cursor(CursorIcon::PointingHand).clicked()
     } else {
-        response
-            .on_hover_cursor(CursorIcon::NotAllowed)
-            .on_hover_text("")
-            .clicked()
+        response.on_hover_cursor(CursorIcon::NotAllowed).clicked()
     }
 }
 

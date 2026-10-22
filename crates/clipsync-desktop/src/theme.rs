@@ -222,6 +222,9 @@ pub fn configure(ctx: &egui::Context) {
         style.spacing.interact_size.y = 30.0;
         style.spacing.menu_margin = Margin::same(5);
         style.spacing.window_margin = Margin::same(16);
+        // compose 悬停就出 tooltip。egui 默认还额外要求指针完全静止，本机空闲时 800ms 才重绘一帧，
+        // 停手那一刻没有新帧，tooltip 要等到下一轮轮询才冒出来，看着就像这个版本根本没做。
+        style.interaction.show_tooltips_only_when_still = false;
         style.text_styles.insert(
             TextStyle::Heading,
             FontId::new(20.0, FontFamily::Proportional),
