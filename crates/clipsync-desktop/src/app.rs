@@ -122,6 +122,7 @@ enum SettingsAction {
     WatchImages(bool),
     WatchFiles(bool),
     DeleteExpired(bool),
+    EditRoom,
     LeaveRoom,
     Quit,
     CheckUpdate,
@@ -730,6 +731,15 @@ impl ClipSyncApp {
         let key = crypto.key_material().to_vec();
         self.room_crypto = Some(Arc::new(crypto));
         self.room_hash = room_hash(&room);
+        // 换房间：上一间的钥匙先清掉，新链路没连上才不会留着旧的再自动回去
+        if self
+            .settings
+            .session
+            .as_ref()
+            .is_some_and(|session| session.room != room)
+        {
+            self.settings.forget();
+        }
         self.pending_session = Some((room.clone(), password.clone()));
         let device_name = self.sender_name();
         self.engine.join(Config {
@@ -986,14 +996,17 @@ impl ClipSyncApp {
                             let remember = self.preferences.remember_room();
                             let launch = self.preferences.launch_at_login();
                             settings_group(ui, "同步", |ui| {
-                                settings_value_row(
+                                if settings_value_row(
                                     ui,
                                     "房间",
                                     if joined { &room } else { "未共享" },
                                     joined.then_some((label, color.unwrap_or(theme::p().muted))),
                                     joined,
                                     if joined { color } else { None },
-                                );
+                                    true,
+                                ) {
+                                    action = Some(SettingsAction::EditRoom);
+                                }
                                 if joined {
                                     settings_divider(ui);
                                     if settings_action_row(ui, "退出房间") {
@@ -1072,6 +1085,7 @@ impl ClipSyncApp {
                                     None,
                                     false,
                                     None,
+                                    false,
                                 );
                                 settings_divider(ui);
                                 if let Some(chosen) = settings_update_row(ui, &self.update) {
@@ -1085,6 +1099,7 @@ impl ClipSyncApp {
                                     None,
                                     false,
                                     None,
+                                    false,
                                 );
                                 settings_divider(ui);
                                 if settings_switch_row(
@@ -1118,6 +1133,7 @@ impl ClipSyncApp {
                                     None,
                                     false,
                                     None,
+                                    false,
                                 );
                                 settings_divider(ui);
                                 if settings_action_row(ui, "退出 ClipSync") {
@@ -1205,6 +1221,7 @@ impl ClipSyncApp {
             SettingsAction::WatchImages(enabled) => self.set_watch_images(enabled),
             SettingsAction::WatchFiles(enabled) => self.set_watch_files(enabled),
             SettingsAction::DeleteExpired(enabled) => self.set_delete_expired(enabled),
+            SettingsAction::EditRoom => self.open(Overlay::Share),
             SettingsAction::LeaveRoom => self.open(Overlay::LeaveRoom),
             SettingsAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             SettingsAction::CheckUpdate => self.check_updates(),
@@ -4989,17 +5006,27 @@ fn settings_value_row(
     detail: Option<(&str, Color32)>,
     monospace: bool,
     value_color: Option<Color32>,
-) {
-    let (rect, _) = settings_row(ui, SETTINGS_ROW_HEIGHT, false);
+    link: bool,
+) -> bool {
+    let (rect, response) = settings_row(ui, SETTINGS_ROW_HEIGHT, link);
     let center = rect.center().y;
+    let chevron = Rect::from_center_size(Pos2::new(rect.right() - 25.0, center), Vec2::splat(18.0));
+    if link {
+        icons::paint(ui.painter(), chevron, Icon::ChevronRight, theme::p().faint);
+    }
     let color = value_color.unwrap_or(theme::p().muted);
     let value_font = if monospace {
         FontId::monospace(13.0)
     } else {
         FontId::proportional(13.0)
     };
+    let right_edge = if link {
+        chevron.left() - 10.0
+    } else {
+        rect.right() - 16.0
+    };
     let value = row_line(ui, value, value_font, color, 200.0);
-    let mut title_limit = rect.right() - 16.0 - value.galley.size().x - 12.0;
+    let mut title_limit = right_edge - value.galley.size().x - 12.0;
     let detail = detail.map(|(detail, detail_color)| {
         row_line(ui, detail, FontId::proportional(11.5), detail_color, 120.0)
     });
@@ -5015,10 +5042,15 @@ fn settings_value_row(
     );
     let baseline = baseline_at(&title, center);
     paint_line_at(ui, rect.left() + 16.0, baseline, title);
-    let mut right = rect.right() - 16.0;
+    let mut right = right_edge;
     right = paint_line_before(ui, right, baseline, value);
     if let Some(detail) = detail {
         paint_line_before(ui, right - 9.0, baseline, detail);
+    }
+    if link {
+        response.on_hover_cursor(CursorIcon::PointingHand).clicked()
+    } else {
+        false
     }
 }
 
