@@ -4169,12 +4169,12 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
             Vec2::splat(32.0),
         );
         let thumb_response = ui.interact(thumb_rect, id.with("thumb"), Sense::click());
-        ui.put(
-            thumb_rect,
-            egui::Image::new(texture)
-                .fit_to_exact_size(Vec2::splat(32.0))
-                .corner_radius(6),
-        );
+        // put() 会把父布局的游标推到缩略图下沿，下一行因此被拽上来压在时间戳上；
+        // paint_at 只画不进布局。
+        egui::Image::new(texture)
+            .fit_to_exact_size(Vec2::splat(32.0))
+            .corner_radius(6)
+            .paint_at(ui, thumb_rect);
         if thumb_response
             .on_hover_cursor(CursorIcon::PointingHand)
             .on_hover_text("查看大图")
