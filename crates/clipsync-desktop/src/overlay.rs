@@ -23,6 +23,8 @@ const HANDLE_SIZE: f32 = 8.0;
 const MIN_SIZE: f32 = 6.0;
 const TOOLBAR_GAP: f32 = 8.0;
 const TOOLBAR_HEIGHT: f32 = 45.0;
+/// Two 33pt buttons, 6pt of margin either side, 4pt between them.
+const TOOLBAR_WIDTH: f32 = 2.0 * 33.0 + 2.0 * 6.0 + 4.0;
 
 /// The id of the overlay window; one at a time, since only one screen can be frozen.
 pub fn viewport_id() -> egui::ViewportId {
@@ -298,7 +300,9 @@ impl Session {
         let Some(Drag::Fresh { anchor }) = self.drag.take() else {
             return;
         };
-        let dragged = position.map(|position| between(anchor, position));
+        // A drag that ended off the edges still has to leave a region inside them: the pill and the
+        // handles are placed from this rect, and off-screen means unreachable.
+        let dragged = position.map(|position| between(anchor, position).intersect(frame));
         let picked = dragged
             .filter(|rect| is_region(*rect, frame))
             .unwrap_or_else(|| {
@@ -532,16 +536,15 @@ fn hit_window(windows: &[Rect], position: Pos2, frame: Rect) -> Rect {
 
 /// Where the button pill sits: under the region's bottom-right, flipped above it at the edge.
 fn pill_at(selection: Rect, frame: Rect) -> Rect {
-    let width = 2.0 * 33.0 + 12.0;
     let min = Pos2::new(
-        (selection.max.x - width).clamp(0.0, frame.max.x - width),
+        (selection.max.x - TOOLBAR_WIDTH).clamp(0.0, frame.max.x - TOOLBAR_WIDTH),
         if selection.max.y + TOOLBAR_GAP + TOOLBAR_HEIGHT > frame.max.y {
             (selection.min.y - TOOLBAR_GAP - TOOLBAR_HEIGHT).max(0.0)
         } else {
             selection.max.y + TOOLBAR_GAP
         },
     );
-    Rect::from_min_size(min, Vec2::new(width, TOOLBAR_HEIGHT))
+    Rect::from_min_size(min, Vec2::new(TOOLBAR_WIDTH, TOOLBAR_HEIGHT))
 }
 
 fn handle_point(rect: Rect, handle: Handle) -> Pos2 {
