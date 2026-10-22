@@ -181,14 +181,16 @@ jobs:
 
       - name: Build msi
         # 工作区里有两个 package，cargo-wix 不会自己挑，必须 --package 点名；
-        # init 会把 main.wxs 写到 crates/clipsync-desktop/wix/ 下。
+        # 它生成的 main.wxs 用 wix\License.rtf 这种相对路径，所以 cwd 必须是包目录，
+        # 从仓库根跑 light.exe 会报找不到文件。
         # 产品名 / upgrade-guid 在 clipsync-desktop/Cargo.toml 的 [package.metadata.wix]，
         # 本地跑 cargo wix 出来的包和这里一致。
         run: |
           set -euo pipefail
+          cd crates/clipsync-desktop
           cargo wix init --force --package clipsync-desktop
           cargo wix --no-build --nocapture --package clipsync-desktop --target x86_64-pc-windows-msvc
-          find target/wix -name '*.msi'
+          find "$GITHUB_WORKSPACE/target/wix" -name '*.msi'
 
       - name: Collect packages
         env:
