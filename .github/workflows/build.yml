@@ -1,0 +1,347 @@
+name: Build Packages
+
+on:
+  # 手动触发，可勾选要打哪些平台的包
+  workflow_dispatch:
+    inputs:
+      build_macos:
+        description: "Build macOS (dmg / zip)"
+        type: boolean
+        default: true
+      build_windows:
+        description: "Build Windows (msi / zip)"
+        type: boolean
+        default: true
+      build_linux:
+        description: "Build Linux (deb / tar.xz)"
+        type: boolean
+        default: true
+  # master 日常推送和 PR 只跑 check；推送 tag（如 v0.0.2）时全量构建并发 Release
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+# 同一 ref 并发只保留最新一次，取消旧 run
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  # 和 Compose 版 ClipSync 区分开：macOS 的 LaunchAgent 标签是按 .app 名字算的，
+  # 两个都叫 ClipSync 会互相盖掉对方的开机自启。
+  APP_NAME: ClipSyncRust
+  BIN: clipsync-desktop
+
+jobs:
+  # ----------------------------------------------------------------
+  # 日常校验：macOS runner 不需要额外系统库，跑得最快
+  # ----------------------------------------------------------------
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+  # ----------------------------------------------------------------
+  # macOS：.app 打包成 dmg，另附 zip（zip 解压即可运行，方便自动化安装）
+  # x86_64 在 arm runner 上交叉编译，Apple SDK 自带双架构切片。
+  # ----------------------------------------------------------------
+  macos:
+    if: startsWith(github.ref, 'refs/tags/') || inputs.build_macos
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            target: aarch64-apple-darwin
+          - arch: x64
+            target: x86_64-apple-darwin
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Read version
+        id: ver
+        run: echo "value=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="clipsync-desktop").version')" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: |
+          rustup target add "${{ matrix.target }}"
+          cargo build --release --target "${{ matrix.target }}" -p clipsync-desktop
+
+      - name: Bundle .app
+        env:
+          VER: ${{ steps.ver.outputs.value }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/$APP_NAME.app"
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "target/$TARGET/release/$BIN" "$APP/Contents/MacOS/$APP_NAME"
+          printf 'APPL????' > "$APP/Contents/PkgInfo"
+          cat > "$APP/Contents/Info.plist" << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
+            <key>CFBundleExecutable</key><string>$APP_NAME</string>
+            <key>CFBundleIdentifier</key><string>zhiqiu.app.clipsync.rust</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>CFBundleName</key><string>$APP_NAME</string>
+            <key>CFBundleDisplayName</key><string>ClipSync</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$VER</string>
+            <key>CFBundleVersion</key><string>$VER</string>
+            <key>LSMinimumSystemVersion</key><string>12.0</string>
+            <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+
+      - name: Ad-hoc sign
+        # arm64 上没签名的二进制直接起不来；没有 Developer ID 证书时只能 ad-hoc 签，
+        # 别人下载后过一次 Gatekeeper（xattr -dr com.apple.quarantine）即可。
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/$APP_NAME.app"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --verbose=2 "$APP"
+
+      - name: Make dmg and zip
+        env:
+          VER: ${{ steps.ver.outputs.value }}
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/$APP_NAME.app"
+          STAGE="$RUNNER_TEMP/stage"
+          rm -rf "$STAGE" && mkdir -p "$STAGE"
+          cp -R "$APP" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO \
+            "$APP_NAME-$VER-${{ matrix.arch }}.dmg"
+          ditto -c -k --keepParent "$APP" "$APP_NAME-$VER-${{ matrix.arch }}.zip"
+          ls -lh "$APP_NAME-$VER"-*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: |
+            ${{ env.APP_NAME }}-*.dmg
+            ${{ env.APP_NAME }}-*.zip
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------
+  # Windows：cargo-wix 出 msi，另附免安装 zip
+  # ----------------------------------------------------------------
+  windows:
+    if: startsWith(github.ref, 'refs/tags/') || inputs.build_windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Read version
+        id: ver
+        run: echo "value=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="clipsync-desktop").version')" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc -p clipsync-desktop
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --locked
+
+      - name: Build msi
+        # 产品名 / upgrade-guid 在 clipsync-desktop/Cargo.toml 的 [package.metadata.wix]，
+        # 本地跑 cargo wix 出来的包和这里一致。
+        run: |
+          set -euo pipefail
+          cargo wix init --force
+          cargo wix --no-build --nocapture --target x86_64-pc-windows-msvc
+          find target/wix -name '*.msi'
+
+      - name: Collect packages
+        env:
+          VER: ${{ steps.ver.outputs.value }}
+        run: |
+          set -euo pipefail
+          mv target/wix/*.msi "$APP_NAME-$VER-x64.msi"
+          7z a -tzip "$APP_NAME-$VER-x64.zip" target/x86_64-pc-windows-msvc/release/$BIN.exe
+          ls -lh "$APP_NAME-$VER"-*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: |
+            ${{ env.APP_NAME }}-*.msi
+            ${{ env.APP_NAME }}-*.zip
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------
+  # Linux：dpkg-deb 手工组 deb（不往 Cargo.toml 塞 cargo-deb 元数据），另附 tar.xz
+  # arm64 用 ARM runner，预览版机器挂了不影响 x64 发布
+  # ----------------------------------------------------------------
+  linux:
+    if: startsWith(github.ref, 'refs/tags/') || inputs.build_linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            dpkg-arch: amd64
+            os: ubuntu-latest
+          - arch: arm64
+            dpkg-arch: arm64
+            os: ubuntu-24.04-arm
+    continue-on-error: ${{ matrix.arch == 'arm64' }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config file \
+            libgtk-3-dev libayatana-appindicator3-dev libdbus-1-dev libglib2.0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libwayland-dev \
+            libpipewire-0.3-dev libspa-0.2-dev libasound2-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+
+      - name: Read version
+        id: ver
+        run: echo "value=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="clipsync-desktop").version')" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: cargo build --release -p clipsync-desktop
+
+      - name: Make deb and tarball
+        env:
+          VER: ${{ steps.ver.outputs.value }}
+          DPKG_ARCH: ${{ matrix.dpkg-arch }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/deb"
+          rm -rf "$ROOT"
+          mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/bin" "$ROOT/usr/share/applications"
+          cp "target/release/$BIN" "$ROOT/usr/bin/clipsync-rust"
+          cat > "$ROOT/usr/share/applications/clipsync-rust.desktop" << DESKTOP
+          [Desktop Entry]
+          Type=Application
+          Name=ClipSync
+          Comment=Sync clipboard between devices, end-to-end encrypted
+          Exec=clipsync-rust %U
+          Icon=clipsync-rust
+          Terminal=false
+          Categories=Utility;
+          StartupNotify=true
+          DESKTOP
+          cat > "$ROOT/DEBIAN/control" << CONTROL
+          Package: clipsync-rust
+          Version: $VER
+          Architecture: $DPKG_ARCH
+          Maintainer: zhiqiu <aacai@users.noreply.github.com>
+          Priority: optional
+          Section: utils
+          Description: ClipSync desktop client (Rust)
+           Syncs the clipboard between devices over an MQTT broker, end-to-end encrypted.
+          CONTROL
+          dpkg-deb --root-owner-group -Zxz --build "$ROOT" "$APP_NAME-$VER-$ARCH.deb"
+          tar -cJf "$APP_NAME-$VER-$ARCH.tar.xz" -C "$ROOT/usr/bin" clipsync-rust
+          ls -lh "$APP_NAME-$VER"-*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            ${{ env.APP_NAME }}-*.deb
+            ${{ env.APP_NAME }}-*.tar.xz
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------
+  # Release：推送 v* tag 时把所有产物汇总发布到 GitHub Release
+  # 应用内的「检查更新」读的就是这里的 latest release 资产名
+  # ----------------------------------------------------------------
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [check, macos, windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten packages
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.msi' -o -name '*.deb' -o -name '*.tar.xz' \) \
+            -exec mv {} dist/ \;
+          ls -lh dist
+
+      - name: Delete existing release (clean stale assets)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --yes || true
+
+      - name: Generate release notes
+        run: |
+          {
+            echo "# ClipSyncRust ${GITHUB_REF_NAME}"
+            echo
+            find dist -type f | sort | while read -r f; do
+              NAME=$(basename "$f")
+              case "$NAME" in
+                *.dmg) desc="macOS 安装包（拖入「应用程序」；首次打开被 Gatekeeper 拦时执行 xattr -dr com.apple.quarantine \"/Applications/ClipSyncRust.app\"）" ;;
+                *.zip) desc="免安装压缩包" ;;
+                *.msi) desc="Windows 安装包（MSI）" ;;
+                *.deb) desc="Linux 安装包（dpkg -i 安装）" ;;
+                *.tar.xz) desc="Linux 单文件二进制" ;;
+                *) desc="其他产物" ;;
+              esac
+              printf -- '- `%s` — %s\n' "$NAME" "$desc"
+            done
+          } > release_notes.md
+          cat release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body_path: release_notes.md

@@ -35,3 +35,9 @@ xcap = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSScreen", "NSWindow"] }
+
+# cargo wix 读这里：产品名决定「程序和功能」里的条目，upgrade-guid 固定下来
+# 新包才会升级旧安装而不是并存两份。
+[package.metadata.wix]
+product-name = "ClipSyncRust"
+upgrade-guid = "6FE3AC0A-BB99-4AC7-B6C0-9AC20BCF01FA"
