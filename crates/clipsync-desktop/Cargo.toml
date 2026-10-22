@@ -1,6 +1,6 @@
 [package]
 name = "clipsync-desktop"
-description = "ClipSync desktop app: egui shell over clipsync-core"
+description = "ClipSyncRust desktop client: clipboard sync over an MQTT broker, end-to-end encrypted"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
