@@ -183,12 +183,13 @@ jobs:
         # 工作区里有两个 package，cargo-wix 不会自己挑，必须 --package 点名；
         # 它生成的 main.wxs 用 wix\License.rtf 这种相对路径，所以 cwd 必须是包目录，
         # 从仓库根跑 light.exe 会报找不到文件。
-        # 产品名 / upgrade-guid 在 clipsync-desktop/Cargo.toml 的 [package.metadata.wix]，
-        # 本地跑 cargo wix 出来的包和这里一致。
+        # 产品名只能走 --product-name：cargo-wix 只从命令行取它，Cargo.toml 里写
+        # product-name 会被忽略，「程序和功能」里就成了 clipsync-desktop。
+        # upgrade-guid / path-guid 倒是读 [package.metadata.wix]，本地跑 cargo wix 一致。
         run: |
           set -euo pipefail
           cd crates/clipsync-desktop
-          cargo wix init --force --package clipsync-desktop
+          cargo wix init --force --package clipsync-desktop --product-name "$APP_NAME"
           cargo wix --no-build --nocapture --package clipsync-desktop --target x86_64-pc-windows-msvc
           find "$GITHUB_WORKSPACE/target/wix" -name '*.msi'
 
@@ -198,7 +199,12 @@ jobs:
         run: |
           set -euo pipefail
           mv target/wix/*.msi "$APP_NAME-$VER-x64.msi"
-          7z a -tzip "$APP_NAME-$VER-x64.zip" target/x86_64-pc-windows-msvc/release/$BIN.exe
+          # 免安装包里的 exe 放在压缩包根目录，也按 App 名走；7z 会照抄给它的相对路径，
+          # 所以要进目录再压，否则解压出来是一长串 target/x86_64-.../release/。
+          mkdir -p portable
+          cp "target/x86_64-pc-windows-msvc/release/$BIN.exe" "portable/$APP_NAME.exe"
+          (cd portable && 7z a -tzip "../$APP_NAME-$VER-x64.zip" "$APP_NAME.exe")
+          rm -rf portable
           ls -lh "$APP_NAME-$VER"-*
 
       - name: Upload artifacts
