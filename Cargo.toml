@@ -38,3 +38,14 @@ dirs = "7.0.0"
 sys-locale = "0.3.2"
 global-hotkey = "0.9.0"
 xcap = { version = "0.9.8", features = ["image"] }
+
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+debug = false
+strip = "debuginfo"
