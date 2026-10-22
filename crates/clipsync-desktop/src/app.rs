@@ -8,7 +8,7 @@ use eframe::egui::text::TextWrapping;
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Id, Key, Layout, Margin,
     Modifiers, Order, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextEdit, TextFormat,
-    TextureHandle, TextureOptions, Ui, UiBuilder, Vec2,
+    TextureHandle, TextureOptions, Ui, UiBuilder, Vec2, ViewportCommand,
 };
 
 use clipsync_core::engine::{Clip, Config, EngineHandle, Event, FileUpload, Peer, Status};
@@ -35,6 +35,8 @@ use crate::{autostart, overlay, paths, screenshot};
 const TOAST_INFO: Duration = Duration::from_secs(4);
 const TOAST_ERROR: Duration = Duration::from_secs(6);
 const TOAST_UNDO: Duration = Duration::from_secs(9);
+/// Time for the app window to actually leave the screen before the grab.
+const CAPTURE_HIDE_DELAY: Duration = Duration::from_millis(140);
 const THUMB_MAX_SIDE: u32 = 256;
 const ZOOM_MAX_SIDE: u32 = 2048;
 const REPO_URL: &str = "https://github.com/aacai/ClipSync";
@@ -100,6 +102,8 @@ pub struct ClipSyncApp {
     hotkeys: Option<screenshot::Hotkeys>,
     /// The screenshot overlay frozen on screen right now, shared with its own window.
     shot: Option<Arc<Mutex<overlay::Session>>>,
+    /// When the app window will be gone long enough to grab the screen behind it.
+    capture_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -365,6 +369,7 @@ impl ClipSyncApp {
             autostart_available,
             hotkeys,
             shot: None,
+            capture_at: None,
         };
         let restore = app.preferences.remember_room() && app.settings.session.is_some();
         if !app.preferences.remember_room() {
@@ -934,8 +939,8 @@ impl ClipSyncApp {
 
     /// Freeze the screen, then open the WeChat overlay on top of everything: the frame goes grey
     /// and the user picks a window with a click or draws a region before anything is cut.
-    fn start_capture(&mut self) {
-        if self.shot.is_some() {
+    fn start_capture(&mut self, ctx: &egui::Context) {
+        if self.shot.is_some() || self.capture_at.is_some() {
             return;
         }
         if screenshot::permission_missing() {
@@ -944,14 +949,31 @@ impl ClipSyncApp {
             );
             return;
         }
-        let freeze = match screenshot::freeze() {
-            Ok(freeze) => freeze,
-            Err(error) => {
-                self.notify_error(format!("截屏失败：{error}"));
-                return;
+        // Our own window is never part of the screenshot: it is what the user is leaving behind.
+        // A transparent GL window also comes back as a black hole from the screen grabber.
+        self.capture_at = Some(Instant::now() + CAPTURE_HIDE_DELAY);
+        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        ctx.request_repaint_after(CAPTURE_HIDE_DELAY);
+    }
+
+    /// Grabs the screen once the app window has actually left it, then brings the window back:
+    /// the overlay window needs a live app to be created in.
+    fn take_capture(&mut self, ctx: &egui::Context) {
+        let Some(at) = self.capture_at else { return };
+        let now = Instant::now();
+        if now < at {
+            ctx.request_repaint_after(at - now);
+            return;
+        }
+        self.capture_at = None;
+        let freeze = screenshot::freeze();
+        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+        match freeze {
+            Ok(freeze) => {
+                self.shot = Some(Arc::new(Mutex::new(overlay::Session::new(freeze))));
             }
-        };
-        self.shot = Some(Arc::new(Mutex::new(overlay::Session::new(freeze))));
+            Err(error) => self.notify_error(format!("截屏失败：{error}")),
+        }
     }
 
     /// Keep the overlay window alive and collect the region the moment the user settles on one.
@@ -2340,8 +2362,9 @@ impl ClipSyncApp {
             .as_ref()
             .is_some_and(|hotkeys| hotkeys.take_pressed())
         {
-            self.start_capture();
+            self.start_capture(ctx);
         }
+        self.take_capture(ctx);
         self.service_shot(ctx);
         self.poll_clipboard();
         self.poll_translation();

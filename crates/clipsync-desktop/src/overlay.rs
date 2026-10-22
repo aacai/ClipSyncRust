@@ -25,6 +25,9 @@ pub fn viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("screenshot-overlay")
 }
 
+/// The window title, which is also how the native macOS layer finds the overlay window.
+const TITLE: &str = "ClipSync 截图";
+
 /// One frozen screen plus the windows that were on it, all in overlay-local points.
 pub struct Freeze {
     /// The screen in physical pixels.
@@ -88,6 +91,8 @@ pub struct Session {
     hover: Option<Rect>,
     drag: Option<Drag>,
     outcome: Option<Outcome>,
+    /// Whether the window has been pinned over the whole screen already.
+    presented: bool,
 }
 
 impl Session {
@@ -99,6 +104,7 @@ impl Session {
             hover: None,
             drag: None,
             outcome: None,
+            presented: false,
         }
     }
 
@@ -107,7 +113,7 @@ impl Session {
     pub fn viewport(&self) -> egui::ViewportBuilder {
         egui::ViewportBuilder::default()
             .with_app_id("clipsync-screenshot")
-            .with_title("ClipSync 截图")
+            .with_title(TITLE)
             .with_decorations(false)
             .with_titlebar_shown(false)
             .with_titlebar_buttons_shown(false)
@@ -143,11 +149,34 @@ impl Session {
 
     pub fn draw(&mut self, ui: &mut Ui) {
         let frame = ui.max_rect();
+        if !self.presented || frame.size() != self.freeze.size {
+            self.present(ui);
+        }
         self.paint_frame(ui, frame);
         let position = self.track_pointer(ui, frame);
         self.paint_marks(ui, frame);
         let toolbar = self.paint_toolbar(ui, frame);
         self.paint_cursor(ui, position, toolbar);
+    }
+
+    /// macOS hands the window back shrunk to the space below the menu bar and keeps an ordinary
+    /// floating window out of the menu bar and dock, so the window is pinned natively instead.
+    fn present(&mut self, ui: &Ui) {
+        #[cfg(target_os = "macos")]
+        {
+            self.presented = cover_screen();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            ui.ctx()
+                .send_viewport_cmd(ViewportCommand::OuterPosition(self.freeze.position));
+            ui.ctx()
+                .send_viewport_cmd(ViewportCommand::InnerSize(self.freeze.size));
+            ui.ctx().request_repaint();
+            self.presented = true;
+        }
+        #[cfg(target_os = "macos")]
+        let _ = ui;
     }
 
     fn paint_frame(&mut self, ui: &Ui, frame: Rect) {
@@ -408,6 +437,35 @@ impl Session {
 /// Ask the compositor to tear the overlay window down.
 pub fn close(ctx: &egui::Context) {
     ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::Close);
+}
+
+/// Raise the overlay above the menu bar and stretch it over the whole primary screen. Returns
+/// whether the window was there yet.
+#[cfg(target_os = "macos")]
+fn cover_screen() -> bool {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSScreen, NSScreenSaverWindowLevel};
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    let Some(screen) = NSScreen::mainScreen(mtm) else {
+        return false;
+    };
+    for window in app.windows().iter() {
+        if window.title().to_string() != TITLE {
+            continue;
+        }
+        // The menu bar and the dock live at levels 24 and 20 and AppKit keeps floating windows
+        // below them; a screen-saver level window is allowed to dim all of it.
+        window.setLevel(NSScreenSaverWindowLevel);
+        window.setFrame_display(screen.frame(), true);
+        app.activate();
+        window.makeKeyAndOrderFront(None);
+        return true;
+    }
+    false
 }
 
 /// A region the user drew is only real once it is big enough to be worth pixels.
