@@ -948,7 +948,7 @@ impl ClipSyncApp {
         }
         if screenshot::permission_missing() {
             self.notify_error(
-                "缺少屏幕录制权限：系统设置 → 隐私与安全性 → 屏幕与系统音频录制，勾上 ClipSync",
+                "缺少屏幕录制权限：系统设置 → 隐私与安全性 → 屏幕与系统音频录制，勾上 ClipSyncRust",
             );
             return;
         }
@@ -1358,7 +1358,7 @@ impl ClipSyncApp {
                                     action = Some(SettingsAction::About);
                                 }
                                 settings_divider(ui);
-                                if settings_action_row(ui, "退出 ClipSync") {
+                                if settings_action_row(ui, "退出 ClipSyncRust") {
                                     action = Some(SettingsAction::Quit);
                                 }
                             });
@@ -3238,7 +3238,7 @@ impl ClipSyncApp {
                         });
                     }
                     Overlay::About => {
-                        dialog_header(ui, Icon::Info, "关于 ClipSync");
+                        dialog_header(ui, Icon::Info, "关于 ClipSyncRust");
                         ui.add_space(12.0);
                         let room = if self.joined {
                             self.room_code.clone()
@@ -3251,6 +3251,7 @@ impl ClipSyncApp {
                         about_row(ui, "本地记录", &format!("{} 条", self.history.items.len()), false);
                         about_row(ui, "房间", &room, self.joined);
                         about_row(ui, "文件托管", "uguu.se，拒收时退回 x0.at", false);
+                        about_row(ui, "界面字体", "HarmonyOS Sans（华为授权）", false);
                         ui.add_space(6.0);
                         field_label(ui, "缓存目录");
                         ui.add_space(2.0);

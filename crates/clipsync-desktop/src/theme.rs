@@ -303,10 +303,11 @@ fn visuals(dark: bool) -> Visuals {
     visuals
 }
 
-/// 苹方 is the one face for every family: egui stacks runs of different faces by
-/// box centre rather than by baseline, so a Han glyph next to latin digits lands
-/// on a different line.
-const PRIMARY_FACE: &[u8] = include_bytes!("../assets/PingFangSC-Regular.otf");
+/// HarmonyOS Sans SC is the one face for every family: egui stacks runs of different
+/// faces by box centre rather than by baseline, so a Han glyph next to latin digits lands
+/// on a different line. Huawei's licence asks for a notice in the software, which the
+/// about panel carries.
+const PRIMARY_FACE: &[u8] = include_bytes!("../assets/HarmonyOS_Sans_SC_Regular.ttf");
 
 fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(primary_fonts());
@@ -682,7 +683,7 @@ mod tests {
             assert_eq!(fonts.families[&family][0], "primary");
         }
         assert!(
-            PRIMARY_FACE.starts_with(b"OTTO"),
+            PRIMARY_FACE.starts_with(b"\x00\x01\x00\x00"),
             "the font asset is truncated"
         );
         assert!(PRIMARY_FACE.len() > 8_000_000, "the font asset is a stub");

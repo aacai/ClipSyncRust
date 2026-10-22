@@ -39,7 +39,7 @@ fn main() -> eframe::Result {
     let preferences = Preferences::open(paths::app_dir().join("preferences.json"));
 
     eframe::run_native(
-        "ClipSync",
+        "ClipSyncRust",
         native_options(),
         Box::new(move |ctx| {
             configure_shell(&ctx.egui_ctx, preferences.theme());

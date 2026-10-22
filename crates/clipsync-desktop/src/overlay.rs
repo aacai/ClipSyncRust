@@ -51,7 +51,7 @@ pub fn viewport() -> egui::ViewportBuilder {
 }
 
 /// The window title, which is also how the native macOS layer finds the overlay window.
-const TITLE: &str = "ClipSync 截图";
+const TITLE: &str = "ClipSyncRust 截图";
 
 /// One frozen screen plus the windows that were on it, all in overlay-local points.
 pub struct Freeze {
