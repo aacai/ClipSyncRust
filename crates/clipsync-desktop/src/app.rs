@@ -477,6 +477,11 @@ impl ClipSyncApp {
                 }
                 return;
             }
+            // 屋里另一台机器（或本机另一个 ClipSync）把我们刚发出去的内容又推回来。
+            // 这时候用户的剪贴板可能已经换成更新的一份了，写下去就是把新的盖掉。
+            if self.clipboard.is_echo(&clip.text) {
+                return;
+            }
             self.clipboard.write(&clip.text);
             if inserted {
                 self.notify(format!("收到 {sender} 的文本，已进剪贴板"));
@@ -603,6 +608,7 @@ impl ClipSyncApp {
         match self.clipboard.poll(self.watch_files, self.watch_images) {
             Some(Captured::Text(text)) => {
                 if matches!(self.status, Status::Online { .. }) {
+                    self.clipboard.note_published(&text);
                     self.engine.publish_text(&text);
                 } else {
                     self.record_local(&text);

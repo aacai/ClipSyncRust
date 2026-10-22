@@ -1,12 +1,18 @@
+use std::collections::VecDeque;
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arboard::{Clipboard, ImageData};
 use clipsync_core::crypto::sha256_hex;
 use clipsync_core::files::MAX_FILE_BYTES;
 
 pub const POLL_INTERVAL: Duration = Duration::from_millis(800);
+
+/// How long a text we broadcast stays "ours". Long enough that the room's reply can no
+/// longer overwrite a copy the user just made, short enough that copying the same text
+/// again five minutes later is still a real clip.
+const ECHO_WINDOW: Duration = Duration::from_secs(10);
 
 fn meaningful(text: Option<String>) -> Option<String> {
     text.filter(|text| !text.trim().is_empty())
@@ -17,11 +23,15 @@ fn meaningful(text: Option<String>) -> Option<String> {
 /// The same text can reach us three ways: the user copied it, we wrote it back after
 /// an incoming clip, or we published it from the compose box. Only the first is worth
 /// re-broadcasting; the others must be suppressed or the room loops on itself.
+///
+/// Outbound texts are remembered as a short window rather than as one slot: another
+/// ClipSync on the same machine treats the clip we sent as a fresh copy and pushes it
+/// back, and that echo has to be dropped without forgetting what the user copied since.
 #[derive(Default)]
 pub struct CopyFilter {
     captured: Option<String>,
     own_write: Option<String>,
-    published: Option<String>,
+    outbound: VecDeque<(String, Instant)>,
 }
 
 impl CopyFilter {
@@ -38,7 +48,7 @@ impl CopyFilter {
         let text = meaningful(text)?;
         if Some(&text) == self.captured.as_ref()
             || Some(&text) == self.own_write.as_ref()
-            || Some(&text) == self.published.as_ref()
+            || self.echoed(&text)
         {
             return None;
         }
@@ -51,7 +61,23 @@ impl CopyFilter {
     }
 
     pub fn published(&mut self, text: &str) {
-        self.published = Some(text.to_string());
+        self.remember(text, Instant::now());
+    }
+
+    /// True while `text` is something this device put on the wire moments ago.
+    pub fn echoed(&self, text: &str) -> bool {
+        self.outbound
+            .iter()
+            .any(|(sent, at)| sent == text && at.elapsed() < ECHO_WINDOW)
+    }
+
+    fn remember(&mut self, text: &str, at: Instant) {
+        self.outbound
+            .retain(|(_, sent_at)| sent_at.elapsed() < ECHO_WINDOW);
+        self.outbound.push_back((text.to_string(), at));
+        while self.outbound.len() > 32 {
+            self.outbound.pop_front();
+        }
     }
 
     fn mark_seen(&mut self, text: Option<String>) {
@@ -187,6 +213,12 @@ impl ClipboardWatcher {
         self.filter.published(text);
     }
 
+    /// A clip we already put on the wire or on the pasteboard: writing it back would only
+    /// bury whatever the user copied since.
+    pub fn is_echo(&self, text: &str) -> bool {
+        self.filter.echoed(text) || self.filter.own_write.as_deref() == Some(text)
+    }
+
     pub fn write_files(&mut self, paths: &[PathBuf]) -> bool {
         if paths.is_empty() {
             return false;
@@ -294,8 +326,9 @@ pub fn image_hash(rgba: &[u8], width: u32, height: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{image_hash, signature_of, ClipFile, CopyFilter};
+    use super::{image_hash, signature_of, ClipFile, CopyFilter, ECHO_WINDOW};
     use std::path::PathBuf;
+    use std::time::Instant;
 
     #[test]
     fn startup_baseline_is_not_a_copy() {
@@ -336,6 +369,27 @@ mod tests {
         let mut filter = CopyFilter::new(None);
         filter.published("sent");
         assert_eq!(filter.observe(Some("sent".to_string())), None);
+    }
+
+    #[test]
+    fn a_recent_send_is_an_echo_but_an_ancient_one_is_a_fresh_clip() {
+        let mut filter = CopyFilter::new(None);
+        filter.published("sent");
+        assert!(filter.echoed("sent"));
+        assert!(!filter.echoed("something else"));
+        if let Some(ancient) = Instant::now().checked_sub(ECHO_WINDOW * 2) {
+            filter.remember("stale", ancient);
+            assert!(!filter.echoed("stale"));
+        }
+    }
+
+    #[test]
+    fn a_later_copy_does_not_erase_what_we_sent() {
+        let mut filter = CopyFilter::new(None);
+        filter.published("first");
+        filter.published("second");
+        assert!(filter.echoed("first"));
+        assert!(filter.echoed("second"));
     }
 
     #[test]
