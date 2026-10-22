@@ -3038,7 +3038,7 @@ impl ClipSyncApp {
                         about_row(ui, "版本", env!("CARGO_PKG_VERSION"), false);
                         about_row(ui, "所属系统", paths::device_os(), false);
                         about_row(ui, "设备号", &paths::install_id(), true);
-                        about_row(ui, "本机记录", &format!("{} 条", self.history.items.len()), false);
+                        about_row(ui, "本地记录", &format!("{} 条", self.history.items.len()), false);
                         about_row(ui, "房间", &room, self.joined);
                         about_row(ui, "文件托管", "uguu.se，拒收时退回 x0.at", false);
                         ui.add_space(6.0);
