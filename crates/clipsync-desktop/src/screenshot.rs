@@ -4,11 +4,12 @@ use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use eframe::egui::{self, Key, Modifiers};
+use eframe::egui::{Key, Modifiers, Pos2, Rect, Vec2};
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 
 use crate::clipboard::image_hash;
+use crate::overlay;
 
 /// WeChat's default; the one users get without ever opening settings.
 pub const DEFAULT_HOTKEY: &str = "Alt+A";
@@ -18,14 +19,58 @@ pub struct Shot {
     pub hash: String,
 }
 
-pub fn capture() -> Result<Shot, String> {
+/// The frozen screen the overlay draws: the pixels, the monitor in points, and the windows that
+/// were on it, front to back, already in the overlay's own coordinates.
+pub fn freeze() -> Result<overlay::Freeze, String> {
+    let monitor = primary_monitor()?;
+    let image = monitor.capture_image().map_err(|error| error.to_string())?;
+    let width = monitor.width().map_err(|error| error.to_string())? as f32;
+    let height = monitor.height().map_err(|error| error.to_string())? as f32;
+    let position = Pos2::new(
+        monitor.x().map_err(|error| error.to_string())? as f32,
+        monitor.y().map_err(|error| error.to_string())? as f32,
+    );
+    // Window bounds come in display points, so one point is however many pixels the grab came
+    // back with — that ratio is what turns a selection into a crop.
+    let scale = image.width() as f32 / width.max(1.0);
+    let windows = xcap::Window::all()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|window| !window.is_minimized().unwrap_or(false))
+        .filter_map(|window| {
+            let left = window.x().ok()? as f32 - position.x;
+            let top = window.y().ok()? as f32 - position.y;
+            let right = left + window.width().ok()? as f32;
+            let bottom = top + window.height().ok()? as f32;
+            (right > left && bottom > top).then_some(Rect::from_min_max(
+                Pos2::new(left, top),
+                Pos2::new(right, bottom),
+            ))
+        })
+        .collect();
+    Ok(overlay::Freeze {
+        image,
+        position,
+        size: Vec2::new(width, height),
+        scale,
+        windows,
+    })
+}
+
+fn primary_monitor() -> Result<xcap::Monitor, String> {
     let monitors = xcap::Monitor::all().map_err(|error| error.to_string())?;
-    let monitor = monitors
+    let index = monitors
         .iter()
-        .find(|monitor| monitor.is_primary().unwrap_or(false))
-        .or_else(|| monitors.first())
-        .ok_or("没有可用的显示器")?;
-    let frame = monitor.capture_image().map_err(|error| error.to_string())?;
+        .position(|monitor| monitor.is_primary().unwrap_or(false))
+        .unwrap_or(0);
+    monitors
+        .into_iter()
+        .nth(index)
+        .ok_or_else(|| "没有可用的显示器".to_string())
+}
+
+/// PNG plus the content hash the clipboard watch has to know about, or a re-record follows.
+pub fn encode(frame: image::RgbaImage) -> Result<Shot, String> {
     let (width, height) = frame.dimensions();
     let hash = image_hash(frame.as_raw(), width, height);
     let mut png = Cursor::new(Vec::new());
@@ -289,5 +334,53 @@ mod tests {
     fn the_default_matches_wechat() {
         assert_eq!(DEFAULT_HOTKEY, "Alt+A");
         assert!(parse(DEFAULT_HOTKEY).is_some());
+    }
+
+    /// 键名单和 Compose 端的 `ScreenshotHotkey.keys` 是同一份：两端各存各的设置，
+    /// 但同一条「Alt+A」必须注册到同一个物理键上，所以这里把每个 token 都过一遍解析。
+    #[test]
+    fn every_advertised_token_name_registers() {
+        let names = [
+            "Space",
+            "Enter",
+            "Tab",
+            "Backspace",
+            "Delete",
+            "Home",
+            "End",
+            "PageUp",
+            "PageDown",
+            "ArrowUp",
+            "ArrowDown",
+            "ArrowLeft",
+            "ArrowRight",
+            "Minus",
+            "Equal",
+            "BracketLeft",
+            "BracketRight",
+            "Backslash",
+            "Semicolon",
+            "Quote",
+            "Comma",
+            "Period",
+            "Slash",
+            "Backquote",
+        ];
+        for name in names {
+            let shortcut = format!("Alt+{name}");
+            assert!(parse(&shortcut).is_some(), "{shortcut} should register");
+        }
+        for byte in b'A'..=b'Z' {
+            let shortcut = format!("Alt+{}", char::from(byte));
+            assert!(parse(&shortcut).is_some(), "{shortcut} should register");
+        }
+        for digit in '0'..='9' {
+            let shortcut = format!("Alt+{digit}");
+            assert!(parse(&shortcut).is_some(), "{shortcut} should register");
+        }
+        for number in 1..=12 {
+            let shortcut = format!("Alt+F{number}");
+            assert!(parse(&shortcut).is_some(), "{shortcut} should register");
+        }
     }
 }

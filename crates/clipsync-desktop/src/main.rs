@@ -3,6 +3,7 @@ mod autostart;
 mod clipboard;
 mod icons;
 mod jobs;
+mod overlay;
 mod paths;
 mod screenshot;
 mod settings;

@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::text::TextWrapping;
@@ -30,7 +30,7 @@ use crate::theme;
 use crate::transfer::TransferClient;
 use crate::translate::{self, Failure as TranslateFailure, Target as TranslateTarget};
 use crate::update::{self, UpdateEvent, UpdateState};
-use crate::{autostart, paths, screenshot};
+use crate::{autostart, overlay, paths, screenshot};
 
 const TOAST_INFO: Duration = Duration::from_secs(4);
 const TOAST_ERROR: Duration = Duration::from_secs(6);
@@ -98,6 +98,8 @@ pub struct ClipSyncApp {
     update_rx: Option<mpsc::Receiver<UpdateEvent>>,
     autostart_available: bool,
     hotkeys: Option<screenshot::Hotkeys>,
+    /// The screenshot overlay frozen on screen right now, shared with its own window.
+    shot: Option<Arc<Mutex<overlay::Session>>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -362,6 +364,7 @@ impl ClipSyncApp {
             update_rx: None,
             autostart_available,
             hotkeys,
+            shot: None,
         };
         let restore = app.preferences.remember_room() && app.settings.session.is_some();
         if !app.preferences.remember_room() {
@@ -929,21 +932,69 @@ impl ClipSyncApp {
         Ok(())
     }
 
-    fn capture_screen(&mut self) {
-        if screenshot::permission_missing() {
-            self.notify_error("缺少屏幕录制权限：系统设置 → 隐私与安全性 → 屏幕与系统音频录制，勾上 ClipSync");
+    /// Freeze the screen, then open the WeChat overlay on top of everything: the frame goes grey
+    /// and the user picks a window with a click or draws a region before anything is cut.
+    fn start_capture(&mut self) {
+        if self.shot.is_some() {
             return;
         }
-        let shot = match screenshot::capture() {
-            Ok(shot) => shot,
+        if screenshot::permission_missing() {
+            self.notify_error(
+                "缺少屏幕录制权限：系统设置 → 隐私与安全性 → 屏幕与系统音频录制，勾上 ClipSync",
+            );
+            return;
+        }
+        let freeze = match screenshot::freeze() {
+            Ok(freeze) => freeze,
             Err(error) => {
                 self.notify_error(format!("截屏失败：{error}"));
                 return;
             }
         };
+        self.shot = Some(Arc::new(Mutex::new(overlay::Session::new(freeze))));
+    }
+
+    /// Keep the overlay window alive and collect the region the moment the user settles on one.
+    fn service_shot(&mut self, ctx: &egui::Context) {
+        let Some(session) = self.shot.clone() else {
+            return;
+        };
+        let outcome = session.lock().ok().and_then(|mut guard| {
+            let outcome = guard.take_outcome();
+            if outcome.is_none() {
+                let builder = guard.viewport();
+                drop(guard);
+                let shared = session.clone();
+                ctx.show_viewport_deferred(overlay::viewport_id(), builder, move |ui, _| {
+                    if let Ok(mut session) = shared.lock() {
+                        session.draw(ui);
+                    }
+                });
+            }
+            outcome
+        });
+        let Some(outcome) = outcome else { return };
+        overlay::close(ctx);
+        let shot = match outcome {
+            overlay::Outcome::Cancel => None,
+            overlay::Outcome::Crop(rect) => session.lock().ok().and_then(|mut guard| {
+                let image = guard.take_image()?;
+                let size = Vec2::new(image.width() as f32, image.height() as f32);
+                let (x, y, width, height) = overlay::crop_px(rect, size, guard.scale());
+                let cropped = image::imageops::crop_imm(&image, x, y, width, height).to_image();
+                screenshot::encode(cropped).ok()
+            }),
+        };
+        self.shot = None;
+        if let Some(shot) = shot {
+            self.commit_shot(shot);
+        }
+    }
+
+    fn commit_shot(&mut self, shot: screenshot::Shot) {
         if shot.png.len() as i64 > MAX_FILE_BYTES {
             self.notify_error(format!(
-                "整屏超过 {}MB，这次没有截",
+                "这块区域超过 {}MB，这次没有截",
                 clipsync_core::files::max_mb()
             ));
             return;
@@ -2289,8 +2340,9 @@ impl ClipSyncApp {
             .as_ref()
             .is_some_and(|hotkeys| hotkeys.take_pressed())
         {
-            self.capture_screen();
+            self.start_capture();
         }
+        self.service_shot(ctx);
         self.poll_clipboard();
         self.poll_translation();
         self.expire_toast();
@@ -4034,9 +4086,7 @@ impl ClipSyncApp {
             DialogAction::SetHotkey(spec) => match self.set_screenshot_hotkey(&spec) {
                 Ok(()) => keep = false,
                 Err(error) => {
-                    overlay = Overlay::Hotkey {
-                        error: Some(error),
-                    };
+                    overlay = Overlay::Hotkey { error: Some(error) };
                 }
             },
         }
