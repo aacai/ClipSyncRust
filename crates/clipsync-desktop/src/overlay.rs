@@ -4,8 +4,12 @@
 
 use eframe::egui::{
     self, Color32, CursorIcon, Frame, Id, Key, Order, PointerButton, Pos2, Rect, Stroke,
-    StrokeKind, TextureHandle, TextureOptions, Ui, Vec2, ViewportCommand,
+    StrokeKind, TextureHandle, TextureOptions, Ui, Vec2, ViewportCommand, ViewportId,
 };
+#[cfg(target_os = "macos")]
+use objc2::{rc::Retained, MainThreadMarker};
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{NSApplication, NSWindow};
 
 use crate::icons;
 use crate::theme;
@@ -23,6 +27,25 @@ const TOOLBAR_HEIGHT: f32 = 45.0;
 /// The id of the overlay window; one at a time, since only one screen can be frozen.
 pub fn viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("screenshot-overlay")
+}
+
+/// The overlay window itself: borderless, above every other app, and hidden until a capture is
+/// pinned over the screen. There is one of them for the whole process because closing a window
+/// only closes its egui side — the native window stays behind and the next capture stacks on it.
+pub fn viewport() -> egui::ViewportBuilder {
+    egui::ViewportBuilder::default()
+        .with_app_id("clipsync-screenshot")
+        .with_title(TITLE)
+        .with_decorations(false)
+        .with_titlebar_shown(false)
+        .with_titlebar_buttons_shown(false)
+        .with_close_button(false)
+        .with_minimize_button(false)
+        .with_maximize_button(false)
+        .with_resizable(false)
+        .with_taskbar(false)
+        .with_visible(false)
+        .with_always_on_top()
 }
 
 /// The window title, which is also how the native macOS layer finds the overlay window.
@@ -91,8 +114,10 @@ pub struct Session {
     hover: Option<Rect>,
     drag: Option<Drag>,
     outcome: Option<Outcome>,
-    /// Whether the window has been pinned over the whole screen already.
-    presented: bool,
+    /// The frozen screen has reached the glass, which is when the app window may come back.
+    raised: bool,
+    /// The overlay holds the keyboard, so Esc and Enter are its to hear.
+    focused: bool,
 }
 
 impl Session {
@@ -104,28 +129,14 @@ impl Session {
             hover: None,
             drag: None,
             outcome: None,
-            presented: false,
+            raised: false,
+            focused: false,
         }
     }
 
-    /// The builder for the window this session is drawn in: borderless, on top of every other
-    /// app, covering the monitor that was frozen.
-    pub fn viewport(&self) -> egui::ViewportBuilder {
-        egui::ViewportBuilder::default()
-            .with_app_id("clipsync-screenshot")
-            .with_title(TITLE)
-            .with_decorations(false)
-            .with_titlebar_shown(false)
-            .with_titlebar_buttons_shown(false)
-            .with_close_button(false)
-            .with_minimize_button(false)
-            .with_maximize_button(false)
-            .with_resizable(false)
-            .with_taskbar(false)
-            .with_visible(true)
-            .with_always_on_top()
-            .with_position(self.freeze.position)
-            .with_inner_size(self.freeze.size)
+    /// Where the overlay window has to sit for this frame to fill the screen.
+    pub fn screen(&self) -> (Pos2, Vec2) {
+        (self.freeze.position, self.freeze.size)
     }
 
     /// Hands the frozen frame over to the caller once the session is done with it.
@@ -149,34 +160,26 @@ impl Session {
 
     pub fn draw(&mut self, ui: &mut Ui) {
         let frame = ui.max_rect();
-        if !self.presented || frame.size() != self.freeze.size {
-            self.present(ui);
-        }
         self.paint_frame(ui, frame);
         let position = self.track_pointer(ui, frame);
         self.paint_marks(ui, frame);
         let toolbar = self.paint_toolbar(ui, frame);
         self.paint_cursor(ui, position, toolbar);
+        self.raise(ui.ctx());
     }
 
-    /// macOS hands the window back shrunk to the space below the menu bar and keeps an ordinary
-    /// floating window out of the menu bar and dock, so the window is pinned natively instead.
-    fn present(&mut self, ui: &Ui) {
-        #[cfg(target_os = "macos")]
-        {
-            self.presented = cover_screen();
+    /// Once the frozen screen is on glass the app window may come back behind it. Showing it also
+    /// hands it the keyboard, so the overlay has to take the keys one pass later rather than in
+    /// the same flush — otherwise Esc goes to a window nobody can see.
+    fn raise(&mut self, ctx: &egui::Context) {
+        if !self.raised {
+            self.raised = true;
+            ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Visible(true));
+            ctx.request_repaint();
+        } else if !self.focused {
+            self.focused = true;
+            focus();
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            ui.ctx()
-                .send_viewport_cmd(ViewportCommand::OuterPosition(self.freeze.position));
-            ui.ctx()
-                .send_viewport_cmd(ViewportCommand::InnerSize(self.freeze.size));
-            ui.ctx().request_repaint();
-            self.presented = true;
-        }
-        #[cfg(target_os = "macos")]
-        let _ = ui;
     }
 
     fn paint_frame(&mut self, ui: &Ui, frame: Rect) {
@@ -434,39 +437,74 @@ impl Session {
     }
 }
 
-/// Ask the compositor to tear the overlay window down.
-pub fn close(ctx: &egui::Context) {
-    ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::Close);
+/// Put the overlay window on screen, or take it off again. It is never closed: closing tears down
+/// the egui side but leaves the native window behind, so one window per capture would pile up.
+pub fn reveal(ctx: &egui::Context, visible: bool) {
+    ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::Visible(visible));
 }
 
-/// Raise the overlay above the menu bar and stretch it over the whole primary screen. Returns
-/// whether the window was there yet.
-#[cfg(target_os = "macos")]
-fn cover_screen() -> bool {
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::{NSApplication, NSScreen, NSScreenSaverWindowLevel};
+/// Stretch the overlay window over every pixel of the screen, menu bar and dock included, and
+/// report whether it is in place. Done while the window is still hidden so nobody watches it move.
+pub fn cover(ctx: &egui::Context, position: Pos2, size: Vec2) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (ctx, position, size);
+        pin_screen()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::OuterPosition(position));
+        ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::InnerSize(size));
+        true
+    }
+}
 
+/// AppKit keeps even a floating window below the menu bar (level 24) and the dock (level 20), so
+/// only a screen-saver level window is allowed to dim the whole screen.
+#[cfg(target_os = "macos")]
+fn pin_screen() -> bool {
+    use objc2_app_kit::{NSScreen, NSScreenSaverWindowLevel};
+
+    let Some(window) = overlay_window() else {
+        return false;
+    };
     let Some(mtm) = MainThreadMarker::new() else {
         return false;
     };
-    let app = NSApplication::sharedApplication(mtm);
     let Some(screen) = NSScreen::mainScreen(mtm) else {
         return false;
     };
-    for window in app.windows().iter() {
-        if window.title().to_string() != TITLE {
-            continue;
-        }
-        // The menu bar and the dock live at levels 24 and 20 and AppKit keeps floating windows
-        // below them; a screen-saver level window is allowed to dim all of it.
-        window.setLevel(NSScreenSaverWindowLevel);
-        window.setFrame_display(screen.frame(), true);
-        app.activate();
-        window.makeKeyAndOrderFront(None);
-        return true;
-    }
-    false
+    window.setLevel(NSScreenSaverWindowLevel);
+    window.setFrame_display(screen.frame(), false);
+    true
 }
+
+/// The overlay window, found by title because egui hands out no native handle for it.
+#[cfg(target_os = "macos")]
+fn overlay_window() -> Option<Retained<NSWindow>> {
+    let mtm = MainThreadMarker::new()?;
+    NSApplication::sharedApplication(mtm)
+        .windows()
+        .iter()
+        .find(|window| window.title().to_string() == TITLE)
+}
+
+/// Clicks already land on the overlay, but only the key window is told about Esc.
+#[cfg(target_os = "macos")]
+fn focus() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let Some(window) = overlay_window() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    app.activate();
+    window.makeKeyAndOrderFront(None);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn focus() {}
 
 /// A region the user drew is only real once it is big enough to be worth pixels.
 fn is_region(rect: Rect, frame: Rect) -> bool {

@@ -36,6 +36,9 @@ pub fn freeze() -> Result<overlay::Freeze, String> {
     let windows = xcap::Window::all()
         .map_err(|error| error.to_string())?
         .into_iter()
+        // Our own windows never make good targets: the overlay is off screen but still in the
+        // list, and picking it would offer a strip of last week's screenshot.
+        .filter(|window| window.pid().ok() != Some(std::process::id()))
         .filter(|window| !window.is_minimized().unwrap_or(false))
         .filter_map(|window| {
             let left = window.x().ok()? as f32 - position.x;

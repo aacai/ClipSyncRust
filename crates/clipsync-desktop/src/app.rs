@@ -102,6 +102,8 @@ pub struct ClipSyncApp {
     hotkeys: Option<screenshot::Hotkeys>,
     /// The screenshot overlay frozen on screen right now, shared with its own window.
     shot: Option<Arc<Mutex<overlay::Session>>>,
+    /// The overlay window is on screen with the frozen frame in it.
+    shot_visible: bool,
     /// When the app window will be gone long enough to grab the screen behind it.
     capture_at: Option<Instant>,
 }
@@ -369,6 +371,7 @@ impl ClipSyncApp {
             autostart_available,
             hotkeys,
             shot: None,
+            shot_visible: false,
             capture_at: None,
         };
         let restore = app.preferences.remember_room() && app.settings.session.is_some();
@@ -956,8 +959,9 @@ impl ClipSyncApp {
         ctx.request_repaint_after(CAPTURE_HIDE_DELAY);
     }
 
-    /// Grabs the screen once the app window has actually left it, then brings the window back:
-    /// the overlay window needs a live app to be created in.
+    /// Grabs the screen once the app window has actually left it and hands the frame to the
+    /// overlay window, which is already built. The app window stays hidden until the overlay has
+    /// the frozen screen painted, so nothing flashes between the two.
     fn take_capture(&mut self, ctx: &egui::Context) {
         let Some(at) = self.capture_at else { return };
         let now = Instant::now();
@@ -966,47 +970,65 @@ impl ClipSyncApp {
             return;
         }
         self.capture_at = None;
-        let freeze = screenshot::freeze();
-        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-        match freeze {
+        match screenshot::freeze() {
             Ok(freeze) => {
                 self.shot = Some(Arc::new(Mutex::new(overlay::Session::new(freeze))));
             }
-            Err(error) => self.notify_error(format!("截屏失败：{error}")),
+            Err(error) => {
+                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                self.notify_error(format!("截屏失败：{error}"));
+            }
         }
     }
 
-    /// Keep the overlay window alive and collect the region the moment the user settles on one.
+    /// Feed the one overlay window — built at startup, never closed — with the frozen screen,
+    /// show it only once it covers the whole display, and collect the region the moment the user
+    /// settles on one.
     fn service_shot(&mut self, ctx: &egui::Context) {
+        let session = self.shot.clone();
+        ctx.show_viewport_deferred(overlay::viewport_id(), overlay::viewport(), move |ui, _| {
+            let Some(session) = &session else { return };
+            if let Ok(mut session) = session.lock() {
+                session.draw(ui);
+            }
+        });
+
         let Some(session) = self.shot.clone() else {
             return;
         };
-        let outcome = session.lock().ok().and_then(|mut guard| {
-            let outcome = guard.take_outcome();
-            if outcome.is_none() {
-                let builder = guard.viewport();
-                drop(guard);
-                let shared = session.clone();
-                ctx.show_viewport_deferred(overlay::viewport_id(), builder, move |ui, _| {
-                    if let Ok(mut session) = shared.lock() {
-                        session.draw(ui);
-                    }
-                });
+
+        if !self.shot_visible {
+            let Some((position, size)) = session.lock().ok().map(|guard| guard.screen()) else {
+                return;
+            };
+            if overlay::cover(ctx, position, size) {
+                self.shot_visible = true;
+                overlay::reveal(ctx, true);
+            } else {
+                // The window is not up yet; asking for another pass is cheaper than a cut-out
+                // that lands on a half-moved overlay.
+                ctx.request_repaint();
             }
-            outcome
+            return;
+        }
+
+        // None until the user is done, Some(None) for a cancelled shot, Some(Some) for a crop.
+        let shot = session.lock().ok().and_then(|mut guard| {
+            let outcome = guard.take_outcome()?;
+            Some(match outcome {
+                overlay::Outcome::Cancel => None,
+                overlay::Outcome::Crop(rect) => {
+                    let image = guard.take_image()?;
+                    let size = Vec2::new(image.width() as f32, image.height() as f32);
+                    let (x, y, width, height) = overlay::crop_px(rect, size, guard.scale());
+                    let cropped = image::imageops::crop_imm(&image, x, y, width, height).to_image();
+                    screenshot::encode(cropped).ok()
+                }
+            })
         });
-        let Some(outcome) = outcome else { return };
-        overlay::close(ctx);
-        let shot = match outcome {
-            overlay::Outcome::Cancel => None,
-            overlay::Outcome::Crop(rect) => session.lock().ok().and_then(|mut guard| {
-                let image = guard.take_image()?;
-                let size = Vec2::new(image.width() as f32, image.height() as f32);
-                let (x, y, width, height) = overlay::crop_px(rect, size, guard.scale());
-                let cropped = image::imageops::crop_imm(&image, x, y, width, height).to_image();
-                screenshot::encode(cropped).ok()
-            }),
-        };
+        let Some(shot) = shot else { return };
+        overlay::reveal(ctx, false);
+        self.shot_visible = false;
         self.shot = None;
         if let Some(shot) = shot {
             self.commit_shot(shot);
