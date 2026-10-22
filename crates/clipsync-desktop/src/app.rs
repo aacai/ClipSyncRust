@@ -37,6 +37,7 @@ const TOAST_ERROR: Duration = Duration::from_secs(6);
 const TOAST_UNDO: Duration = Duration::from_secs(9);
 const THUMB_MAX_SIDE: u32 = 256;
 const ZOOM_MAX_SIDE: u32 = 2048;
+const REPO_URL: &str = "https://github.com/aacai/ClipSync";
 
 const HELP_STEPS: [&str; 6] = [
     "打开「房间共享」：顶栏的钥匙图标，或未共享时列表里的「共享」。填一个房间码（可随机换一个），房间密码可选，设了就必须两端一致。",
@@ -123,6 +124,7 @@ enum SettingsAction {
     WatchFiles(bool),
     DeleteExpired(bool),
     EditRoom,
+    About,
     LeaveRoom,
     Quit,
     CheckUpdate,
@@ -156,6 +158,7 @@ struct ThumbEntry {
 enum Overlay {
     Share,
     Help,
+    About,
     Safety,
     ClearAll,
     LeaveRoom,
@@ -1154,6 +1157,10 @@ impl ClipSyncApp {
                                     false,
                                 );
                                 settings_divider(ui);
+                                if settings_nav_row(ui, "关于", "项目信息") {
+                                    action = Some(SettingsAction::About);
+                                }
+                                settings_divider(ui);
                                 if settings_action_row(ui, "退出 ClipSync") {
                                     action = Some(SettingsAction::Quit);
                                 }
@@ -1240,6 +1247,7 @@ impl ClipSyncApp {
             SettingsAction::WatchFiles(enabled) => self.set_watch_files(enabled),
             SettingsAction::DeleteExpired(enabled) => self.set_delete_expired(enabled),
             SettingsAction::EditRoom => self.open(Overlay::Share),
+            SettingsAction::About => self.open(Overlay::About),
             SettingsAction::LeaveRoom => self.open(Overlay::LeaveRoom),
             SettingsAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             SettingsAction::CheckUpdate => self.check_updates(),
@@ -3019,6 +3027,40 @@ impl ClipSyncApp {
                             }
                         });
                     }
+                    Overlay::About => {
+                        dialog_header(ui, Icon::Info, "关于 ClipSync");
+                        ui.add_space(12.0);
+                        let room = if self.joined {
+                            self.room_code.clone()
+                        } else {
+                            "未共享".to_string()
+                        };
+                        about_row(ui, "版本", env!("CARGO_PKG_VERSION"), false);
+                        about_row(ui, "所属系统", paths::device_os(), false);
+                        about_row(ui, "设备号", &paths::install_id(), true);
+                        about_row(ui, "本机记录", &format!("{} 条", self.history.items.len()), false);
+                        about_row(ui, "房间", &room, self.joined);
+                        about_row(ui, "文件托管", "uguu.se，拒收时退回 x0.at", false);
+                        ui.add_space(6.0);
+                        field_label(ui, "缓存目录");
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(paths::cache_dir().display().to_string())
+                                .monospace()
+                                .size(11.0)
+                                .color(theme::p().muted),
+                        );
+                        ui.add_space(10.0);
+                        hint(ui, "房间码连同密码在本机派生密钥，托管方只会收到密文。");
+                        ui.add_space(6.0);
+                        ui.hyperlink_to("github.com/aacai/ClipSync", REPO_URL);
+                        ui.add_space(12.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if secondary_button(ui, "知道了").clicked() {
+                                close = true;
+                            }
+                        });
+                    }
                     Overlay::Safety => {
                         dialog_header(ui, Icon::Shield, "安全码");
                         ui.add_space(12.0);
@@ -4744,6 +4786,27 @@ fn bullet(ui: &mut Ui, text: &str) {
         });
     });
     ui.add_space(6.0);
+}
+
+/// 关于面板里的一行：左边项目名，右边取值。
+fn about_row(ui: &mut Ui, title: &str, value: &str, monospace: bool) {
+    let font = if monospace {
+        FontId::monospace(11.5)
+    } else {
+        FontId::proportional(11.5)
+    };
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(title).size(11.5).color(theme::p().faint));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(
+                RichText::new(value)
+                    .size(11.5)
+                    .color(theme::p().text)
+                    .font(font),
+            );
+        });
+    });
+    ui.add_space(7.0);
 }
 
 fn accent_button(ui: &mut Ui, label: &str) -> egui::Response {
