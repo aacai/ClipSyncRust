@@ -201,7 +201,7 @@ enum Overlay {
         error: bool,
     },
     Hotkey {
-        failed: bool,
+        error: Option<String>,
     },
 }
 
@@ -912,15 +912,21 @@ impl ClipSyncApp {
         let spec = self.preferences.screenshot_hotkey().to_string();
         if let Some(hotkeys) = self.hotkeys.as_mut() {
             if let Err(error) = hotkeys.apply(&spec) {
-                self.notify_error(format!("截屏快捷键没有生效：{error}"));
+                self.notify_error(error);
             }
         }
     }
 
-    fn set_screenshot_hotkey(&mut self, spec: &str) {
+    fn set_screenshot_hotkey(&mut self, spec: &str) -> Result<(), String> {
+        // 注册没成功就别写盘：否则下次启动还是同一个坏组合键，每次都报错
+        let result = match self.hotkeys.as_mut() {
+            Some(hotkeys) => hotkeys.apply(spec),
+            None => Ok(()),
+        };
+        result?;
         self.preferences.set_screenshot_hotkey(spec);
-        self.apply_hotkey();
         self.notify(format!("截屏快捷键已改为 {spec}"));
+        Ok(())
     }
 
     fn capture_screen(&mut self) {
@@ -935,6 +941,13 @@ impl ClipSyncApp {
                 return;
             }
         };
+        if shot.png.len() as i64 > MAX_FILE_BYTES {
+            self.notify_error(format!(
+                "整屏超过 {}MB，这次没有截",
+                clipsync_core::files::max_mb()
+            ));
+            return;
+        }
         if let Err(error) = self.clipboard.write_image(&shot.png) {
             self.notify_error(format!("写入剪贴板失败：{error}"));
             return;
@@ -1170,17 +1183,19 @@ impl ClipSyncApp {
                             ui.add_space(22.0);
 
                             let hotkey = self.preferences.screenshot_hotkey().to_string();
-                            settings_group(ui, "截屏", |ui| {
-                                if settings_nav_row(ui, "截屏快捷键", &hotkey) {
-                                    action = Some(SettingsAction::Hotkey);
-                                }
-                                settings_divider(ui);
-                                settings_footnote(
-                                    ui,
-                                    "按一下截下整屏：图直接进剪贴板，也存进列表发给同屋",
-                                );
-                            });
-                            ui.add_space(22.0);
+                            if self.hotkeys.is_some() {
+                                settings_group(ui, "截屏", |ui| {
+                                    if settings_nav_row(ui, "截屏快捷键", &hotkey) {
+                                        action = Some(SettingsAction::Hotkey);
+                                    }
+                                    settings_divider(ui);
+                                    settings_footnote(
+                                        ui,
+                                        "按一下截下整屏：图直接进剪贴板，也存进列表发给同屋",
+                                    );
+                                });
+                                ui.add_space(22.0);
+                            }
 
                             let delete_expired = self.preferences.delete_expired();
                             let retention = self.preferences.retention_days();
@@ -1324,7 +1339,7 @@ impl ClipSyncApp {
             SettingsAction::Theme => self.open(Overlay::Choice(SettingsChoice::Theme)),
             SettingsAction::Language => self.open(Overlay::Choice(SettingsChoice::Language)),
             SettingsAction::Retention => self.open(Overlay::Choice(SettingsChoice::Retention)),
-            SettingsAction::Hotkey => self.open(Overlay::Hotkey { failed: false }),
+            SettingsAction::Hotkey => self.open(Overlay::Hotkey { error: None }),
             SettingsAction::Nickname => self.open(Overlay::Nickname {
                 input: self.preferences.nickname().to_string(),
             }),
@@ -3426,7 +3441,7 @@ impl ClipSyncApp {
                             });
                         });
                     }
-                    Overlay::Hotkey { failed } => {
+                    Overlay::Hotkey { error } => {
                         dialog_header(ui, Icon::Select, "截屏快捷键");
                         ui.add_space(10.0);
                         ui.label(
@@ -3435,14 +3450,18 @@ impl ClipSyncApp {
                                 .color(theme::p().text),
                         );
                         ui.add_space(10.0);
-                        if *failed {
-                            ui.label(
-                                RichText::new("这个键做不了全局快捷键，再按一次别的")
-                                    .size(10.5)
-                                    .color(theme::p().red),
-                            );
-                        } else {
-                            hint(ui, "直接按下新的组合键就能替换，需要带上 Command、Control 或 Alt");
+                        match error.as_deref() {
+                            Some(reason) => {
+                                ui.label(
+                                    RichText::new(reason)
+                                        .size(10.5)
+                                        .color(theme::p().red),
+                                );
+                            }
+                            None => hint(
+                                ui,
+                                "直接按下新的组合键就能替换，需要带上 Command、Control 或 Alt",
+                            ),
                         }
                         let pressed = ui.input_mut(|input| {
                             let index = input.events.iter().position(|event| {
@@ -3459,9 +3478,11 @@ impl ClipSyncApp {
                             if key == Key::Escape {
                                 close = true;
                             } else if let Some(spec) = screenshot::spec(key, modifiers) {
+                                *error = None;
                                 action = DialogAction::SetHotkey(spec);
                             } else {
-                                *failed = true;
+                                *error =
+                                    Some("这个键做不了全局快捷键，再按一次别的组合键".to_string());
                             }
                         }
                         ui.add_space(14.0);
@@ -4010,10 +4031,14 @@ impl ClipSyncApp {
                 self.set_nickname(&name);
                 keep = false;
             }
-            DialogAction::SetHotkey(spec) => {
-                self.set_screenshot_hotkey(&spec);
-                keep = false;
-            }
+            DialogAction::SetHotkey(spec) => match self.set_screenshot_hotkey(&spec) {
+                Ok(()) => keep = false,
+                Err(error) => {
+                    overlay = Overlay::Hotkey {
+                        error: Some(error),
+                    };
+                }
+            },
         }
         if keep && self.overlay.is_none() {
             self.overlay = Some(overlay);

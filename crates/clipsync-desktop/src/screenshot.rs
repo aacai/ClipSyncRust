@@ -204,13 +204,14 @@ impl Hotkeys {
         if self.current == Some(next) {
             return Ok(());
         }
-        if let Some(current) = self.current.take() {
-            let _ = self.manager.unregister(current);
-        }
+        // Register the new chord first: if it fails the old one stays live instead of
+        // leaving the user with no hotkey at all.
         self.manager
             .register(next)
-            .map_err(|error| error.to_string())?;
-        self.current = Some(next);
+            .map_err(|_| format!("「{spec}」注册失败，换一个组合键试试"))?;
+        if let Some(current) = self.current.replace(next) {
+            let _ = self.manager.unregister(current);
+        }
         Ok(())
     }
 }
