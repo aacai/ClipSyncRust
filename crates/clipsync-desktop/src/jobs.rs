@@ -3,13 +3,13 @@ use std::sync::Arc;
 
 use clipsync_core::files::{
     decrypt_file, encrypt_file, max_mb, sanitize_file_name, upload_file_name,
-    validate_outgoing_file, RejectReason, DEFAULT_EXPIRES, MAX_FILE_BYTES,
+    validate_outgoing_file, RejectReason, MAX_FILE_BYTES,
 };
 use clipsync_core::protocol::{file_mid, now_millis};
 use clipsync_core::RoomCrypto;
 
 use crate::paths;
-use crate::transfer::{expiry_from, TransferClient};
+use crate::transfer::TransferClient;
 
 pub struct JobContext {
     pub crypto: Arc<RoomCrypto>,
@@ -167,8 +167,8 @@ pub fn perform_upload(
         mime: request.mime,
         size,
         sha256: encrypted.sha256,
-        link,
-        expires_at: expiry_from(DEFAULT_EXPIRES),
+        link: link.url,
+        expires_at: link.expires_at,
         local_path,
         target: request.target,
     })
@@ -254,7 +254,10 @@ mod tests {
     fn context() -> JobContext {
         JobContext {
             crypto: std::sync::Arc::new(RoomCrypto::open("TESTROOM", "pw").unwrap()),
-            client: std::sync::Arc::new(TransferClient::with_endpoint("http://127.0.0.1:1/")),
+            client: std::sync::Arc::new(TransferClient::with_hosts(
+                "http://127.0.0.1:1/",
+                "http://127.0.0.1:1/",
+            )),
             device_id: "device-1".to_string(),
         }
     }

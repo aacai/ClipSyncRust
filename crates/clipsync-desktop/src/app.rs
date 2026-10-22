@@ -585,17 +585,27 @@ impl ClipSyncApp {
         let online = matches!(self.status, Status::Online { .. });
         let mut uploads = Vec::new();
         for file in files {
-            if file.size <= 0 || file.size > MAX_FILE_BYTES {
+            let name = sanitize_file_name(&file.name);
+            if name.is_empty() {
+                continue;
+            }
+            if file.size <= 0 {
+                self.notify_error(format!("空文件无法分享：{name}"));
+                continue;
+            }
+            if file.size > MAX_FILE_BYTES {
+                self.notify_error(format!(
+                    "文件超过 {}MB，暂不支持：{name}",
+                    clipsync_core::files::max_mb()
+                ));
                 continue;
             }
             let Ok(bytes) = std::fs::read(&file.path) else {
+                self.notify_error(format!("读取本机文件失败：{name}"));
                 continue;
             };
-            if bytes.is_empty() || bytes.len() as i64 > MAX_FILE_BYTES {
-                continue;
-            }
-            let name = sanitize_file_name(&file.name);
-            if name.is_empty() {
+            if bytes.is_empty() {
+                self.notify_error(format!("空文件无法分享：{name}"));
                 continue;
             }
             if online {
@@ -665,6 +675,14 @@ impl ClipSyncApp {
             self.notify_error("还没进房间：文件暂时只能留在本机");
             return;
         };
+        // 先把进度条架起来：托管方从握手到回链接可能要几十秒，别让界面看着像没反应
+        let first = &requests[0];
+        self.transfer = Some(TransferUi {
+            upload: true,
+            name: first.name.clone(),
+            done: 0,
+            total: first.bytes.len() as i64,
+        });
         jobs::spawn_uploads(context, requests, self.job_tx.clone());
     }
 

@@ -4,58 +4,115 @@ use std::time::Duration;
 use clipsync_core::files::MAX_FILE_BYTES;
 use clipsync_core::protocol::now_millis;
 
-pub const UPLOAD_URL: &str = "https://litterbox.catbox.moe/resources/internals/api.php";
+pub const UUGU_UPLOAD_URL: &str = "https://uguu.se/upload.php";
+pub const X0_AT_UPLOAD_URL: &str = "https://x0.at/";
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const PROGRESS_STEP: i64 = 64 * 1024;
 
+// 托管方各自承诺的存活时长。x0.at 只说 3 天起步，按最短的那头算，
+// 免得给界面一个兑现不了的剩余时间；uguu 快但只有 3 小时。
+const UUGU_TTL_MS: i64 = 3 * 3_600_000;
+const X0_AT_TTL_MS: i64 = 72 * 3_600_000;
+
+pub struct UploadedLink {
+    pub url: String,
+    pub expires_at: i64,
+}
+
+impl UploadedLink {
+    fn with_ttl(ttl_ms: i64, url: String) -> Self {
+        Self {
+            url,
+            expires_at: now_millis() + ttl_ms,
+        }
+    }
+}
+
 pub struct TransferClient {
     agent: ureq::Agent,
-    endpoint: String,
+    uugu_url: String,
+    x0at_url: String,
 }
 
 impl TransferClient {
     pub fn new() -> Self {
-        Self::with_endpoint(UPLOAD_URL)
+        Self::with_hosts(UUGU_UPLOAD_URL, X0_AT_UPLOAD_URL)
     }
 
-    pub fn with_endpoint(endpoint: &str) -> Self {
+    pub fn with_hosts(uugu_url: &str, x0at_url: &str) -> Self {
         let agent = ureq::AgentBuilder::new().timeout(REQUEST_TIMEOUT).build();
         Self {
             agent,
-            endpoint: endpoint.to_string(),
+            uugu_url: uugu_url.to_string(),
+            x0at_url: x0at_url.to_string(),
         }
     }
 
     /// Uploads already-encrypted bytes and returns the public link.
+    ///
+    /// uguu 主用（两头都快），它拒收才退回 x0.at；两家都失败时报主用的那个错。
     pub fn upload(
         &self,
         file_name: &str,
         bytes: &[u8],
         mut on_progress: impl FnMut(i64, i64),
+    ) -> Result<UploadedLink, String> {
+        let primary = self
+            .post(
+                &self.uugu_url,
+                "files[]",
+                &[],
+                file_name,
+                bytes,
+                &mut on_progress,
+            )
+            .and_then(|body| {
+                parse_uugu_link(&body).map(|url| UploadedLink::with_ttl(UUGU_TTL_MS, url))
+            });
+        match primary {
+            Ok(link) => Ok(link),
+            Err(primary) => match self
+                .post(
+                    &self.x0at_url,
+                    "file",
+                    &[("keep_name", "1")],
+                    file_name,
+                    bytes,
+                    &mut on_progress,
+                )
+                .and_then(|body| {
+                    parse_plain_link(&body).map(|url| UploadedLink::with_ttl(X0_AT_TTL_MS, url))
+                }) {
+                Ok(link) => Ok(link),
+                Err(_) => Err(primary),
+            },
+        }
+    }
+
+    fn post(
+        &self,
+        url: &str,
+        file_field: &str,
+        fields: &[(&str, &str)],
+        file_name: &str,
+        bytes: &[u8],
+        mut on_progress: impl FnMut(i64, i64),
     ) -> Result<String, String> {
         let boundary = boundary();
-        let body = multipart_body(&boundary, "72h", file_name, bytes);
+        let body = multipart_body(&boundary, fields, file_field, file_name, bytes);
         let total = body.len() as i64;
         let content_type = format!("multipart/form-data; boundary={boundary}");
         let reader = ProgressReader::new(body, total, |sent| on_progress(sent, total));
         let response = self
             .agent
-            .post(&self.endpoint)
+            .post(url)
             .set("Content-Type", &content_type)
             .set("Content-Length", &total.to_string())
             .send(reader);
         match response {
-            Ok(response) => {
-                let link = response
-                    .into_string()
-                    .map_err(|error| format!("上传失败：{error}"))?
-                    .trim()
-                    .to_string();
-                if !link.starts_with("http") {
-                    return Err(format!("上传响应不是有效链接：{link}"));
-                }
-                Ok(link)
-            }
+            Ok(response) => response
+                .into_string()
+                .map_err(|error| format!("上传失败：{error}")),
             Err(ureq::Error::Status(code, response)) => {
                 let detail = response
                     .into_string()
@@ -120,23 +177,25 @@ fn boundary() -> String {
     format!("----ClipSync{}", hex::encode(raw))
 }
 
-fn multipart_body(boundary: &str, expires: &str, file_name: &str, bytes: &[u8]) -> Vec<u8> {
+fn multipart_body(
+    boundary: &str,
+    fields: &[(&str, &str)],
+    file_field: &str,
+    file_name: &str,
+    bytes: &[u8],
+) -> Vec<u8> {
     let mut body = Vec::with_capacity(bytes.len() + 512);
+    for (key, value) in fields {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
     body.extend_from_slice(
         format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"reqtype\"\r\n\r\nfileupload\r\n"
-        )
-        .as_bytes(),
-    );
-    body.extend_from_slice(
-        format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"time\"\r\n\r\n{expires}\r\n"
-        )
-        .as_bytes(),
-    );
-    body.extend_from_slice(
-        format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"fileToUpload\"; filename=\"{}\"\r\nContent-Type: application/octet-stream\r\n\r\n",
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{file_field}\"; filename=\"{}\"\r\nContent-Type: application/octet-stream\r\n\r\n",
             file_name.replace(['"', '\r', '\n'], "_")
         )
         .as_bytes(),
@@ -144,6 +203,36 @@ fn multipart_body(boundary: &str, expires: &str, file_name: &str, bytes: &[u8]) 
     body.extend_from_slice(bytes);
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
     body
+}
+
+/// uguu 回 JSON，且会打乱我们送的文件名，只认 `files[0].url`。
+fn parse_uugu_link(body: &str) -> Result<String, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| format!("上传响应读不懂：{}", clip(body, 200)))?;
+    let link = value
+        .get("files")
+        .and_then(|files| files.get(0))
+        .and_then(|file| file.get("url"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if value.get("success").and_then(serde_json::Value::as_bool) != Some(true)
+        || !link.starts_with("http")
+    {
+        return Err(format!("上传被拒绝：{}", clip(body, 200)));
+    }
+    Ok(link.to_string())
+}
+
+fn parse_plain_link(body: &str) -> Result<String, String> {
+    let link = body.trim();
+    if !link.starts_with("http") {
+        return Err(format!("上传响应不是有效链接：{}", clip(link, 200)));
+    }
+    Ok(link.to_string())
+}
+
+fn clip(raw: &str, limit: usize) -> String {
+    raw.chars().take(limit).collect()
 }
 
 struct ProgressReader<F: FnMut(i64)> {
@@ -178,23 +267,29 @@ impl<F: FnMut(i64)> Read for ProgressReader<F> {
     }
 }
 
-pub fn expiry_from(expires: &str) -> i64 {
-    clipsync_core::files::expiry_from(expires, now_millis())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{boundary, multipart_body, ProgressReader};
+    use super::{
+        boundary, multipart_body, parse_plain_link, parse_uugu_link, ProgressReader, UploadedLink,
+        X0_AT_TTL_MS,
+    };
     use std::io::Read;
 
+    const UUGU_OK: &str = r#"{"success":true,"files":[{"url":"https://n.uguu.se/Av2xQ9.png","size":"1024","name":"zzz"}]}"#;
+
     #[test]
-    fn multipart_carries_the_litterbox_fields_and_bytes() {
-        let body = multipart_body("BOUND", "72h", "cs-abc.bin", b"\x00\x01hello");
+    fn multipart_carries_the_extra_fields_and_the_binary_payload() {
+        let body = multipart_body(
+            "BOUND",
+            &[("keep_name", "1")],
+            "file",
+            "cs-abc.bin",
+            b"\x00\x01hello",
+        );
         let text = String::from_utf8_lossy(&body);
         assert!(text.starts_with("--BOUND\r\n"));
-        assert!(text.contains("name=\"reqtype\"\r\n\r\nfileupload\r\n"));
-        assert!(text.contains("name=\"time\"\r\n\r\n72h\r\n"));
-        assert!(text.contains("filename=\"cs-abc.bin\""));
+        assert!(text.contains("name=\"keep_name\"\r\n\r\n1\r\n"));
+        assert!(text.contains("name=\"file\"; filename=\"cs-abc.bin\""));
         assert!(body.ends_with(b"\r\n--BOUND--\r\n"));
         let start = body
             .windows(6)
@@ -204,10 +299,58 @@ mod tests {
     }
 
     #[test]
+    fn multipart_drops_extra_fields_when_the_host_takes_none() {
+        let body = multipart_body("BOUND", &[], "files[]", "a.bin", b"x");
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.starts_with("--BOUND\r\nContent-Disposition: form-data; name=\"files[]\""));
+    }
+
+    #[test]
     fn multipart_escapes_quotes_in_the_file_name() {
-        let body = multipart_body("B", "72h", "a\"b\r\nc.bin", b"x");
+        let body = multipart_body("B", &[], "files[]", "a\"b\r\nc.bin", b"x");
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("filename=\"a_b__c.bin\""));
+    }
+
+    #[test]
+    fn the_uguu_link_comes_from_the_first_file_entry() {
+        assert_eq!(
+            parse_uugu_link(UUGU_OK).unwrap(),
+            "https://n.uguu.se/Av2xQ9.png"
+        );
+    }
+
+    #[test]
+    fn a_rejected_or_unreadable_uguu_response_is_an_error() {
+        assert!(parse_uugu_link(r#"{"success":false,"files":[]}"#)
+            .unwrap_err()
+            .starts_with("上传被拒绝："));
+        assert!(parse_uugu_link("<html>502</html>")
+            .unwrap_err()
+            .starts_with("上传响应读不懂："));
+    }
+
+    #[test]
+    fn x0_at_returns_the_link_as_plain_text() {
+        assert_eq!(
+            parse_plain_link(" https://x0.at/a.bin\n").unwrap(),
+            "https://x0.at/a.bin"
+        );
+    }
+
+    #[test]
+    fn a_non_link_from_x0_at_is_rejected() {
+        assert!(parse_plain_link("<html>blocked</html>")
+            .unwrap_err()
+            .starts_with("上传响应不是有效链接："));
+    }
+
+    #[test]
+    fn the_expiry_is_the_host_ttl_counted_from_now() {
+        let before = clipsync_core::protocol::now_millis();
+        let link = UploadedLink::with_ttl(X0_AT_TTL_MS, "https://x0.at/a.bin".to_string());
+        assert_eq!(link.url, "https://x0.at/a.bin");
+        assert!(link.expires_at >= before + X0_AT_TTL_MS);
     }
 
     #[test]

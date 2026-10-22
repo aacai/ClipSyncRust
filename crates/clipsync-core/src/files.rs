@@ -2,7 +2,6 @@ use crate::crypto::sha256_hex;
 use crate::room::{RoomCrypto, RoomError};
 
 pub const MAX_FILE_BYTES: i64 = 50 * 1024 * 1024;
-pub const DEFAULT_EXPIRES: &str = "72h";
 pub const MAX_NAME_LENGTH: usize = 120;
 
 pub fn max_mb() -> i64 {
@@ -233,17 +232,6 @@ fn dec(tenths: i64) -> String {
     format!("{}.{}", tenths / 10, tenths % 10)
 }
 
-pub fn expiry_from(expires: &str, now_ms: i64) -> i64 {
-    let hours = match expires.to_lowercase().as_str() {
-        "1h" => 1,
-        "12h" => 12,
-        "24h" => 24,
-        "72h" => 72,
-        _ => 72,
-    };
-    now_ms + hours * 3_600_000
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,15 +406,5 @@ mod tests {
         assert_eq!(human_size(1024), "1.0 KB");
         assert_eq!(human_size(5 * 1024 * 1024), "5.0 MB");
         assert_eq!(human_size(1536 * 1024 * 1024), "1.5 GB");
-    }
-
-    #[test]
-    fn expiry_defaults_to_72h_and_unknown_falls_back() {
-        let now = 1_700_000_000_000i64;
-        assert_eq!(expiry_from("1h", now), now + 3_600_000);
-        assert_eq!(expiry_from("12h", now), now + 12 * 3_600_000);
-        assert_eq!(expiry_from("24h", now), now + 24 * 3_600_000);
-        assert_eq!(expiry_from("72h", now), now + 72 * 3_600_000);
-        assert_eq!(expiry_from("999h", now), now + 72 * 3_600_000);
     }
 }
