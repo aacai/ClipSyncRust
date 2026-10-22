@@ -114,7 +114,7 @@ jobs:
             <key>CFBundleIdentifier</key><string>zhiqiu.app.clipsync.rust</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>$APP_NAME</string>
-            <key>CFBundleDisplayName</key><string>ClipSync</string>
+            <key>CFBundleDisplayName</key><string>$APP_NAME</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>$VER</string>
             <key>CFBundleVersion</key><string>$VER</string>
@@ -180,12 +180,14 @@ jobs:
         run: cargo install cargo-wix --locked
 
       - name: Build msi
+        # 工作区里有两个 package，cargo-wix 不会自己挑，必须 --package 点名；
+        # init 会把 main.wxs 写到 crates/clipsync-desktop/wix/ 下。
         # 产品名 / upgrade-guid 在 clipsync-desktop/Cargo.toml 的 [package.metadata.wix]，
         # 本地跑 cargo wix 出来的包和这里一致。
         run: |
           set -euo pipefail
-          cargo wix init --force
-          cargo wix --no-build --nocapture --target x86_64-pc-windows-msvc
+          cargo wix init --force --package clipsync-desktop
+          cargo wix --no-build --nocapture --package clipsync-desktop --target x86_64-pc-windows-msvc
           find target/wix -name '*.msi'
 
       - name: Collect packages
@@ -234,7 +236,7 @@ jobs:
             pkg-config file \
             libgtk-3-dev libayatana-appindicator3-dev libdbus-1-dev libglib2.0-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev \
-            libgl1-mesa-dev libegl1-mesa-dev libwayland-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libgbm-dev libwayland-dev \
             libpipewire-0.3-dev libspa-0.2-dev libasound2-dev
 
       - uses: Swatinem/rust-cache@v2
@@ -262,7 +264,7 @@ jobs:
           cat > "$ROOT/usr/share/applications/clipsync-rust.desktop" << DESKTOP
           [Desktop Entry]
           Type=Application
-          Name=ClipSync
+          Name=$APP_NAME
           Comment=Sync clipboard between devices, end-to-end encrypted
           Exec=clipsync-rust %U
           Icon=clipsync-rust
