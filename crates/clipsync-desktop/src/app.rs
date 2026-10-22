@@ -91,6 +91,7 @@ pub struct ClipSyncApp {
     zoom_texture: Option<(String, TextureHandle)>,
     zoom_failed: Option<String>,
     watch_clipboard: bool,
+    auto_copy: bool,
     watch_files: bool,
     watch_images: bool,
     update: UpdateState,
@@ -120,6 +121,7 @@ enum SettingsAction {
     RememberRoom(bool),
     LaunchAtLogin(bool),
     WatchClipboard(bool),
+    AutoCopy(bool),
     WatchImages(bool),
     WatchFiles(bool),
     DeleteExpired(bool),
@@ -297,6 +299,7 @@ impl ClipSyncApp {
     ) -> Self {
         let (job_tx, job_rx) = mpsc::channel();
         let watch_clipboard = preferences.watch_clipboard();
+        let auto_copy = preferences.auto_copy();
         let watch_files = preferences.watch_files();
         let watch_images = preferences.watch_images();
         let theme_mode = preferences.theme();
@@ -345,6 +348,7 @@ impl ClipSyncApp {
             zoom_texture: None,
             zoom_failed: None,
             watch_clipboard,
+            auto_copy,
             watch_files,
             watch_images,
             update: UpdateState::Idle,
@@ -444,6 +448,12 @@ impl ClipSyncApp {
                     .is_some_and(|file| !file.link.trim().is_empty());
                 if !known && has_link {
                     self.request_download(&clip.mid, DownloadAfter::Auto);
+                }
+                return;
+            }
+            if !self.auto_copy {
+                if inserted {
+                    self.notify(format!("收到 {sender} 的文本，已存进列表"));
                 }
                 return;
             }
@@ -837,6 +847,11 @@ impl ClipSyncApp {
         }
     }
 
+    fn set_auto_copy(&mut self, enabled: bool) {
+        self.auto_copy = enabled;
+        self.preferences.set_auto_copy(enabled);
+    }
+
     fn set_watch_images(&mut self, enabled: bool) {
         self.watch_images = enabled;
         self.preferences.set_watch_images(enabled);
@@ -1059,6 +1074,7 @@ impl ClipSyncApp {
                             ui.add_space(22.0);
 
                             let watch = self.watch_clipboard;
+                            let auto_copy = self.auto_copy;
                             let watch_images = self.watch_images;
                             let watch_files = self.watch_files;
                             settings_group(ui, "剪贴板", |ui| {
@@ -1091,6 +1107,15 @@ impl ClipSyncApp {
                                         action =
                                             Some(SettingsAction::WatchFiles(!watch_files));
                                     }
+                                }
+                                settings_divider(ui);
+                                if settings_switch_row(
+                                    ui,
+                                    "收到即进剪贴板",
+                                    "关掉后，同伴发来的文本只存进本机列表，不碰你的剪贴板；要点条目里的复制才会写入",
+                                    auto_copy,
+                                ) {
+                                    action = Some(SettingsAction::AutoCopy(!auto_copy));
                                 }
                             });
                             ui.add_space(22.0);
@@ -1243,6 +1268,7 @@ impl ClipSyncApp {
             SettingsAction::RememberRoom(enabled) => self.set_remember_room(enabled),
             SettingsAction::LaunchAtLogin(enabled) => self.set_launch_at_login(enabled),
             SettingsAction::WatchClipboard(enabled) => self.set_watch_clipboard(enabled),
+            SettingsAction::AutoCopy(enabled) => self.set_auto_copy(enabled),
             SettingsAction::WatchImages(enabled) => self.set_watch_images(enabled),
             SettingsAction::WatchFiles(enabled) => self.set_watch_files(enabled),
             SettingsAction::DeleteExpired(enabled) => self.set_delete_expired(enabled),

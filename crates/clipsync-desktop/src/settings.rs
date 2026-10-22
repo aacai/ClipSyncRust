@@ -61,6 +61,7 @@ struct StoredPreferences {
     remember_room: bool,
     nickname: String,
     watch_clipboard: bool,
+    auto_copy: bool,
     watch_images: bool,
     watch_files: bool,
     launch_at_login: bool,
@@ -101,6 +102,7 @@ impl Default for StoredPreferences {
             remember_room: true,
             nickname: String::new(),
             watch_clipboard: true,
+            auto_copy: true,
             watch_images: true,
             watch_files: true,
             launch_at_login: false,
@@ -143,6 +145,10 @@ impl Preferences {
 
     pub fn watch_clipboard(&self) -> bool {
         self.stored.watch_clipboard
+    }
+
+    pub fn auto_copy(&self) -> bool {
+        self.stored.auto_copy
     }
 
     pub fn watch_images(&self) -> bool {
@@ -199,6 +205,11 @@ impl Preferences {
 
     pub fn set_watch_clipboard(&mut self, enabled: bool) {
         self.stored.watch_clipboard = enabled;
+        self.save();
+    }
+
+    pub fn set_auto_copy(&mut self, enabled: bool) {
+        self.stored.auto_copy = enabled;
         self.save();
     }
 
@@ -426,6 +437,7 @@ mod tests {
         assert_eq!(loaded.language(), super::Language::System);
         assert!(loaded.remember_room());
         assert!(loaded.watch_clipboard());
+        assert!(loaded.auto_copy());
         assert!(loaded.watch_images());
         assert!(loaded.watch_files());
         assert!(!loaded.launch_at_login());
@@ -447,6 +459,7 @@ mod tests {
             loaded.set_remember_room(false);
             loaded.set_nickname("  Desk  ");
             loaded.set_watch_clipboard(false);
+            loaded.set_auto_copy(false);
             loaded.set_watch_images(false);
             loaded.set_watch_files(false);
             loaded.set_launch_at_login(true);
@@ -460,6 +473,7 @@ mod tests {
         assert!(!loaded.remember_room());
         assert_eq!(loaded.nickname(), "Desk");
         assert!(!loaded.watch_clipboard());
+        assert!(!loaded.auto_copy());
         assert!(!loaded.watch_images());
         assert!(!loaded.watch_files());
         assert!(loaded.launch_at_login());
@@ -483,6 +497,8 @@ mod tests {
         assert_eq!(loaded.theme(), super::ThemeMode::System);
         assert_eq!(loaded.language(), super::Language::System);
         assert!(loaded.watch_images());
+        // 老文件里没有这个键，得按 compose 的默认值来，不能当成用户关过
+        assert!(loaded.auto_copy());
         cleanup(&path);
     }
 
