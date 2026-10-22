@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-pub const ENDPOINT: &str = "https://api.github.com/repos/aacai/ClipSync/releases/latest";
+pub const ENDPOINT: &str = "https://api.github.com/repos/aacai/ClipSyncRust/releases/latest";
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(900);
 
 #[derive(Clone, Debug, PartialEq, Eq)]

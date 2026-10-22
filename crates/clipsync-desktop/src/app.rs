@@ -39,7 +39,7 @@ const TOAST_UNDO: Duration = Duration::from_secs(9);
 const CAPTURE_HIDE_DELAY: Duration = Duration::from_millis(140);
 const THUMB_MAX_SIDE: u32 = 256;
 const ZOOM_MAX_SIDE: u32 = 2048;
-const REPO_URL: &str = "https://github.com/aacai/ClipSync";
+const REPO_URL: &str = "https://github.com/aacai/ClipSyncRust";
 
 const HELP_STEPS: [&str; 6] = [
     "打开「房间共享」：顶栏的钥匙图标，或未共享时列表里的「共享」。填一个房间码（可随机换一个），房间密码可选，设了就必须两端一致。",
@@ -3263,7 +3263,7 @@ impl ClipSyncApp {
                         ui.add_space(10.0);
                         hint(ui, "房间码连同密码在本机派生密钥，托管方只会收到密文。");
                         ui.add_space(6.0);
-                        ui.hyperlink_to("github.com/aacai/ClipSync", REPO_URL);
+                        ui.hyperlink_to("github.com/aacai/ClipSyncRust", REPO_URL);
                         ui.add_space(12.0);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if secondary_button(ui, "知道了").clicked() {
