@@ -161,9 +161,11 @@ impl Session {
     pub fn draw(&mut self, ui: &mut Ui) {
         let frame = ui.max_rect();
         self.paint_frame(ui, frame);
-        let position = self.track_pointer(ui, frame);
+        // Where the pill is going to sit, so a click on it is not mistaken for a new region.
+        let pill = self.toolbar_rect(frame);
+        let position = self.track_pointer(ui, frame, pill);
         self.paint_marks(ui, frame);
-        let toolbar = self.paint_toolbar(ui, frame);
+        let toolbar = self.paint_toolbar(ui, pill);
         self.paint_cursor(ui, position, toolbar);
         self.raise(ui.ctx());
     }
@@ -209,7 +211,7 @@ impl Session {
     }
 
     /// The whole pointer state machine for this frame; returns where the pointer is.
-    fn track_pointer(&mut self, ui: &mut Ui, frame: Rect) -> Option<Pos2> {
+    fn track_pointer(&mut self, ui: &mut Ui, frame: Rect, pill: Option<Rect>) -> Option<Pos2> {
         if ui.input(|i| i.key_pressed(Key::Escape)) {
             self.outcome = Some(Outcome::Cancel);
             return None;
@@ -229,7 +231,7 @@ impl Session {
             }
         }
         if pointer.button_pressed(PointerButton::Primary) {
-            self.begin_drag(position);
+            self.begin_drag(position, pill);
         } else if let (Some(drag), Some(position)) = (self.drag, position) {
             if pointer.button_down(PointerButton::Primary) {
                 self.apply_drag(drag, position, frame);
@@ -250,7 +252,7 @@ impl Session {
         position
     }
 
-    fn begin_drag(&mut self, position: Option<Pos2>) {
+    fn begin_drag(&mut self, position: Option<Pos2>, pill: Option<Rect>) {
         let Some(position) = position else { return };
         if let Some(selection) = self.selection {
             if let Some(handle) = handle_at(selection, position, HANDLE_SLOP) {
@@ -261,6 +263,11 @@ impl Session {
                 self.drag = Some(Drag::Move {
                     grab: position - selection.min,
                 });
+                return;
+            }
+            // A click on the pill under the region belongs to its buttons; starting a fresh
+            // region here would erase the one the buttons are attached to.
+            if pill.is_some_and(|rect| rect.contains(position)) {
                 return;
             }
         }
@@ -349,21 +356,19 @@ impl Session {
         ui.painter().galley(pill.min + pad, galley, Color32::WHITE);
     }
 
-    /// The pill under the region: cancel and confirm, with room to grow into the annotation tools.
-    fn paint_toolbar(&mut self, ui: &mut Ui, frame: Rect) -> Option<Rect> {
+    /// The pill under the region, or above it when the region reaches the bottom of the screen.
+    fn toolbar_rect(&self, frame: Rect) -> Option<Rect> {
         let selection = self.selection?;
         if self.drag.is_some() {
             return None;
         }
-        let width = 2.0 * 33.0 + 12.0;
-        let min = Pos2::new(
-            (selection.max.x - width).clamp(0.0, frame.max.x - width),
-            if selection.max.y + TOOLBAR_GAP + TOOLBAR_HEIGHT > frame.max.y {
-                (selection.min.y - TOOLBAR_GAP - TOOLBAR_HEIGHT).max(0.0)
-            } else {
-                selection.max.y + TOOLBAR_GAP
-            },
-        );
+        Some(pill_at(selection, frame))
+    }
+
+    /// The pill's cancel and confirm buttons, with room to grow into the annotation tools.
+    fn paint_toolbar(&mut self, ui: &mut Ui, pill: Option<Rect>) -> Option<Rect> {
+        let selection = self.selection?;
+        let min = pill?.min;
         let mut cancel = false;
         let mut confirm = false;
         egui::Area::new(Id::unique("screenshot-toolbar"))
@@ -408,7 +413,7 @@ impl Session {
         } else if confirm {
             self.outcome = Some(Outcome::Crop(selection));
         }
-        Some(Rect::from_min_size(min, Vec2::new(width, TOOLBAR_HEIGHT)))
+        pill
     }
 
     fn paint_cursor(&self, ui: &mut Ui, position: Option<Pos2>, toolbar: Option<Rect>) {
@@ -523,6 +528,20 @@ fn hit_window(windows: &[Rect], position: Pos2, frame: Rect) -> Rect {
         .find(|rect| rect.contains(position))
         .copied()
         .unwrap_or(frame)
+}
+
+/// Where the button pill sits: under the region's bottom-right, flipped above it at the edge.
+fn pill_at(selection: Rect, frame: Rect) -> Rect {
+    let width = 2.0 * 33.0 + 12.0;
+    let min = Pos2::new(
+        (selection.max.x - width).clamp(0.0, frame.max.x - width),
+        if selection.max.y + TOOLBAR_GAP + TOOLBAR_HEIGHT > frame.max.y {
+            (selection.min.y - TOOLBAR_GAP - TOOLBAR_HEIGHT).max(0.0)
+        } else {
+            selection.max.y + TOOLBAR_GAP
+        },
+    );
+    Rect::from_min_size(min, Vec2::new(width, TOOLBAR_HEIGHT))
 }
 
 fn handle_point(rect: Rect, handle: Handle) -> Pos2 {
@@ -684,8 +703,8 @@ pub fn crop_px(rect: Rect, image: Vec2, scale: f32) -> (u32, u32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        between, crop_px, handle_at, handle_point, hit_window, is_region, mask_rects, resize,
-        square_at, translate, Handle, MIN_SIZE,
+        between, crop_px, handle_at, handle_point, hit_window, is_region, mask_rects, pill_at,
+        resize, square_at, translate, Drag, Freeze, Handle, Session, MIN_SIZE, TOOLBAR_GAP,
     };
     use eframe::egui::{Pos2, Rect, Vec2};
 
@@ -894,5 +913,49 @@ mod tests {
             square_at(handle_point(selection, Handle::Left), 8.0),
             rect(96.0, 146.0, 104.0, 154.0)
         );
+    }
+
+    #[test]
+    fn the_pill_sits_under_the_region_and_flips_above_it_at_the_bottom_edge() {
+        let pill = pill_at(rect(100.0, 100.0, 300.0, 200.0), SCREEN);
+        assert_eq!(pill.max.x, 300.0);
+        assert_eq!(pill.min.y, 200.0 + TOOLBAR_GAP);
+
+        let flipped = pill_at(rect(100.0, 100.0, 300.0, 590.0), SCREEN);
+        assert_eq!(flipped.max.y, 100.0 - TOOLBAR_GAP);
+
+        let edge = pill_at(rect(900.0, 100.0, 1000.0, 200.0), SCREEN);
+        assert_eq!(edge.max.x, SCREEN.max.x);
+    }
+
+    #[test]
+    fn a_click_on_the_pill_leaves_the_region_alone() {
+        let selection = rect(100.0, 100.0, 300.0, 200.0);
+        let pill = pill_at(selection, SCREEN);
+        let mut session = session();
+        session.selection = Some(selection);
+
+        session.begin_drag(Some(pill.center()), Some(pill));
+        assert!(session.drag.is_none());
+        assert_eq!(session.selection, Some(selection));
+
+        // Handles still win over the pill, so the bottom edge stays adjustable.
+        session.begin_drag(Some(Pos2::new(200.0, 204.0)), Some(pill));
+        assert!(matches!(session.drag, Some(Drag::Handle(Handle::Bottom))));
+
+        // Anywhere else starts a fresh region.
+        session.begin_drag(Some(Pos2::new(600.0, 400.0)), Some(pill));
+        assert!(matches!(session.drag, Some(Drag::Fresh { .. })));
+        assert_eq!(session.selection, None);
+    }
+
+    fn session() -> Session {
+        Session::new(Freeze {
+            image: image::RgbaImage::new(1, 1),
+            position: Pos2::ZERO,
+            size: Vec2::new(1000.0, 600.0),
+            scale: 1.0,
+            windows: Vec::new(),
+        })
     }
 }
