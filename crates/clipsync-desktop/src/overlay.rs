@@ -1,10 +1,14 @@
 //! The WeChat capture overlay: the screen is frozen under a dim mask, hovering previews the
 //! window a click would take, dragging draws a region, and eight handles adjust it before it is
 //! cut out of the frame.
+//!
+//! 指针状态机与 Compose `ScreenshotOverlay.kt` 对齐：pillPress、双击确认、Esc/右键取消。
+
+use std::time::Instant;
 
 use eframe::egui::{
-    self, Color32, CursorIcon, Frame, Id, Key, Order, PointerButton, Pos2, Rect, Stroke,
-    StrokeKind, TextureHandle, TextureOptions, Ui, Vec2, ViewportCommand, ViewportId,
+    self, Color32, CursorIcon, Key, PointerButton, Pos2, Rect, Sense, Stroke, StrokeKind,
+    TextureHandle, TextureOptions, Ui, Vec2, ViewportCommand,
 };
 #[cfg(target_os = "macos")]
 use objc2::{rc::Retained, MainThreadMarker};
@@ -23,8 +27,20 @@ const HANDLE_SIZE: f32 = 8.0;
 const MIN_SIZE: f32 = 6.0;
 const TOOLBAR_GAP: f32 = 8.0;
 const TOOLBAR_HEIGHT: f32 = 45.0;
-/// Two 33pt buttons, 6pt of margin either side, 4pt between them.
-const TOOLBAR_WIDTH: f32 = 2.0 * 33.0 + 2.0 * 6.0 + 4.0;
+const PILL_INSET: f32 = 6.0;
+const PILL_BUTTON: f32 = 33.0;
+const PILL_SPACING: f32 = 4.0;
+/// Two 33pt buttons, 6pt of margin either side, 4pt between them.（对齐 Compose）
+const TOOLBAR_WIDTH: f32 = PILL_INSET * 2.0 + PILL_BUTTON * 2.0 + PILL_SPACING;
+const DOUBLE_TAP_MS: u128 = 400;
+const DOUBLE_TAP_SLOP: f32 = 24.0;
+
+/// 按钮条上的两个按钮：左取消、右完成。对齐 Compose `PillButton`。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PillButton {
+    Cancel,
+    Confirm,
+}
 
 /// The id of the overlay window; one at a time, since only one screen can be frozen.
 pub fn viewport_id() -> egui::ViewportId {
@@ -48,6 +64,7 @@ pub fn viewport() -> egui::ViewportBuilder {
         .with_taskbar(false)
         .with_visible(false)
         .with_always_on_top()
+        .with_has_shadow(false)
 }
 
 /// The window title, which is also how the native macOS layer finds the overlay window.
@@ -65,6 +82,9 @@ pub struct Freeze {
     pub scale: f32,
     /// On-screen window bounds in overlay-local points, front to back.
     pub windows: Vec<Rect>,
+    /// Menu-bar height in points. macOS does not deliver clicks in that strip, even to a
+    /// window drawn on top of it, so the pill must sit entirely below it.
+    pub top_inset: f32,
 }
 
 /// What the overlay ended up doing with the frozen frame.
@@ -116,6 +136,10 @@ pub struct Session {
     hover: Option<Rect>,
     drag: Option<Drag>,
     outcome: Option<Outcome>,
+    /// 对齐 Compose：按下哪个 pill 按钮；抬起仍在同一按钮上才生效，避免点叉却出图。
+    pill_press: Option<(PillButton, Rect)>,
+    last_up: Option<Pos2>,
+    last_up_at: Instant,
     /// The frozen screen has reached the glass, which is when the app window may come back.
     raised: bool,
     /// The overlay holds the keyboard, so Esc and Enter are its to hear.
@@ -131,6 +155,9 @@ impl Session {
             hover: None,
             drag: None,
             outcome: None,
+            pill_press: None,
+            last_up: None,
+            last_up_at: Instant::now(),
             raised: false,
             focused: false,
         }
@@ -161,24 +188,47 @@ impl Session {
     }
 
     pub fn draw(&mut self, ui: &mut Ui) {
-        let frame = ui.max_rect();
-        self.paint_frame(ui, frame);
-        // Where the pill is going to sit, so a click on it is not mistaken for a new region.
-        let pill = self.toolbar_rect(frame);
-        let position = self.track_pointer(ui, frame, pill);
-        self.paint_marks(ui, frame);
-        let toolbar = self.paint_toolbar(ui, pill);
-        self.paint_cursor(ui, position, toolbar);
+        // 状态机永远在冻屏坐标系里（对齐 Compose session.frame）；
+        // egui 的 max_rect 可能和 NSScreen 不完全一致，指针要换算过去，画再换算回来。
+        let logical = Rect::from_min_size(Pos2::ZERO, self.freeze.size);
+        let surface = ui.max_rect();
+        // 首帧清成黑，避免透明/白屏闪一下
+        ui.painter().rect_filled(surface, 0.0, Color32::BLACK);
+        self.paint_frame(ui, surface);
+        let pill = self.toolbar_rect(logical);
+        let position = self.track_pointer(ui, logical, surface, pill);
+        self.paint_marks(ui, logical, surface);
+        self.paint_toolbar(ui, pill, surface, logical);
+        self.paint_cursor(ui, position, pill);
         self.raise(ui.ctx());
     }
 
-    /// Once the frozen screen is on glass the app window may come back behind it. Showing it also
-    /// hands it the keyboard, so the overlay has to take the keys one pass later rather than in
-    /// the same flush — otherwise Esc goes to a window nobody can see.
+    fn to_logical(pos: Pos2, surface: Rect, logical: Rect) -> Pos2 {
+        let nx = (pos.x - surface.min.x) / surface.width().max(1.0);
+        let ny = (pos.y - surface.min.y) / surface.height().max(1.0);
+        Pos2::new(
+            logical.min.x + nx * logical.width(),
+            logical.min.y + ny * logical.height(),
+        )
+    }
+
+    fn to_surface(rect: Rect, surface: Rect, logical: Rect) -> Rect {
+        let map = |p: Pos2| {
+            let nx = (p.x - logical.min.x) / logical.width().max(1.0);
+            let ny = (p.y - logical.min.y) / logical.height().max(1.0);
+            Pos2::new(
+                surface.min.x + nx * surface.width(),
+                surface.min.y + ny * surface.height(),
+            )
+        };
+        Rect::from_min_max(map(rect.min), map(rect.max))
+    }
+
+    /// 主窗必须一直藏着：中途 Visible(true) 会叠在冻屏遮罩上，再带毛玻璃就又糊又闪。
+    /// 键盘交给 overlay 自己的 key window（下一帧 focus），对齐 Compose「遮罩结束再 restore」。
     fn raise(&mut self, ctx: &egui::Context) {
         if !self.raised {
             self.raised = true;
-            ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Visible(true));
             ctx.request_repaint();
         } else if !self.focused {
             self.focused = true;
@@ -212,51 +262,134 @@ impl Session {
         );
     }
 
-    /// The whole pointer state machine for this frame; returns where the pointer is.
-    fn track_pointer(&mut self, ui: &mut Ui, frame: Rect, pill: Option<Rect>) -> Option<Pos2> {
+    /// 对齐 Compose `onEscape` / `onRightClick` / `onDown` / `onUp` / `onHover`。
+    /// 返回的是**逻辑坐标**（冻屏坐标系），给光标命中用。
+    fn track_pointer(
+        &mut self,
+        ui: &mut Ui,
+        logical: Rect,
+        surface: Rect,
+        pill: Option<Rect>,
+    ) -> Option<Pos2> {
+        if self.outcome.is_some() {
+            return ui.input(|i| {
+                i.pointer
+                    .hover_pos()
+                    .or(i.pointer.latest_pos())
+                    .map(|p| Self::to_logical(p, surface, logical))
+            });
+        }
         if ui.input(|i| i.key_pressed(Key::Escape)) {
             self.outcome = Some(Outcome::Cancel);
             return None;
         }
         let pointer = ui.input(|i| i.pointer.clone());
-        let position = pointer.hover_pos();
+        // latest_pos：松开瞬间 hover_pos 有时是 None，会导致点叉没登记抬起。
+        let raw = pointer.hover_pos().or(pointer.latest_pos());
+        let position = raw.map(|p| Self::to_logical(p, surface, logical));
         if pointer.button_pressed(PointerButton::Secondary) {
             self.outcome = Some(Outcome::Cancel);
             return None;
-        }
-        // The second click of a double-click is also a press, so finish on it before the press
-        // below can start a new drag and throw the region away.
-        if pointer.button_double_clicked(PointerButton::Primary) {
-            if let Some(selection) = self.selection {
-                self.outcome = Some(Outcome::Crop(selection));
-                return Some(position.unwrap_or(selection.min));
-            }
-        }
-        if pointer.button_pressed(PointerButton::Primary) {
-            self.begin_drag(position, pill);
-        } else if let (Some(drag), Some(position)) = (self.drag, position) {
-            if pointer.button_down(PointerButton::Primary) {
-                self.apply_drag(drag, position, frame);
-            }
-        }
-        if pointer.button_released(PointerButton::Primary) {
-            self.finish_drag(position, frame);
         }
         if ui.input(|i| i.key_pressed(Key::Enter)) {
             if let Some(selection) = self.selection {
                 self.outcome = Some(Outcome::Crop(selection));
             }
+            return position;
         }
-        if let (None, Some(position)) = (self.selection, position) {
-            // Nothing is being adjusted yet, so preview whatever a click would take.
-            self.hover = Some(hit_window(&self.freeze.windows, position, frame));
+
+        if pointer.button_pressed(PointerButton::Primary) {
+            if let Some(position) = position {
+                self.on_down(position, pill);
+            }
+        } else if let (Some(drag), Some(position)) = (self.drag, position) {
+            if pointer.button_down(PointerButton::Primary) {
+                self.apply_drag(drag, position, logical);
+            }
+        }
+        if pointer.button_released(PointerButton::Primary) {
+            if let Some(position) = position {
+                self.on_up(position, logical);
+            } else if let Some((button, _)) = self.pill_press.take() {
+                // 没有坐标也尊重「按下的是取消」：Compose 要同按钮抬起，这里兜底取消优先。
+                if button == PillButton::Cancel {
+                    self.outcome = Some(Outcome::Cancel);
+                }
+                self.drag = None;
+            } else {
+                self.drag = None;
+            }
+        }
+        if self.selection.is_none() && self.drag.is_none() {
+            if let Some(position) = position {
+                self.hover = Some(hit_window(&self.freeze.windows, position, logical));
+            }
         }
         position
     }
 
-    fn begin_drag(&mut self, position: Option<Pos2>, pill: Option<Rect>) {
-        let Some(position) = position else { return };
+    fn on_down(&mut self, position: Pos2, pill: Option<Rect>) {
+        if self.outcome.is_some() {
+            return;
+        }
+        // 双击确认：对齐 Compose DOUBLE_TAP_*，第二下按下时直接 Crop，别开新 drag。
+        if let (Some(selection), Some(previous)) = (self.selection, self.last_up) {
+            let dt = self.last_up_at.elapsed().as_millis();
+            if dt <= DOUBLE_TAP_MS && (position - previous).length() <= DOUBLE_TAP_SLOP {
+                self.outcome = Some(Outcome::Crop(selection));
+                return;
+            }
+        }
+        self.begin_drag(position, pill);
+    }
+
+    fn on_up(&mut self, position: Pos2, frame: Rect) {
+        if self.outcome.is_some() {
+            return;
+        }
+        if let Some((button, rect)) = self.pill_press.take() {
+            // 按下和抬起都在同一个按钮上才算点它（Compose pillPress）。
+            if rect.contains(position) {
+                match button {
+                    PillButton::Cancel => self.outcome = Some(Outcome::Cancel),
+                    PillButton::Confirm => {
+                        if let Some(selection) = self.selection {
+                            self.outcome = Some(Outcome::Crop(selection));
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        self.last_up = Some(position);
+        self.last_up_at = Instant::now();
+        self.finish_drag(position, frame);
+    }
+
+    fn begin_drag(&mut self, position: Pos2, pill: Option<Rect>) {
         if let Some(selection) = self.selection {
+            // 按钮命中优先于手柄：底边手柄的 slop 会吃到叉/勾上沿，否则点叉像没点到。
+            if let Some(pill) = pill {
+                if let Some((button, rect)) = pill_buttons(pill)
+                    .into_iter()
+                    .find(|(_, rect)| rect.contains(position))
+                {
+                    // 叉：按下即取消。全屏 overlay 上抬起事件常丢，等 press+release 会对着叉连点好几下。
+                    // 勾仍走 pill_press，要按下抬起都在勾上才裁切，避免误触出图。
+                    if button == PillButton::Cancel {
+                        self.outcome = Some(Outcome::Cancel);
+                        self.pill_press = None;
+                        self.drag = None;
+                        return;
+                    }
+                    self.pill_press = Some((button, rect));
+                    return;
+                }
+                if pill.contains(position) {
+                    // 点在条上但不是按钮：别开 Fresh，别擦选区。
+                    return;
+                }
+            }
             if let Some(handle) = handle_at(selection, position, HANDLE_SLOP) {
                 self.drag = Some(Drag::Handle(handle));
                 return;
@@ -267,15 +400,11 @@ impl Session {
                 });
                 return;
             }
-            // A click on the pill under the region belongs to its buttons; starting a fresh
-            // region here would erase the one the buttons are attached to.
-            if pill.is_some_and(|rect| rect.contains(position)) {
-                return;
-            }
         }
         self.drag = Some(Drag::Fresh { anchor: position });
         self.selection = None;
         self.hover = None;
+        self.pill_press = None;
     }
 
     fn apply_drag(&mut self, drag: Drag, position: Pos2, frame: Rect) {
@@ -296,48 +425,52 @@ impl Session {
         }
     }
 
-    fn finish_drag(&mut self, position: Option<Pos2>, frame: Rect) {
+    fn finish_drag(&mut self, position: Pos2, frame: Rect) {
         let Some(Drag::Fresh { anchor }) = self.drag.take() else {
+            self.drag = None;
             return;
         };
-        // A drag that ended off the edges still has to leave a region inside them: the pill and the
-        // handles are placed from this rect, and off-screen means unreachable.
-        let dragged = position.map(|position| between(anchor, position).intersect(frame));
-        let picked = dragged
-            .filter(|rect| is_region(*rect, frame))
-            .unwrap_or_else(|| {
-                // No real drag: a click takes the window under the cursor, the desktop if none.
-                hit_window(&self.freeze.windows, position.unwrap_or(anchor), frame)
-            });
+        let dragged = between(anchor, position).intersect(frame);
+        let picked = if is_region(dragged, frame) {
+            dragged
+        } else {
+            hit_window(&self.freeze.windows, position, frame)
+        };
         self.selection = Some(picked);
         self.hover = None;
     }
 
-    fn paint_marks(&self, ui: &Ui, frame: Rect) {
+    fn paint_marks(&self, ui: &Ui, logical: Rect, surface: Rect) {
         let hole = self.selection.or(self.hover);
-        for rect in mask_rects(frame, hole) {
+        for rect in mask_rects(logical, hole) {
             if !rect.is_negative() {
-                ui.painter().rect_filled(rect, 0, MASK);
+                ui.painter()
+                    .rect_filled(Self::to_surface(rect, surface, logical), 0.0, MASK);
             }
         }
         let Some(rect) = hole else { return };
+        let drawn = Self::to_surface(rect, surface, logical);
         let accent = theme::p().accent;
         ui.painter()
-            .rect_stroke(rect, 0, Stroke::new(1.5, accent), StrokeKind::Middle);
+            .rect_stroke(drawn, 0.0, Stroke::new(1.5, accent), StrokeKind::Middle);
         if self.selection.is_some() && self.drag.is_none() {
             for handle in HANDLES {
                 let square = square_at(handle_point(rect, handle), HANDLE_SIZE);
+                let square = Self::to_surface(square, surface, logical);
                 ui.painter()
-                    .rect_filled(square, 1, Color32::from_white_alpha(230));
+                    .rect_filled(square, 1.0, Color32::from_white_alpha(230));
                 ui.painter()
-                    .rect_stroke(square, 1, Stroke::new(1.0, accent), StrokeKind::Inside);
+                    .rect_stroke(square, 1.0, Stroke::new(1.0, accent), StrokeKind::Inside);
             }
         }
-        self.paint_size(ui, rect);
+        // 定下来之后按钮条占同一位置，读数只在「还在瞄 / 还在拖」时画（对齐 Compose readout）。
+        if self.selection.is_none() || self.drag.is_some() {
+            self.paint_size(ui, rect, logical, surface);
+        }
     }
 
     /// The `宽 × 高` readout, in the pixels the crop will actually be.
-    fn paint_size(&self, ui: &Ui, rect: Rect) {
+    fn paint_size(&self, ui: &Ui, rect: Rect, logical: Rect, surface: Rect) {
         let width = (rect.width() * self.freeze.scale).round().max(1.0) as i64;
         let height = (rect.height() * self.freeze.scale).round().max(1.0) as i64;
         let label = format!("{width} × {height}");
@@ -347,16 +480,16 @@ impl Session {
         let size = galley.size() + pad * 2.0;
         let below = rect.max.y + TOOLBAR_GAP + size.y;
         let min = Pos2::new(
-            (rect.max.x - size.x).clamp(0.0, ui.max_rect().max.x - size.x),
-            if below > ui.max_rect().max.y {
+            (rect.max.x - size.x).clamp(0.0, (logical.max.x - size.x).max(0.0)),
+            if below > logical.max.y {
                 (rect.min.y - TOOLBAR_GAP - size.y).max(0.0)
             } else {
                 below
             },
         );
-        let pill = Rect::from_min_size(min, size);
+        let pill = Self::to_surface(Rect::from_min_size(min, size), surface, logical);
         ui.painter()
-            .rect_filled(pill, 4, Color32::from_black_alpha(200));
+            .rect_filled(pill, 4.0, Color32::from_black_alpha(200));
         ui.painter().galley(pill.min + pad, galley, Color32::WHITE);
     }
 
@@ -366,58 +499,49 @@ impl Session {
         if self.drag.is_some() {
             return None;
         }
-        Some(pill_at(selection, frame))
+        Some(pill_at(selection, frame, self.freeze.top_inset))
     }
 
-    /// The pill's cancel and confirm buttons, with room to grow into the annotation tools.
-    fn paint_toolbar(&mut self, ui: &mut Ui, pill: Option<Rect>) -> Option<Rect> {
-        let selection = self.selection?;
-        let min = pill?.min;
-        let mut cancel = false;
-        let mut confirm = false;
-        egui::Area::new(Id::unique("screenshot-toolbar"))
-            .order(Order::Foreground)
-            .fixed_pos(min)
-            .show(ui.ctx(), |ui| {
-                Frame::new()
-                    .fill(Color32::from_black_alpha(220))
-                    .stroke(Stroke::new(1.0, Color32::from_white_alpha(40)))
-                    .corner_radius(10)
-                    .inner_margin(6)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing = Vec2::splat(4.0);
-                            if icons::icon_button_tinted(
-                                ui,
-                                icons::Icon::Close,
-                                Color32::WHITE,
-                                true,
-                                "取消（Esc）",
-                            )
-                            .clicked()
-                            {
-                                cancel = true;
-                            }
-                            if icons::icon_button_tinted(
-                                ui,
-                                icons::Icon::Check,
-                                theme::p().green,
-                                true,
-                                "完成（Enter）",
-                            )
-                            .clicked()
-                            {
-                                confirm = true;
-                            }
-                        });
-                    });
-            });
-        if cancel {
-            self.outcome = Some(Outcome::Cancel);
-        } else if confirm {
-            self.outcome = Some(Outcome::Crop(selection));
+    /// 只负责画，点击由 `pill_press` 几何命中处理——不用 egui Button，避免点叉误触成完成。
+    fn paint_toolbar(&self, ui: &mut Ui, pill: Option<Rect>, surface: Rect, logical: Rect) {
+        let Some(pill_logical) = pill else { return };
+        if self.selection.is_none() {
+            return;
         }
-        pill
+        let pill = Self::to_surface(pill_logical, surface, logical);
+        ui.painter()
+            .rect_filled(pill, 10.0, Color32::from_black_alpha(220));
+        ui.painter().rect_stroke(
+            pill,
+            10.0,
+            Stroke::new(1.0, Color32::from_white_alpha(40)),
+            StrokeKind::Inside,
+        );
+        let hover = ui
+            .input(|i| i.pointer.hover_pos().or(i.pointer.latest_pos()))
+            .map(|p| Self::to_logical(p, surface, logical));
+        for (button, rect_logical) in pill_buttons(pill_logical) {
+            let rect = Self::to_surface(rect_logical, surface, logical);
+            if hover.is_some_and(|p| rect_logical.contains(p)) {
+                ui.painter()
+                    .rect_filled(rect, 10.0, Color32::from_white_alpha(10));
+            }
+            let (icon, color) = match button {
+                PillButton::Cancel => (icons::Icon::Close, Color32::WHITE),
+                PillButton::Confirm => (icons::Icon::Check, theme::p().green),
+            };
+            icons::paint(
+                ui.painter(),
+                Rect::from_center_size(rect.center(), Vec2::splat(19.0)),
+                icon,
+                color,
+            );
+            let id = match button {
+                PillButton::Cancel => ui.scope_id().with("shot-cancel"),
+                PillButton::Confirm => ui.scope_id().with("shot-confirm"),
+            };
+            ui.interact(rect, id, Sense::hover());
+        }
     }
 
     fn paint_cursor(&self, ui: &mut Ui, position: Option<Pos2>, toolbar: Option<Rect>) {
@@ -450,6 +574,11 @@ impl Session {
 /// the egui side but leaves the native window behind, so one window per capture would pile up.
 pub fn reveal(ctx: &egui::Context, visible: bool) {
     ctx.send_viewport_cmd_to(viewport_id(), ViewportCommand::Visible(visible));
+    // egui 只藏 viewport；若原生层叠了同名窗，点叉仍会打在下面那层上。
+    #[cfg(target_os = "macos")]
+    if !visible {
+        hide_overlay_windows();
+    }
 }
 
 /// Stretch the overlay window over every pixel of the screen, menu bar and dock included, and
@@ -498,6 +627,18 @@ fn overlay_window() -> Option<Retained<NSWindow>> {
         .find(|window| window.title().to_string() == TITLE)
 }
 
+#[cfg(target_os = "macos")]
+fn hide_overlay_windows() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    for window in NSApplication::sharedApplication(mtm).windows().iter() {
+        if window.title().to_string() == TITLE {
+            window.orderOut(None);
+        }
+    }
+}
+
 /// Clicks already land on the overlay, but only the key window is told about Esc.
 #[cfg(target_os = "macos")]
 fn focus() {
@@ -535,16 +676,66 @@ fn hit_window(windows: &[Rect], position: Pos2, frame: Rect) -> Rect {
 }
 
 /// Where the button pill sits: under the region's bottom-right, flipped above it at the edge.
-fn pill_at(selection: Rect, frame: Rect) -> Rect {
+/// `top_inset` is the menu bar: the pill is kept wholly below it so a click can land.
+fn pill_at(selection: Rect, frame: Rect, top_inset: f32) -> Rect {
+    let mut y = if selection.max.y + TOOLBAR_GAP + TOOLBAR_HEIGHT > frame.max.y {
+        (selection.min.y - TOOLBAR_GAP - TOOLBAR_HEIGHT).max(0.0)
+    } else {
+        selection.max.y + TOOLBAR_GAP
+    };
+    let floor = top_inset.max(0.0);
+    if y < floor {
+        y = floor;
+    }
+    let limit = (frame.max.y - TOOLBAR_HEIGHT).max(0.0);
+    if y > limit {
+        y = limit;
+    }
     let min = Pos2::new(
-        (selection.max.x - TOOLBAR_WIDTH).clamp(0.0, frame.max.x - TOOLBAR_WIDTH),
-        if selection.max.y + TOOLBAR_GAP + TOOLBAR_HEIGHT > frame.max.y {
-            (selection.min.y - TOOLBAR_GAP - TOOLBAR_HEIGHT).max(0.0)
-        } else {
-            selection.max.y + TOOLBAR_GAP
-        },
+        (selection.max.x - TOOLBAR_WIDTH).clamp(0.0, (frame.max.x - TOOLBAR_WIDTH).max(0.0)),
+        y,
     );
     Rect::from_min_size(min, Vec2::new(TOOLBAR_WIDTH, TOOLBAR_HEIGHT))
+}
+
+/// Points at the top of the main screen that the menu bar occupies. Clicks there never
+/// reach the overlay, so the pill uses this as its minimum y.
+#[cfg(target_os = "macos")]
+pub fn top_inset() -> f32 {
+    use objc2_app_kit::NSScreen;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return 28.0;
+    };
+    let Some(screen) = NSScreen::mainScreen(mtm) else {
+        return 28.0;
+    };
+    let frame = screen.frame();
+    let visible = screen.visibleFrame();
+    let top = (frame.origin.y + frame.size.height) - (visible.origin.y + visible.size.height);
+    (top as f32).max(0.0)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn top_inset() -> f32 {
+    0.0
+}
+
+/// 按钮条里的两个按钮：左边取消，右边完成。对齐 Compose `pillButtons`。
+fn pill_buttons(pill: Rect) -> [(PillButton, Rect); 2] {
+    let top = pill.min.y + (TOOLBAR_HEIGHT - PILL_BUTTON) / 2.0;
+    let cancel = Rect::from_min_size(
+        Pos2::new(pill.min.x + PILL_INSET, top),
+        Vec2::splat(PILL_BUTTON),
+    );
+    let confirm = Rect::from_min_size(
+        Pos2::new(cancel.max.x + PILL_SPACING, top),
+        Vec2::splat(PILL_BUTTON),
+    );
+    [
+        (PillButton::Cancel, cancel),
+        (PillButton::Confirm, confirm),
+    ]
 }
 
 fn handle_point(rect: Rect, handle: Handle) -> Pos2 {
@@ -707,7 +898,8 @@ pub fn crop_px(rect: Rect, image: Vec2, scale: f32) -> (u32, u32, u32, u32) {
 mod tests {
     use super::{
         between, crop_px, handle_at, handle_point, hit_window, is_region, mask_rects, pill_at,
-        resize, square_at, translate, Drag, Freeze, Handle, Session, MIN_SIZE, TOOLBAR_GAP,
+        pill_buttons, resize, square_at, translate, Drag, Freeze, Handle, Outcome, PillButton,
+        Session, MIN_SIZE, TOOLBAR_GAP,
     };
     use eframe::egui::{Pos2, Rect, Vec2};
 
@@ -920,36 +1112,104 @@ mod tests {
 
     #[test]
     fn the_pill_sits_under_the_region_and_flips_above_it_at_the_bottom_edge() {
-        let pill = pill_at(rect(100.0, 100.0, 300.0, 200.0), SCREEN);
+        let pill = pill_at(rect(100.0, 100.0, 300.0, 200.0), SCREEN, 0.0);
         assert_eq!(pill.max.x, 300.0);
         assert_eq!(pill.min.y, 200.0 + TOOLBAR_GAP);
 
-        let flipped = pill_at(rect(100.0, 100.0, 300.0, 590.0), SCREEN);
+        let flipped = pill_at(rect(100.0, 100.0, 300.0, 590.0), SCREEN, 0.0);
         assert_eq!(flipped.max.y, 100.0 - TOOLBAR_GAP);
 
-        let edge = pill_at(rect(900.0, 100.0, 1000.0, 200.0), SCREEN);
+        let edge = pill_at(rect(900.0, 100.0, 1000.0, 200.0), SCREEN, 0.0);
         assert_eq!(edge.max.x, SCREEN.max.x);
+
+        // 全屏选区会把按钮条翻到 y=0，那一截是菜单栏，点不到。整条放到菜单栏下面。
+        let full = pill_at(SCREEN, SCREEN, 32.0);
+        assert_eq!(full.min.y, 32.0);
+        assert_eq!(full.max.x, SCREEN.max.x);
     }
 
     #[test]
     fn a_click_on_the_pill_leaves_the_region_alone() {
         let selection = rect(100.0, 100.0, 300.0, 200.0);
-        let pill = pill_at(selection, SCREEN);
+        let pill = pill_at(selection, SCREEN, 0.0);
         let mut session = session();
         session.selection = Some(selection);
 
-        session.begin_drag(Some(pill.center()), Some(pill));
+        // 点叉：按下即取消，不擦选区、不开 Fresh。
+        let cancel = pill_buttons(pill)[0].1;
+        session.begin_drag(cancel.center(), Some(pill));
+        assert!(session.drag.is_none());
+        assert_eq!(session.selection, Some(selection));
+        assert!(matches!(session.outcome, Some(Outcome::Cancel)));
+
+        session.outcome = None;
+        // 点在条上但不是按钮：不动选区。
+        session.begin_drag(Pos2::new(pill.center().x, pill.min.y + 1.0), Some(pill));
         assert!(session.drag.is_none());
         assert_eq!(session.selection, Some(selection));
 
-        // Handles still win over the pill, so the bottom edge stays adjustable.
-        session.begin_drag(Some(Pos2::new(200.0, 204.0)), Some(pill));
+        // 底边手柄（避开按钮）仍可拖。
+        session.begin_drag(Pos2::new(200.0, 200.0), Some(pill));
         assert!(matches!(session.drag, Some(Drag::Handle(Handle::Bottom))));
 
+        session.drag = None;
+        session.selection = Some(selection);
         // Anywhere else starts a fresh region.
-        session.begin_drag(Some(Pos2::new(600.0, 400.0)), Some(pill));
+        session.begin_drag(Pos2::new(600.0, 400.0), Some(pill));
         assert!(matches!(session.drag, Some(Drag::Fresh { .. })));
         assert_eq!(session.selection, None);
+    }
+
+    #[test]
+    fn pressing_cancel_cancels_without_a_crop() {
+        let selection = rect(100.0, 100.0, 300.0, 200.0);
+        let pill = pill_at(selection, SCREEN, 0.0);
+        let cancel = pill_buttons(pill)[0].1;
+        let mut session = session();
+        session.selection = Some(selection);
+        session.begin_drag(cancel.center(), Some(pill));
+        assert!(matches!(session.outcome, Some(Outcome::Cancel)));
+    }
+
+    #[test]
+    fn releasing_confirm_never_crops_if_pointer_jitters_onto_cancel() {
+        let selection = rect(100.0, 100.0, 300.0, 200.0);
+        let pill = pill_at(selection, SCREEN, 0.0);
+        let [(_, cancel), (_, confirm)] = pill_buttons(pill);
+        let mut session = session();
+        session.selection = Some(selection);
+        // 勾仍要 press+release 同钮；按下在勾、抬起滑到叉：不出图
+        session.begin_drag(confirm.center(), Some(pill));
+        assert!(matches!(session.pill_press, Some((PillButton::Confirm, _))));
+        session.on_up(cancel.center(), SCREEN);
+        assert!(session.outcome.is_none());
+        assert_eq!(session.selection, Some(selection));
+    }
+
+    #[test]
+    fn coordinate_mapping_round_trips_corners() {
+        let logical = SCREEN;
+        let surface = rect(10.0, 20.0, 510.0, 320.0);
+        let corners = [
+            Pos2::new(0.0, 0.0),
+            Pos2::new(1000.0, 0.0),
+            Pos2::new(0.0, 600.0),
+            Pos2::new(1000.0, 600.0),
+            Pos2::new(250.0, 150.0),
+        ];
+        for logical_pos in corners {
+            let on_surface = Session::to_surface(
+                Rect::from_min_size(logical_pos, Vec2::splat(1.0)),
+                surface,
+                logical,
+            )
+            .min;
+            let back = Session::to_logical(on_surface, surface, logical);
+            assert!(
+                (back.x - logical_pos.x).abs() < 0.01 && (back.y - logical_pos.y).abs() < 0.01,
+                "round-trip failed: {logical_pos:?} -> {on_surface:?} -> {back:?}"
+            );
+        }
     }
 
     fn session() -> Session {
@@ -959,6 +1219,7 @@ mod tests {
             size: Vec2::new(1000.0, 600.0),
             scale: 1.0,
             windows: Vec::new(),
+            top_inset: 0.0,
         })
     }
 }

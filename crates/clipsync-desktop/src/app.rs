@@ -28,6 +28,7 @@ use crate::store::{FileInfo, History, Record, KIND_FILE, KIND_TEXT};
 use crate::text_tools::{self, TextOp};
 use crate::theme;
 use crate::transfer::TransferClient;
+use crate::tray::{Tray, TrayCmd};
 use crate::translate::{self, Failure as TranslateFailure, Target as TranslateTarget};
 use crate::update::{self, UpdateEvent, UpdateState};
 use crate::{autostart, overlay, paths, screenshot};
@@ -106,6 +107,11 @@ pub struct ClipSyncApp {
     shot_visible: bool,
     /// When the app window will be gone long enough to grab the screen behind it.
     capture_at: Option<Instant>,
+    /// 第二实例连上本机回环端口时发来的「请显示窗口」。
+    show_rx: mpsc::Receiver<()>,
+    tray: Option<Tray>,
+    /// 设置页「退出」：允许真正关进程，普通点关闭只是藏窗。
+    force_quit: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -135,6 +141,7 @@ enum SettingsAction {
     WatchImages(bool),
     WatchFiles(bool),
     DeleteExpired(bool),
+    ScreenshotKeepWindow(bool),
     EditRoom,
     About,
     LeaveRoom,
@@ -172,6 +179,8 @@ enum Overlay {
     Help,
     About,
     Safety,
+    /// 同屋设备列表（顶栏设备按钮）；与安全码对话框分开。
+    Devices,
     ClearAll,
     LeaveRoom,
     Choice(SettingsChoice),
@@ -311,6 +320,8 @@ impl ClipSyncApp {
         settings: Settings,
         preferences: Preferences,
         hotkeys: Option<screenshot::Hotkeys>,
+        show_rx: mpsc::Receiver<()>,
+        tray: Option<Tray>,
     ) -> Self {
         let (job_tx, job_rx) = mpsc::channel();
         let watch_clipboard = preferences.watch_clipboard();
@@ -373,6 +384,9 @@ impl ClipSyncApp {
             shot: None,
             shot_visible: false,
             capture_at: None,
+            show_rx,
+            tray,
+            force_quit: false,
         };
         let restore = app.preferences.remember_room() && app.settings.session.is_some();
         if !app.preferences.remember_room() {
@@ -416,6 +430,42 @@ impl ClipSyncApp {
         let count = self.history.remove_expired(cutoff);
         if count > 0 {
             self.notify(format!("清掉了 {count} 条过期条目"));
+        }
+    }
+
+    fn reveal_window(&self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(ViewportCommand::Focus);
+        ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+    }
+
+    fn drain_shell_signals(&mut self, ctx: &egui::Context) {
+        let mut show = false;
+        while self.show_rx.try_recv().is_ok() {
+            show = true;
+        }
+        if let Some(tray) = self.tray.as_ref() {
+            while let Some(cmd) = tray.poll() {
+                match cmd {
+                    TrayCmd::Show => show = true,
+                    TrayCmd::Quit => {
+                        self.force_quit = true;
+                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                        return;
+                    }
+                }
+            }
+        }
+        if show {
+            self.reveal_window(ctx);
+        }
+        // 关窗收进托盘；设置里「退出」或托盘退出才真正结束进程。
+        if ctx.input(|input| input.viewport().close_requested()) {
+            if self.force_quit {
+                return;
+            }
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         }
     }
 
@@ -952,17 +1002,22 @@ impl ClipSyncApp {
         if self.shot.is_some() || self.capture_at.is_some() {
             return;
         }
-        if screenshot::permission_missing() {
+        if !screenshot::request_access() {
             self.notify_error(
                 "缺少屏幕录制权限：系统设置 → 隐私与安全性 → 屏幕与系统音频录制，勾上 ClipSyncRust",
             );
             return;
         }
-        // Our own window is never part of the screenshot: it is what the user is leaving behind.
-        // A transparent GL window also comes back as a black hole from the screen grabber.
-        self.capture_at = Some(Instant::now() + CAPTURE_HIDE_DELAY);
-        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-        ctx.request_repaint_after(CAPTURE_HIDE_DELAY);
+        // 对齐 Compose：默认保留本窗；关掉「截图时保留本窗口」才先藏起再抓，避免冻屏里出现自己。
+        // 透明 GL 窗被抓到也会是黑洞，所以藏窗时要留一帧时间让系统真正摘掉它。
+        if self.preferences.screenshot_keep_window() {
+            self.capture_at = Some(Instant::now());
+            ctx.request_repaint();
+        } else {
+            self.capture_at = Some(Instant::now() + CAPTURE_HIDE_DELAY);
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            ctx.request_repaint_after(CAPTURE_HIDE_DELAY);
+        }
     }
 
     /// Grabs the screen once the app window has actually left it and hands the frame to the
@@ -993,10 +1048,15 @@ impl ClipSyncApp {
     fn service_shot(&mut self, ctx: &egui::Context) {
         let session = self.shot.clone();
         ctx.show_viewport_deferred(overlay::viewport_id(), overlay::viewport(), move |ui, _| {
-            let Some(session) = &session else { return };
-            if let Ok(mut session) = session.lock() {
-                session.draw(ui);
-            }
+            // 无边框、无边距：否则 egui 默认面板会在全屏上画出「额外的线」和边角控件感。
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show_inside(ui, |ui| {
+                    let Some(session) = &session else { return };
+                    if let Ok(mut session) = session.lock() {
+                        session.draw(ui);
+                    }
+                });
         });
 
         let Some(session) = self.shot.clone() else {
@@ -1036,6 +1096,8 @@ impl ClipSyncApp {
         overlay::reveal(ctx, false);
         self.shot_visible = false;
         self.shot = None;
+        // 框选/取消结束后再抬主窗，避免截屏过程中毛玻璃窗叠在遮罩上
+        self.reveal_window(ctx);
         if let Some(shot) = shot {
             self.commit_shot(shot);
         }
@@ -1156,8 +1218,8 @@ impl ClipSyncApp {
                     Pos2::new(left + width, screen.bottom()),
                 );
                 ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-                    let bar_top = screen.top() + theme::TOP_INSET + 4.0;
-                    ui.add_space(bar_top - screen.top());
+                    // 标题栏固定在滚动区外：内容从栏下开始滚，不会滑到「设置」玻璃下面。
+                    ui.add_space(bar_bottom - screen.top() + 10.0);
                     egui::ScrollArea::vertical()
                         .id_salt("settings-scroll")
                         .auto_shrink([false, false])
@@ -1166,7 +1228,6 @@ impl ClipSyncApp {
                         )
                         .show(ui, |ui| {
                             ui.set_width(width);
-                            ui.add_space(bar_bottom - bar_top + 14.0);
                             ui.spacing_mut().item_spacing.y = 0.0;
 
                             settings_group(ui, "外观", |ui| {
@@ -1186,7 +1247,7 @@ impl ClipSyncApp {
                                     action = Some(SettingsAction::Language);
                                 }
                             });
-                            ui.add_space(22.0);
+                            ui.add_space(14.0);
 
                             let joined = self.joined;
                             let room = self.room_code.clone();
@@ -1234,7 +1295,7 @@ impl ClipSyncApp {
                                     }
                                 }
                             });
-                            ui.add_space(22.0);
+                            ui.add_space(14.0);
 
                             let watch = self.watch_clipboard;
                             let auto_copy = self.auto_copy;
@@ -1281,21 +1342,32 @@ impl ClipSyncApp {
                                     action = Some(SettingsAction::AutoCopy(!auto_copy));
                                 }
                             });
-                            ui.add_space(22.0);
+                            ui.add_space(14.0);
 
                             let hotkey = self.preferences.screenshot_hotkey().to_string();
+                            let keep_window = self.preferences.screenshot_keep_window();
                             if self.hotkeys.is_some() {
                                 settings_group(ui, "截屏", |ui| {
                                     if settings_nav_row(ui, "截屏快捷键", &hotkey) {
                                         action = Some(SettingsAction::Hotkey);
                                     }
-                                    settings_divider(ui);
                                     settings_footnote(
                                         ui,
-                                        "按一下截下整屏：图直接进剪贴板，也存进列表发给同屋",
+                                        "按一下打开框选：切好的图进剪贴板，也存进列表发给同屋",
                                     );
+                                    settings_divider(ui);
+                                    if settings_switch_row(
+                                        ui,
+                                        "截图时保留本窗口",
+                                        "开着时冻屏里还能看见 ClipSyncRust；关掉会先藏起本窗口再截，画面里就不会出现自己",
+                                        keep_window,
+                                    ) {
+                                        action = Some(SettingsAction::ScreenshotKeepWindow(
+                                            !keep_window,
+                                        ));
+                                    }
                                 });
-                                ui.add_space(22.0);
+                                ui.add_space(14.0);
                             }
 
                             let delete_expired = self.preferences.delete_expired();
@@ -1394,7 +1466,7 @@ impl ClipSyncApp {
                 Frame::new()
                     .fill(theme::glass_fill())
                     .stroke(Stroke::new(1.0, theme::p().glass_border))
-                    .corner_radius(CornerRadius::same(theme::BAR_RADIUS))
+                    .corner_radius(CornerRadius::same(20))
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 8],
                         blur: 28,
@@ -1426,7 +1498,7 @@ impl ClipSyncApp {
         theme::frost(
             ctx,
             response.response.rect,
-            theme::BAR_RADIUS,
+            20,
             theme::frost_layer(),
         );
         if back {
@@ -1451,10 +1523,16 @@ impl ClipSyncApp {
             SettingsAction::WatchImages(enabled) => self.set_watch_images(enabled),
             SettingsAction::WatchFiles(enabled) => self.set_watch_files(enabled),
             SettingsAction::DeleteExpired(enabled) => self.set_delete_expired(enabled),
+            SettingsAction::ScreenshotKeepWindow(enabled) => {
+                self.preferences.set_screenshot_keep_window(enabled);
+            }
             SettingsAction::EditRoom => self.open(Overlay::Share),
             SettingsAction::About => self.open(Overlay::About),
             SettingsAction::LeaveRoom => self.open(Overlay::LeaveRoom),
-            SettingsAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            SettingsAction::Quit => {
+                self.force_quit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             SettingsAction::CheckUpdate => self.check_updates(),
             SettingsAction::DownloadUpdate => self.download_update(),
         }
@@ -2382,6 +2460,7 @@ impl ClipSyncApp {
         {
             theme::apply(ctx, self.theme_mode);
         }
+        self.drain_shell_signals(ctx);
         self.drain_events();
         self.drain_jobs();
         self.drain_updates();
@@ -2641,7 +2720,7 @@ impl ClipSyncApp {
                     self.open(Overlay::Share);
                 }
                 if matches!(self.status, Status::Online { .. }) && self.devices_button(ui) {
-                    self.open(Overlay::Safety);
+                    self.open(Overlay::Devices);
                 }
             });
         });
@@ -3122,6 +3201,7 @@ impl ClipSyncApp {
             Overlay::Help => 470.0,
             Overlay::Detail { .. } => 500.0,
             Overlay::Safety => 440.0,
+            Overlay::Devices => 400.0,
             Overlay::Transform { .. } => 460.0,
             Overlay::Translate { .. } => 520.0,
             Overlay::Choice(_) => 360.0,
@@ -3199,41 +3279,32 @@ impl ClipSyncApp {
                     Overlay::Help => {
                         dialog_header(ui, Icon::Help, "怎么用");
                         ui.add_space(12.0);
+                        // 对齐 Compose HelpDialog：序号顶对齐、固定列宽，正文 wrap，避免圆点垂直居中把字顶歪。
                         egui::ScrollArea::vertical()
                             .max_height(360.0)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 12.0;
                                 for (index, step) in HELP_STEPS.iter().enumerate() {
-                                    ui.horizontal(|ui| {
-                                        let (rect, _) = ui.allocate_exact_size(
-                                            Vec2::splat(22.0),
-                                            Sense::hover(),
-                                        );
-                                        ui.painter().circle_filled(
-                                            rect.center(),
-                                            10.0,
-                                            Color32::from_rgba_unmultiplied(
-                                                0xf4, 0xa8, 0xc0, 30,
+                                    ui.horizontal_top(|ui| {
+                                        ui.add_sized(
+                                            [16.0, 16.0],
+                                            egui::Label::new(
+                                                RichText::new((index + 1).to_string())
+                                                    .monospace()
+                                                    .size(12.0)
+                                                    .color(theme::p().accent),
                                             ),
                                         );
-                                        ui.painter().text(
-                                            rect.center(),
-                                            Align2::CENTER_CENTER,
-                                            (index + 1).to_string(),
-                                            FontId::proportional(10.5),
-                                            theme::p().accent,
-                                        );
-                                        ui.add_space(2.0);
-                                        ui.vertical(|ui| {
-                                            ui.set_width(ui.available_width());
-                                            ui.label(
+                                        ui.add(
+                                            egui::Label::new(
                                                 RichText::new(*step)
-                                                    .size(12.0)
-                                                    .color(theme::p().muted),
-                                            );
-                                        });
+                                                    .size(12.5)
+                                                    .color(theme::p().text),
+                                            )
+                                            .wrap(),
+                                        );
                                     });
-                                    ui.add_space(8.0);
                                 }
                             });
                         ui.add_space(12.0);
@@ -3358,6 +3429,33 @@ impl ClipSyncApp {
                         ui.add_space(14.0);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if secondary_button(ui, "知道了").clicked() {
+                                close = true;
+                            }
+                        });
+                    }
+                    Overlay::Devices => {
+                        dialog_header(ui, Icon::Devices, "同屋设备");
+                        ui.add_space(12.0);
+                        let mine = self.sender_name();
+                        let mine_os = paths::device_os();
+                        egui::ScrollArea::vertical()
+                            .max_height(360.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                device_row(ui, &mine, mine_os, true);
+                                ui.add_space(6.0);
+                                if self.peers.is_empty() {
+                                    hint(ui, "暂时没有其他设备在线。");
+                                } else {
+                                    for peer in &self.peers {
+                                        device_row(ui, &peer.name, &peer.os, false);
+                                        ui.add_space(6.0);
+                                    }
+                                }
+                            });
+                        ui.add_space(14.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if secondary_button(ui, "关闭").clicked() {
                                 close = true;
                             }
                         });
@@ -4040,6 +4138,13 @@ impl ClipSyncApp {
                     }
                 }
             });
+        // 磨砂衬在对话框底下（对齐 Compose Popup + GlassCard）
+        theme::frost(
+            ctx,
+            response.response.rect,
+            theme::DIALOG_RADIUS,
+            theme::frost_layer(),
+        );
         if response.should_close() {
             close = true;
         }
@@ -4345,19 +4450,23 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
     let painter = ui.painter().clone();
     let hovered = card_response.contains_pointer();
     let revealed = hovered || cursor;
+    // 对齐 Compose ClipRow：选中/光标用 primary(accent) 透明叠色；浅色空闲行用实心 surface。
+    let accent = theme::p().accent;
     let fill = if picked {
-        Color32::from_rgba_unmultiplied(0xf4, 0xa8, 0xc0, 38)
+        theme::with_alpha(accent, 41)
     } else if cursor {
-        Color32::from_white_alpha(9)
-    } else {
+        theme::with_alpha(accent, 20)
+    } else if theme::p().dark {
         theme::with_alpha(theme::p().card, 128)
+    } else {
+        theme::p().surface
     };
     let border = if picked {
-        Color32::from_rgba_unmultiplied(0xf4, 0xa8, 0xc0, 130)
+        theme::with_alpha(accent, 140)
     } else if cursor {
-        Color32::from_white_alpha(48)
+        theme::with_alpha(accent, 82)
     } else {
-        Color32::from_rgba_unmultiplied(0x3a, 0x2a, 0x33, 110)
+        theme::with_alpha(theme::p().border, 115)
     };
     painter.rect(
         card,
@@ -4366,10 +4475,14 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
         Stroke::new(1.0, border),
         StrokeKind::Inside,
     );
+    // 顶沿高光（Compose rimHighlight）
     painter.hline(
-        (card.left() + 16.0)..=(card.right() - 16.0),
+        (card.left() + 14.0)..=(card.right() - 14.0),
         card.top() + 1.0,
-        Stroke::new(1.0, Color32::from_white_alpha(10)),
+        Stroke::new(
+            1.0,
+            Color32::from_white_alpha(if theme::p().dark { 36 } else { 140 }),
+        ),
     );
 
     if pick_mode {
@@ -4691,14 +4804,45 @@ fn banner(
     text: &str,
     action: Option<&str>,
 ) -> bool {
+    // 对齐 Compose InlineMessage：图标 / 正文 / 操作同一中线，别再写死 center.y-7。
     let avail = ui.available_width();
     let width = (avail - theme::ROW_INSET * 2.0).max(240.0);
-    let (outer, _) = ui.allocate_exact_size(Vec2::new(avail, 62.0), Sense::hover());
+    let action_width = if action.is_some() { 78.0 } else { 0.0 };
+    let text_width = (width - 40.0 - action_width - 16.0).max(80.0);
+    let font = FontId::proportional(12.0);
+    let text_color = if error {
+        theme::p().on_error_container
+    } else {
+        theme::p().text
+    };
+    let galley = {
+        let mut job = egui::text::LayoutJob {
+            wrap: TextWrapping {
+                max_width: text_width,
+                max_rows: 2,
+                overflow_character: Some('…'),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        job.append(
+            text,
+            0.0,
+            TextFormat {
+                font_id: font.clone(),
+                color: text_color,
+                ..Default::default()
+            },
+        );
+        ui.ctx().fonts_mut(|fonts| fonts.layout_job(job))
+    };
+    let card_h = (galley.size().y + 22.0).max(44.0);
+    let (outer, _) = ui.allocate_exact_size(Vec2::new(avail, card_h + 8.0), Sense::hover());
     let card = Rect::from_min_max(
         Pos2::new(outer.left() + theme::ROW_INSET, outer.top() + 4.0),
         Pos2::new(
             outer.left() + theme::ROW_INSET + width,
-            outer.bottom() - 4.0,
+            outer.top() + 4.0 + card_h,
         ),
     );
     let fill = if error {
@@ -4711,43 +4855,31 @@ fn banner(
     } else {
         Color32::from_rgba_unmultiplied(0x3a, 0x2a, 0x33, 140)
     };
-    let text_color = if error {
-        theme::p().on_error_container
-    } else {
-        theme::p().text
-    };
     ui.painter().rect(
         card,
-        CornerRadius::same(16),
+        CornerRadius::same(12),
         fill,
         Stroke::new(1.0, stroke),
         StrokeKind::Inside,
     );
+    let mid = card.center().y;
     icons::paint(
         ui.painter(),
-        Rect::from_center_size(
-            Pos2::new(card.left() + 20.0, card.center().y),
-            Vec2::splat(17.0),
-        ),
+        Rect::from_center_size(Pos2::new(card.left() + 20.0, mid), Vec2::splat(16.0)),
         icon,
         color,
     );
-    let action_width = if action.is_some() { 74.0 } else { 0.0 };
-    let text_width = (card.width() - 40.0 - action_width - 20.0).max(80.0);
-    paint_line(
-        ui,
-        Pos2::new(card.left() + 40.0, card.center().y - 7.0),
-        text,
-        FontId::proportional(12.0),
+    ui.painter().galley(
+        Pos2::new(card.left() + 40.0, mid - galley.size().y * 0.5),
+        galley,
         text_color,
-        text_width,
     );
     let Some(label) = action else {
         return false;
     };
-    let pill = Rect::from_min_max(
-        Pos2::new(card.right() - 12.0 - 72.0, card.center().y - 16.0),
-        Pos2::new(card.right() - 8.0, card.center().y + 16.0),
+    let pill = Rect::from_center_size(
+        Pos2::new(card.right() - 12.0 - 36.0, mid),
+        Vec2::new(72.0, 28.0),
     );
     let response = ui.interact(pill, Id::unique(("banner-action", text)), Sense::click());
     if response.hovered() {
@@ -4757,14 +4889,14 @@ fn banner(
     icons::paint(
         ui.painter(),
         Rect::from_center_size(
-            Pos2::new(pill.left() + 16.0, pill.center().y),
+            Pos2::new(pill.left() + 14.0, pill.center().y),
             Vec2::splat(14.0),
         ),
         Icon::Key,
         text_color,
     );
     ui.painter().text(
-        Pos2::new(pill.left() + 28.0, pill.center().y),
+        Pos2::new(pill.left() + 26.0, pill.center().y),
         Align2::LEFT_CENTER,
         label,
         FontId::proportional(12.0),
@@ -5026,6 +5158,7 @@ fn paint_chip(ui: &Ui, rect: Rect, label: &str, active: bool, font: FontId) {
 
 fn dialog_header(ui: &mut Ui, icon: Icon, title: &str) {
     ui.horizontal(|ui| {
+        ui.set_height(24.0);
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
         icons::paint(
             ui.painter(),
@@ -5033,12 +5166,16 @@ fn dialog_header(ui: &mut Ui, icon: Icon, title: &str) {
             icon,
             theme::p().accent,
         );
-        ui.label(
-            RichText::new(title)
-                .size(18.0)
-                .strong()
-                .color(theme::p().text),
-        );
+        ui.add_space(6.0);
+        ui.vertical(|ui| {
+            ui.add_space(1.0);
+            ui.label(
+                RichText::new(title)
+                    .size(17.0)
+                    .strong()
+                    .color(theme::p().text),
+            );
+        });
     });
 }
 
@@ -5048,6 +5185,39 @@ fn field_label(ui: &mut Ui, text: &str) {
 
 fn hint(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).size(10.5).color(theme::p().faint));
+}
+
+fn device_row(ui: &mut Ui, name: &str, os: &str, mine: bool) {
+    Frame::new()
+        .fill(theme::with_alpha(theme::p().card, 180))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                icons::paint(ui.painter(), icon_rect, Icon::Devices, theme::p().muted);
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width() - if mine { 48.0 } else { 0.0 });
+                    ui.label(
+                        RichText::new(name)
+                            .size(12.5)
+                            .color(theme::p().text),
+                    );
+                    ui.label(RichText::new(os).size(10.5).color(theme::p().faint));
+                });
+                if mine {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new("本机")
+                                .size(11.0)
+                                .strong()
+                                .color(theme::p().accent),
+                        );
+                    });
+                }
+            });
+        });
 }
 
 fn bullet(ui: &mut Ui, text: &str) {
@@ -5273,30 +5443,30 @@ fn language_label(language: Language) -> &'static str {
     }
 }
 
-const SETTINGS_ROW_HEIGHT: f32 = 54.0;
-const SETTINGS_SWITCH_HEIGHT: f32 = 56.0;
+const SETTINGS_ROW_HEIGHT: f32 = 48.0;
+const SETTINGS_SWITCH_HEIGHT: f32 = 52.0;
+const SETTINGS_PAD: f32 = 14.0;
+const SETTINGS_GROUP_RADIUS: u8 = 18;
 
 fn settings_group(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 23.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), Sense::hover());
     paint_line(
         ui,
-        Pos2::new(rect.left() + 18.0, rect.top() + 2.0),
+        Pos2::new(rect.left() + SETTINGS_PAD, rect.top() + 1.0),
         title,
         FontId::proportional(11.5),
-        theme::p().accent,
-        rect.width() - 36.0,
+        theme::p().muted,
+        rect.width() - SETTINGS_PAD * 2.0,
     );
+    // 不用 frost Mesh：同层会盖住条目；半透明 surface 才看得见文字。
     let dark = theme::p().dark;
     Frame::new()
         .fill(theme::with_alpha(
             theme::p().surface,
             if dark { 199 } else { 224 },
         ))
-        .stroke(Stroke::new(
-            1.0,
-            theme::with_alpha(theme::p().glass_border, 128),
-        ))
-        .corner_radius(CornerRadius::same(16))
+        .stroke(Stroke::new(1.0, theme::p().glass_border))
+        .corner_radius(CornerRadius::same(SETTINGS_GROUP_RADIUS))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -5307,9 +5477,9 @@ fn settings_group(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
 fn settings_divider(ui: &mut Ui) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
     ui.painter().hline(
-        (rect.left() + 16.0)..=(rect.right() - 16.0),
+        (rect.left() + SETTINGS_PAD)..=(rect.right() - SETTINGS_PAD),
         rect.center().y,
-        Stroke::new(1.0, theme::with_alpha(theme::p().border, 102)),
+        Stroke::new(1.0, theme::with_alpha(theme::p().border, 71)),
     );
 }
 
@@ -5347,10 +5517,10 @@ fn settings_nav_row(ui: &mut Ui, title: &str, value: &str) -> bool {
         title,
         FontId::proportional(15.0),
         theme::p().text,
-        (value_left - 12.0 - rect.left() - 16.0).max(40.0),
+        (value_left - 12.0 - rect.left() - SETTINGS_PAD).max(40.0),
     );
     let baseline = baseline_at(&title, center);
-    paint_line_at(ui, rect.left() + 16.0, baseline, title);
+    paint_line_at(ui, rect.left() + SETTINGS_PAD, baseline, title);
     paint_line_at(ui, value_left, baseline, value);
     response.on_hover_cursor(CursorIcon::PointingHand).clicked()
 }
@@ -5379,7 +5549,7 @@ fn settings_value_row(
     let right_edge = if link {
         chevron.left() - 10.0
     } else {
-        rect.right() - 16.0
+        rect.right() - SETTINGS_PAD
     };
     let value = row_line(ui, value, value_font, color, 200.0);
     let mut title_limit = right_edge - value.galley.size().x - 12.0;
@@ -5394,10 +5564,10 @@ fn settings_value_row(
         title,
         FontId::proportional(15.0),
         theme::p().text,
-        (title_limit - rect.left() - 16.0).max(40.0),
+        (title_limit - rect.left() - SETTINGS_PAD).max(40.0),
     );
     let baseline = baseline_at(&title, center);
-    paint_line_at(ui, rect.left() + 16.0, baseline, title);
+    paint_line_at(ui, rect.left() + SETTINGS_PAD, baseline, title);
     let mut right = right_edge;
     right = paint_line_before(ui, right, baseline, value);
     if let Some(detail) = detail {
@@ -5420,9 +5590,14 @@ fn settings_action_row(ui: &mut Ui, title: &str) -> bool {
         title,
         FontId::proportional(15.0),
         theme::p().red,
-        chevron.left() - 12.0 - rect.left() - 16.0,
+        chevron.left() - 12.0 - rect.left() - SETTINGS_PAD,
     );
-    paint_line_at(ui, rect.left() + 16.0, baseline_at(&title, center), title);
+    paint_line_at(
+        ui,
+        rect.left() + SETTINGS_PAD,
+        baseline_at(&title, center),
+        title,
+    );
     response.on_hover_cursor(CursorIcon::PointingHand).clicked()
 }
 
@@ -5431,31 +5606,31 @@ fn settings_switch_row(ui: &mut Ui, title: &str, summary: &str, checked: bool) -
         Vec2::new(ui.available_width(), SETTINGS_SWITCH_HEIGHT),
         Sense::hover(),
     );
-    let title_center = rect.top() + 20.0;
+    let title_center = rect.top() + 18.0;
     let switch_id = title;
     let title = row_line(
         ui,
         title,
         FontId::proportional(15.0),
         theme::p().text,
-        (rect.width() - 32.0 - 36.0 - 12.0).max(60.0),
+        (rect.width() - SETTINGS_PAD * 2.0 - 36.0 - 12.0).max(60.0),
     );
     paint_line_at(
         ui,
-        rect.left() + 16.0,
+        rect.left() + SETTINGS_PAD,
         baseline_at(&title, title_center),
         title,
     );
     paint_line(
         ui,
-        Pos2::new(rect.left() + 16.0, rect.top() + 33.0),
+        Pos2::new(rect.left() + SETTINGS_PAD, rect.top() + 31.0),
         summary,
         FontId::proportional(10.5),
-        theme::p().muted,
-        rect.width() - 32.0,
+        theme::with_alpha(theme::p().muted, 230),
+        rect.width() - SETTINGS_PAD * 2.0,
     );
     let track = Rect::from_min_size(
-        Pos2::new(rect.right() - 16.0 - 36.0, title_center - 10.0),
+        Pos2::new(rect.right() - SETTINGS_PAD - 36.0, title_center - 10.0),
         Vec2::new(36.0, 20.0),
     );
     let response = ui
@@ -5503,7 +5678,7 @@ fn settings_update_row(ui: &mut Ui, state: &UpdateState) -> Option<SettingsActio
         _ => None,
     };
     let refresh = Rect::from_center_size(
-        Pos2::new(rect.right() - 16.0 - 15.0, center),
+        Pos2::new(rect.right() - SETTINGS_PAD - 15.0, center),
         Vec2::splat(30.0),
     );
     let download = Rect::from_center_size(
@@ -5527,10 +5702,10 @@ fn settings_update_row(ui: &mut Ui, state: &UpdateState) -> Option<SettingsActio
         "检查更新",
         FontId::proportional(15.0),
         theme::p().text,
-        (label_right - status.galley.size().x - 12.0 - rect.left() - 16.0).max(60.0),
+        (label_right - status.galley.size().x - 12.0 - rect.left() - SETTINGS_PAD).max(60.0),
     );
     let baseline = baseline_at(&title, center);
-    paint_line_at(ui, rect.left() + 16.0, baseline, title);
+    paint_line_at(ui, rect.left() + SETTINGS_PAD, baseline, title);
     paint_line_before(ui, label_right, baseline, status);
 
     let mut action = None;
@@ -5590,14 +5765,14 @@ fn settings_icon_action(
 }
 
 fn settings_footnote(ui: &mut Ui, text: &str) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::hover());
     paint_line(
         ui,
-        Pos2::new(rect.left() + 16.0, rect.top() + 1.0),
+        Pos2::new(rect.left() + SETTINGS_PAD, rect.top() + 1.0),
         text,
         FontId::proportional(10.5),
         theme::p().muted,
-        rect.width() - 32.0,
+        rect.width() - SETTINGS_PAD * 2.0,
     );
 }
 
@@ -5830,12 +6005,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
+        let (_show_tx, show_rx) = std::sync::mpsc::channel();
         let mut app = super::ClipSyncApp::new(
             engine::spawn(BrokerLinks),
             super::History::open(dir.join("history.json")),
             super::Settings::open(dir.join("settings.json"), "viewport-test"),
             super::Preferences::open(dir.join("preferences.json")),
             // 测试里不注册全局快捷键：那会占掉这台机器上的 Alt+A
+            None,
+            show_rx,
             None,
         );
         for index in 0..24 {

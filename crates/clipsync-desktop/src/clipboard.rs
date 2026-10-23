@@ -3,7 +3,9 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use arboard::{Clipboard, ImageData};
+use arboard::Clipboard;
+#[cfg(not(target_os = "macos"))]
+use arboard::ImageData;
 use clipsync_core::crypto::sha256_hex;
 use clipsync_core::files::MAX_FILE_BYTES;
 
@@ -240,17 +242,46 @@ impl ClipboardWatcher {
         let (width, height) = rgba.dimensions();
         let bytes = rgba.into_raw();
         let hash = image_hash(&bytes, width, height);
-        let clipboard = self.clipboard.as_mut().ok_or("剪贴板不可用")?;
-        clipboard
-            .set_image(ImageData {
-                width: width as usize,
-                height: height as usize,
-                bytes: bytes.into(),
-            })
-            .map_err(|error| error.to_string())?;
+        #[cfg(target_os = "macos")]
+        {
+            // Cursor / Electron 认 public.png；arboard 只写 NSImage→TIFF，粘贴会报不支持格式。
+            // PNG + TIFF 都放上，两边都能吃。
+            write_macos_image(png, &bytes, width as usize, height as usize)?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let clipboard = self.clipboard.as_mut().ok_or("剪贴板不可用")?;
+            clipboard
+                .set_image(ImageData {
+                    width: width as usize,
+                    height: height as usize,
+                    bytes: bytes.into(),
+                })
+                .map_err(|error| error.to_string())?;
+        }
         self.own_image = Some(hash);
         Ok(())
     }
+}
+
+/// macOS：写入 `public.png`。arboard 只放 NSImage/TIFF，Cursor 等 Electron 会报不支持格式。
+#[cfg(target_os = "macos")]
+fn write_macos_image(
+    png: &[u8],
+    _rgba: &[u8],
+    _width: usize,
+    _height: usize,
+) -> Result<(), String> {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG};
+    use objc2_foundation::NSData;
+
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    let png_data = NSData::with_bytes(png);
+    if !unsafe { pasteboard.setData_forType(Some(&png_data), NSPasteboardTypePNG) } {
+        return Err("写入 PNG 到剪贴板失败".into());
+    }
+    Ok(())
 }
 
 fn read_files(clipboard: &mut Clipboard) -> Vec<ClipFile> {

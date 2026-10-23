@@ -12,9 +12,13 @@ mod text_tools;
 mod theme;
 mod transfer;
 mod translate;
+mod tray;
 mod update;
 
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc;
+use std::thread;
 
 use app::ClipSyncApp;
 use clipsync_core::engine;
@@ -25,9 +29,17 @@ use store::History;
 const SINGLE_INSTANCE_PORT: u16 = 48124;
 
 fn main() -> eframe::Result {
-    let Ok(_single_instance) = TcpListener::bind(("127.0.0.1", SINGLE_INSTANCE_PORT)) else {
-        return Ok(());
+    let listener = match TcpListener::bind(("127.0.0.1", SINGLE_INSTANCE_PORT)) {
+        Ok(listener) => listener,
+        Err(_) => {
+            // 已有实例：敲一下回环端口，请它把窗口抬起来
+            notify_existing_instance();
+            return Ok(());
+        }
     };
+    let (show_tx, show_rx) = mpsc::channel();
+    start_instance_server(listener, show_tx);
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -37,6 +49,7 @@ fn main() -> eframe::Result {
     let history = History::open(paths::app_dir().join("history.json"));
     let settings = Settings::open(paths::app_dir().join("settings.json"), &paths::install_id());
     let preferences = Preferences::open(paths::app_dir().join("preferences.json"));
+    let tray = tray::Tray::try_install();
 
     eframe::run_native(
         "ClipSyncRust",
@@ -49,6 +62,8 @@ fn main() -> eframe::Result {
                 settings,
                 preferences,
                 screenshot::Hotkeys::new(&ctx.egui_ctx),
+                show_rx,
+                tray,
             )))
         }),
     )
@@ -69,6 +84,26 @@ fn native_options() -> eframe::NativeOptions {
             .with_titlebar_shown(false)
             .with_title_shown(false),
         ..Default::default()
+    }
+}
+
+fn start_instance_server(listener: TcpListener, show_tx: mpsc::Sender<()>) {
+    thread::Builder::new()
+        .name("clipsync-instance".into())
+        .spawn(move || {
+            listener.set_nonblocking(false).ok();
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1];
+                let _ = stream.read(&mut buf);
+                let _ = show_tx.send(());
+            }
+        })
+        .ok();
+}
+
+fn notify_existing_instance() {
+    if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", SINGLE_INSTANCE_PORT)) {
+        let _ = stream.write_all(&[1]);
     }
 }
 

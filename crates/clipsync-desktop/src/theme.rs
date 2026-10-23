@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use eframe::egui::{
     self, epaint::Shadow, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Id,
-    Margin, Pos2, Rect, Stroke, TextStyle, Visuals,
+    Margin, Pos2, Rect, Shape, Stroke, TextStyle, Visuals,
 };
 
 use crate::settings::ThemeMode;
@@ -175,10 +175,16 @@ pub fn glass_frame() -> egui::Frame {
 
 pub fn dialog_frame() -> egui::Frame {
     let palette = p();
+    // 对齐 Compose GlassAlertDialog：近不透明磨砂面，底下再叠 frost
+    let fill = if palette.dark {
+        Color32::from_rgba_unmultiplied(28, 28, 30, 235)
+    } else {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 235)
+    };
     egui::Frame::new()
-        .fill(palette.surface)
-        .stroke(Stroke::new(1.0, palette.border))
-        .corner_radius(CornerRadius::same(24))
+        .fill(fill)
+        .stroke(Stroke::new(1.0, palette.glass_border))
+        .corner_radius(CornerRadius::same(DIALOG_RADIUS))
         .shadow(Shadow {
             offset: [0, 14],
             blur: 40,
@@ -187,6 +193,8 @@ pub fn dialog_frame() -> egui::Frame {
         })
         .inner_margin(Margin::symmetric(20, 18))
 }
+
+pub const DIALOG_RADIUS: u8 = 22;
 
 pub fn resolve_dark(ctx: &egui::Context, mode: ThemeMode) -> bool {
     match mode {
@@ -435,8 +443,8 @@ static FROST: Mutex<Option<FrostBake>> = Mutex::new(None);
 /// Draw the blurred backdrop a glass panel sits on, in the given layer.
 ///
 /// The panel stays translucent, so the frost has to be submitted below it. Floating
-/// bars need [`frost_layer`] to keep the scrolling list off their face; a panel that
-/// flows with the list frosts the very layer it is drawn in.
+/// bars need [`frost_layer`] to keep the scrolling list off their face. Do not frost
+/// scrolling list cards on the same layer as their labels — the mesh covers the text.
 pub fn frost(ctx: &egui::Context, rect: Rect, radius: u8, layer: egui::LayerId) {
     let content = ctx.content_rect();
     if !rect.is_finite() || rect.area() <= 0.0 || !content.is_finite() || content.area() <= 0.0 {
@@ -452,7 +460,7 @@ pub fn frost(ctx: &egui::Context, rect: Rect, radius: u8, layer: egui::LayerId) 
         image,
         egui::TextureOptions::LINEAR,
     );
-    ctx.layer_painter(layer).add(egui::Shape::mesh(frost_mesh(
+    ctx.layer_painter(layer).add(Shape::mesh(frost_mesh(
         rect,
         radius as f32,
         content,

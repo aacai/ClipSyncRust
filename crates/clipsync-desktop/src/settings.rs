@@ -68,6 +68,8 @@ struct StoredPreferences {
     delete_expired: bool,
     retention_days: u32,
     screenshot_hotkey: String,
+    /// 对齐 Compose `screenshotKeepWindow`：默认保留，关掉才在抓屏前藏主窗。
+    screenshot_keep_window: bool,
     last_room_code: Option<String>,
 }
 
@@ -110,6 +112,7 @@ impl Default for StoredPreferences {
             delete_expired: false,
             retention_days: DEFAULT_RETENTION_DAYS,
             screenshot_hotkey: crate::screenshot::DEFAULT_HOTKEY.to_string(),
+            screenshot_keep_window: true,
             last_room_code: None,
         }
     }
@@ -175,6 +178,10 @@ impl Preferences {
 
     pub fn screenshot_hotkey(&self) -> &str {
         &self.stored.screenshot_hotkey
+    }
+
+    pub fn screenshot_keep_window(&self) -> bool {
+        self.stored.screenshot_keep_window
     }
 
     pub fn last_room_code(&self) -> Option<&str> {
@@ -246,6 +253,11 @@ impl Preferences {
 
     pub fn set_screenshot_hotkey(&mut self, spec: &str) {
         self.stored.screenshot_hotkey = spec.to_string();
+        self.save();
+    }
+
+    pub fn set_screenshot_keep_window(&mut self, enabled: bool) {
+        self.stored.screenshot_keep_window = enabled;
         self.save();
     }
 

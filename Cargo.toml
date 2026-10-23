@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/clipsync-core", "crates/clipsync-desktop"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 license = "MIT"
 authors = ["zhiqiu"]
@@ -40,11 +40,15 @@ global-hotkey = "0.9.0"
 xcap = { version = "0.9.8", features = ["image"] }
 
 [profile.dev]
+opt-level = 3
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
+incremental = false
+debug-assertions = true
 
 [profile.dev.package."*"]
 debug = false
+debug-assertions = false
 
 [profile.release]
 debug = false

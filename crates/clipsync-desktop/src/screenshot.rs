@@ -33,6 +33,7 @@ pub fn freeze() -> Result<overlay::Freeze, String> {
     // Window bounds come in display points, so one point is however many pixels the grab came
     // back with — that ratio is what turns a selection into a crop.
     let scale = image.width() as f32 / width.max(1.0);
+    let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(width, height));
     let windows = xcap::Window::all()
         .map_err(|error| error.to_string())?
         .into_iter()
@@ -45,10 +46,10 @@ pub fn freeze() -> Result<overlay::Freeze, String> {
             let top = window.y().ok()? as f32 - position.y;
             let right = left + window.width().ok()? as f32;
             let bottom = top + window.height().ok()? as f32;
-            (right > left && bottom > top).then_some(Rect::from_min_max(
-                Pos2::new(left, top),
-                Pos2::new(right, bottom),
-            ))
+            let rect = Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, bottom));
+            // 过滤碎条/不可见框，减少「满屏莫名其妙的线」
+            let visible = rect.intersect(screen);
+            (visible.width() >= 40.0 && visible.height() >= 40.0).then_some(visible)
         })
         .collect();
     Ok(overlay::Freeze {
@@ -57,6 +58,7 @@ pub fn freeze() -> Result<overlay::Freeze, String> {
         size: Vec2::new(width, height),
         scale,
         windows,
+        top_inset: overlay::top_inset(),
     })
 }
 
@@ -93,15 +95,33 @@ pub fn permission_missing() -> bool {
     !unsafe { CGPreflightScreenCaptureAccess() }
 }
 
+/// Preflight alone never prompts and never registers the app in System Settings → Screen
+/// Recording. Mirror Compose: when missing, call `CGRequestScreenCaptureAccess` so the
+/// system sheet appears and ClipSyncRust shows up in the list. A freshly granted grant
+/// still needs a process restart before capture works.
+#[cfg(target_os = "macos")]
+pub fn request_access() -> bool {
+    if unsafe { CGPreflightScreenCaptureAccess() } {
+        return true;
+    }
+    unsafe { CGRequestScreenCaptureAccess() }
+}
+
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGRequestScreenCaptureAccess() -> bool;
 }
 
 #[cfg(not(target_os = "macos"))]
 pub fn permission_missing() -> bool {
     false
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn request_access() -> bool {
+    true
 }
 
 pub fn parse(spec: &str) -> Option<HotKey> {
