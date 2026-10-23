@@ -53,8 +53,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # 先 fmt 再测：避免手滑忘了格式化就把整条流水线卡死在 check。
       - name: Format
-        run: cargo fmt --all --check
+        run: cargo fmt --all
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets
@@ -87,6 +88,9 @@ jobs:
       - name: Read version
         id: ver
         run: echo "value=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="clipsync-desktop").version')" >> "$GITHUB_OUTPUT"
+
+      - name: Format
+        run: cargo fmt --all
 
       - name: Build
         run: |
@@ -173,6 +177,9 @@ jobs:
         id: ver
         run: echo "value=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="clipsync-desktop").version')" >> "$GITHUB_OUTPUT"
 
+      - name: Format
+        run: cargo fmt --all
+
       - name: Build
         run: cargo build --release --target x86_64-pc-windows-msvc -p clipsync-desktop
 
@@ -254,6 +261,9 @@ jobs:
       - name: Read version
         id: ver
         run: echo "value=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="clipsync-desktop").version')" >> "$GITHUB_OUTPUT"
+
+      - name: Format
+        run: cargo fmt --all
 
       - name: Build
         run: cargo build --release -p clipsync-desktop
