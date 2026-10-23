@@ -732,10 +732,7 @@ fn pill_buttons(pill: Rect) -> [(PillButton, Rect); 2] {
         Pos2::new(cancel.max.x + PILL_SPACING, top),
         Vec2::splat(PILL_BUTTON),
     );
-    [
-        (PillButton::Cancel, cancel),
-        (PillButton::Confirm, confirm),
-    ]
+    [(PillButton::Cancel, cancel), (PillButton::Confirm, confirm)]
 }
 
 fn handle_point(rect: Rect, handle: Handle) -> Pos2 {

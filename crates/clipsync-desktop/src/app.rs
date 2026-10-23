@@ -28,8 +28,8 @@ use crate::store::{FileInfo, History, Record, KIND_FILE, KIND_TEXT};
 use crate::text_tools::{self, TextOp};
 use crate::theme;
 use crate::transfer::TransferClient;
-use crate::tray::{Tray, TrayCmd};
 use crate::translate::{self, Failure as TranslateFailure, Target as TranslateTarget};
+use crate::tray::{Tray, TrayCmd};
 use crate::update::{self, UpdateEvent, UpdateState};
 use crate::{autostart, overlay, paths, screenshot};
 
@@ -1495,12 +1495,7 @@ impl ClipSyncApp {
                         });
                     });
             });
-        theme::frost(
-            ctx,
-            response.response.rect,
-            20,
-            theme::frost_layer(),
-        );
+        theme::frost(ctx, response.response.rect, 20, theme::frost_layer());
         if back {
             self.close_settings();
         }
@@ -5199,11 +5194,7 @@ fn device_row(ui: &mut Ui, name: &str, os: &str, mine: bool) {
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
                     ui.set_width(ui.available_width() - if mine { 48.0 } else { 0.0 });
-                    ui.label(
-                        RichText::new(name)
-                            .size(12.5)
-                            .color(theme::p().text),
-                    );
+                    ui.label(RichText::new(name).size(12.5).color(theme::p().text));
                     ui.label(RichText::new(os).size(10.5).color(theme::p().faint));
                 });
                 if mine {
