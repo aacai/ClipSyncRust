@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -13,7 +14,7 @@ use eframe::egui::{
 
 use clipsync_core::engine::{Clip, Config, EngineHandle, Event, FileUpload, Peer, Status};
 use clipsync_core::files::{human_size, is_image, sanitize_file_name, MAX_FILE_BYTES};
-use clipsync_core::protocol::room_hash;
+use clipsync_core::protocol::{clip_topic, room_hash};
 use clipsync_core::RoomCrypto;
 
 use crate::clipboard::{Captured, ClipFile, ClipboardWatcher, POLL_INTERVAL};
@@ -31,11 +32,20 @@ use crate::transfer::TransferClient;
 use crate::translate::{self, Failure as TranslateFailure, Target as TranslateTarget};
 use crate::tray::{Tray, TrayCmd};
 use crate::update::{self, UpdateEvent, UpdateState};
-use crate::{autostart, overlay, paths, screenshot};
+use crate::{autostart, overlay, paths, preview, record, screenshot};
 
 const TOAST_INFO: Duration = Duration::from_secs(4);
 const TOAST_ERROR: Duration = Duration::from_secs(6);
 const TOAST_UNDO: Duration = Duration::from_secs(9);
+/// The overlay's record accent, so the picker and the recording bar read as the same action.
+const RECORD_RED: Color32 = Color32::from_rgb(0xff, 0x45, 0x3a);
+/// 一次录屏最长两小时，和 Compose 端一致。
+const RECORD_LIMIT_SEC: u64 = 120 * 60;
+/// 录制中的操作栏：和录屏工具条一样固定在顶部中间，显示计时和结束按钮。
+const RECORD_BAR_WIDTH: f32 = 420.0;
+const RECORD_BAR_HEIGHT: f32 = 56.0;
+/// 操作栏离菜单栏的间距，和录屏工具条一致。
+const RECORD_BAR_TOP_GAP: f32 = 8.0;
 /// Time for the app window to actually leave the screen before the grab.
 const CAPTURE_HIDE_DELAY: Duration = Duration::from_millis(140);
 const THUMB_MAX_SIDE: u32 = 256;
@@ -89,6 +99,8 @@ pub struct ClipSyncApp {
     transfer: Option<TransferUi>,
     pending_downloads: HashSet<String>,
     pending_cache: HashMap<String, String>,
+    /// 本帧末尾交给系统拖出（访达/资源管理器）。
+    pending_drag_out: Option<Vec<PathBuf>>,
     thumbnails: HashMap<String, ThumbEntry>,
     zoom: Option<String>,
     zoom_texture: Option<(String, TextureHandle)>,
@@ -107,11 +119,40 @@ pub struct ClipSyncApp {
     shot_visible: bool,
     /// When the app window will be gone long enough to grab the screen behind it.
     capture_at: Option<Instant>,
+    /// 这次冻屏是为了选录制区域，而不是截一张图。
+    record_pick: bool,
+    record_phase: RecordPhase,
+    /// 所有 ScreenCaptureKit 调用都排队给这条线程，主线程一次都不碰。
+    record_worker: record::Worker,
+    record_started: Option<Instant>,
+    record_path: Option<PathBuf>,
+    record_stop: Arc<AtomicBool>,
+    /// 录制期间定时唤醒主窗口：主窗口已经藏进托盘，eframe 不会再自己刷新，
+    /// 计时条和停止请求就都收不到消息了。
+    record_pump: Arc<AtomicBool>,
+    /// 录制条窗口出现后重刷一次内容过滤器，把它自己排除在录像之外。
+    record_exclude_sent: bool,
+    record_excluded: bool,
+    /// 录制条露脸之后再刷一次：万一隐藏窗口不在第一份排除名单里，这一下也把它摘掉。
+    record_rechecked: bool,
     /// 第二实例连上本机回环端口时发来的「请显示窗口」。
     show_rx: mpsc::Receiver<()>,
     tray: Option<Tray>,
     /// 设置页「退出」：允许真正关进程，普通点关闭只是藏窗。
     force_quit: bool,
+    /// 主窗口此刻是不是露着。录屏时要先收起来，录完再按原来的样子还回去。
+    window_visible: bool,
+    /// 开始录屏前主窗口是露着的：停止后要重新抬出来；本来是收进托盘的就不动。
+    record_restore_window: bool,
+    /// 为了冻屏把主窗口藏起来了，选完区域/截完图要还原。
+    capture_hidden_window: bool,
+    /// 设置页里「麦克风设备」的候选，打开对话框时刷新。
+    record_inputs: Vec<record::MicInput>,
+    /// 录完自动弹出的预览窗口；分享/下载/删除都在这里收。
+    record_preview: Option<preview::Preview>,
+    /// 预览窗口「下载」在后台读文件、写下载目录，结果从这里回来。
+    preview_save_tx: mpsc::Sender<Result<String, String>>,
+    preview_save_rx: mpsc::Receiver<Result<String, String>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -120,11 +161,26 @@ enum Screen {
     Settings,
 }
 
+/// 录屏的四态：开录和收尾都在工作线程上跑，主线程只等回信。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordPhase {
+    Idle,
+    /// 指令已发出，ScreenCaptureKit 还没回「开始」。
+    Preparing,
+    Recording,
+    /// 已请求停止，正在等 moov 写完并把文件读回来。
+    Stopping,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsChoice {
     Theme,
     Language,
     Retention,
+    RecordMode,
+    RecordSize,
+    RecordFps,
+    RecordMicDevice,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -142,6 +198,13 @@ enum SettingsAction {
     WatchFiles(bool),
     DeleteExpired(bool),
     ScreenshotKeepWindow(bool),
+    RecordHotkey,
+    RecordMode,
+    RecordSize,
+    RecordFps,
+    RecordMicDevice,
+    RecordMic(bool),
+    RecordSystem(bool),
     EditRoom,
     About,
     LeaveRoom,
@@ -218,8 +281,11 @@ enum Overlay {
         error: bool,
     },
     Hotkey {
+        record: bool,
         error: Option<String>,
     },
+    /// 点「发送文件」后的框：只有拖进这块区域才上传。
+    SendFile,
 }
 
 enum DialogAction {
@@ -241,7 +307,13 @@ enum DialogAction {
     SetLanguage(Language),
     SetRetention(u32),
     SetHotkey(String),
+    SetRecordHotkey(String),
+    SetRecordRegion(bool),
+    SetRecordLongEdge(i32),
+    SetRecordFps(u32),
+    SetRecordMicDevice(String),
     SaveNickname(String),
+    PickFiles,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -272,6 +344,8 @@ enum AppEvent {
     Open(String),
     Download(String),
     Zoom(String),
+    /// 从该条（或当前多选）拖出到访达/桌面。
+    DragOut(String),
     Menu(String, MenuAction),
     Share,
     Retry,
@@ -331,6 +405,7 @@ impl ClipSyncApp {
         let theme_mode = preferences.theme();
         let language = preferences.language();
         let autostart_available = autostart::is_available();
+        let (preview_save_tx, preview_save_rx) = mpsc::channel();
         let mut app = Self {
             engine,
             history,
@@ -369,6 +444,7 @@ impl ClipSyncApp {
             transfer: None,
             pending_downloads: HashSet::new(),
             pending_cache: HashMap::new(),
+            pending_drag_out: None,
             thumbnails: HashMap::new(),
             zoom: None,
             zoom_texture: None,
@@ -384,9 +460,26 @@ impl ClipSyncApp {
             shot: None,
             shot_visible: false,
             capture_at: None,
+            record_pick: false,
+            record_phase: RecordPhase::Idle,
+            record_worker: record::Worker::spawn(),
+            record_started: None,
+            record_path: None,
+            record_stop: Arc::new(AtomicBool::new(false)),
+            record_pump: Arc::new(AtomicBool::new(false)),
+            record_exclude_sent: false,
+            record_excluded: false,
+            record_rechecked: false,
             show_rx,
             tray,
             force_quit: false,
+            window_visible: true,
+            record_restore_window: false,
+            capture_hidden_window: false,
+            record_inputs: Vec::new(),
+            record_preview: None,
+            preview_save_tx,
+            preview_save_rx,
         };
         let restore = app.preferences.remember_room() && app.settings.session.is_some();
         if !app.preferences.remember_room() {
@@ -433,10 +526,28 @@ impl ClipSyncApp {
         }
     }
 
-    fn reveal_window(&self, ctx: &egui::Context) {
+    fn reveal_window(&mut self, ctx: &egui::Context) {
+        self.window_visible = true;
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
         ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+    }
+
+    /// 藏主窗口。录屏/冻屏都要先把它从屏幕上摘掉，否则录进去、冻进去的都是自己。
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        self.window_visible = false;
+        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+    }
+
+    /// 录屏结束：恢复主窗口透明度；本来收在托盘里的继续收着。
+    fn restore_record_window(&mut self, ctx: &egui::Context) {
+        crate::overlay::set_main_window_hidden(false);
+        if self.record_restore_window {
+            self.record_restore_window = false;
+            self.reveal_window(ctx);
+        } else {
+            self.hide_window(ctx);
+        }
     }
 
     fn drain_shell_signals(&mut self, ctx: &egui::Context) {
@@ -465,7 +576,7 @@ impl ClipSyncApp {
                 return;
             }
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            self.hide_window(ctx);
         }
     }
 
@@ -596,6 +707,12 @@ impl ClipSyncApp {
                 if let Some(path) = &done.local_path {
                     self.pending_cache.insert(done.id.clone(), path.clone());
                 }
+                // 录屏上传完成才有 clip id：预览里的「删除」要靠它把列表记录一起摘掉。
+                if let Some(preview) = self.record_preview.as_mut() {
+                    if preview.name() == done.name {
+                        preview.set_clip_id(done.id.clone());
+                    }
+                }
                 self.engine.publish_file(
                     FileUpload {
                         mid: done.id.clone(),
@@ -704,6 +821,7 @@ impl ClipSyncApp {
                         mime: file.mime().to_string(),
                         bytes,
                         target: UploadTarget::Publish { cache: true },
+                        cached: None,
                     });
                 }
             } else {
@@ -721,6 +839,7 @@ impl ClipSyncApp {
                 mime: image.mime().to_string(),
                 bytes: image.png,
                 target: UploadTarget::Publish { cache: true },
+                cached: None,
             }]);
         } else {
             self.record_local_file(&name, image.mime(), &image.png);
@@ -728,12 +847,23 @@ impl ClipSyncApp {
     }
 
     fn record_local_file(&mut self, name: &str, mime: &str, bytes: &[u8]) {
-        let ts = now_millis();
         let id = new_id();
         let path = crate::paths::write_cache(&id, name, bytes).ok();
+        self.record_file_entry(id, name, mime, bytes, path);
+    }
+
+    fn record_file_entry(
+        &mut self,
+        id: String,
+        name: &str,
+        mime: &str,
+        bytes: &[u8],
+        local_path: Option<String>,
+    ) {
+        let ts = now_millis();
         let sender_name = self.sender_name();
         self.history.add(Record {
-            id: id.clone(),
+            id,
             kind: KIND_FILE.to_string(),
             ts,
             sender_id: crate::paths::install_id(),
@@ -746,8 +876,8 @@ impl ClipSyncApp {
                 sha256: clipsync_core::crypto::sha256_hex(bytes),
                 link: String::new(),
                 expires_at: 0,
-                cached: path.is_some(),
-                local_path: path,
+                cached: local_path.is_some(),
+                local_path,
             }),
             pinned: false,
             order: 0,
@@ -779,7 +909,7 @@ impl ClipSyncApp {
         Some(JobContext {
             crypto: self.room_crypto.clone()?,
             client: self.client.clone(),
-            device_id: crate::paths::install_id(),
+            clip_topic: clip_topic(&self.room_hash),
         })
     }
 
@@ -888,11 +1018,26 @@ impl ClipSyncApp {
         self.overlay = None;
         self.pick_mode = false;
         self.picked.clear();
+        // 麦克风列表只在进设置页/开对话框时取一次：设备枚举不算便宜，别每帧都跑。
+        self.record_inputs = record::inputs();
     }
 
     fn close_settings(&mut self) {
         self.screen = Screen::Main;
         self.overlay = None;
+    }
+
+    /// 设置页上显示的输入设备名。存着的设备拔掉了就退回「系统默认」。
+    fn record_mic_label(&self) -> String {
+        let selected = self.preferences.record_mic_device();
+        if selected.is_empty() {
+            return "系统默认".to_string();
+        }
+        self.record_inputs
+            .iter()
+            .find(|input| input.id == selected)
+            .map(|input| input.name.clone())
+            .unwrap_or_else(|| "系统默认".to_string())
     }
 
     fn set_theme(&mut self, ctx: &egui::Context, mode: ThemeMode) {
@@ -977,10 +1122,18 @@ impl ClipSyncApp {
 
     fn apply_hotkey(&mut self) {
         let spec = self.preferences.screenshot_hotkey().to_string();
+        let record = self.preferences.record_hotkey().to_string();
+        let mut errors = Vec::new();
         if let Some(hotkeys) = self.hotkeys.as_mut() {
             if let Err(error) = hotkeys.apply(&spec) {
-                self.notify_error(error);
+                errors.push(error);
             }
+            if let Err(error) = hotkeys.apply_record(&record) {
+                errors.push(error);
+            }
+        }
+        for error in errors {
+            self.notify_error(error);
         }
     }
 
@@ -996,6 +1149,17 @@ impl ClipSyncApp {
         Ok(())
     }
 
+    fn set_record_hotkey(&mut self, spec: &str) -> Result<(), String> {
+        let result = match self.hotkeys.as_mut() {
+            Some(hotkeys) => hotkeys.apply_record(spec),
+            None => Ok(()),
+        };
+        result?;
+        self.preferences.set_record_hotkey(spec);
+        self.notify(format!("录屏快捷键已改为 {spec}"));
+        Ok(())
+    }
+
     /// Freeze the screen, then open the WeChat overlay on top of everything: the frame goes grey
     /// and the user picks a window with a click or draws a region before anything is cut.
     fn start_capture(&mut self, ctx: &egui::Context) {
@@ -1004,18 +1168,20 @@ impl ClipSyncApp {
         }
         if !screenshot::request_access() {
             self.notify_error(
-                "缺少屏幕录制权限：系统设置 → 隐私与安全性 → 屏幕与系统音频录制，勾上 ClipSyncRust",
+                "缺少屏幕录制权限：系统设置 → 隐私与安全性 → 屏幕与系统音频录制，勾上 ClipSyncRust；勾完要退出重开一次才生效",
             );
             return;
         }
-        // 对齐 Compose：默认保留本窗；关掉「截图时保留本窗口」才先藏起再抓，避免冻屏里出现自己。
+        // 对齐 Compose：截图默认保留本窗，关掉「截图时保留本窗口」才先藏起再抓。
+        // 录屏框选则一律先藏：冻屏只是框选时的背景，但用户不该在这层背景里又看见 ClipSync。
         // 透明 GL 窗被抓到也会是黑洞，所以藏窗时要留一帧时间让系统真正摘掉它。
-        if self.preferences.screenshot_keep_window() {
+        if !self.record_pick && self.preferences.screenshot_keep_window() {
             self.capture_at = Some(Instant::now());
             ctx.request_repaint();
         } else {
             self.capture_at = Some(Instant::now() + CAPTURE_HIDE_DELAY);
-            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            self.capture_hidden_window = self.window_visible;
+            self.hide_window(ctx);
             ctx.request_repaint_after(CAPTURE_HIDE_DELAY);
         }
     }
@@ -1033,10 +1199,17 @@ impl ClipSyncApp {
         self.capture_at = None;
         match screenshot::freeze() {
             Ok(freeze) => {
-                self.shot = Some(Arc::new(Mutex::new(overlay::Session::new(freeze))));
+                let record = self.record_pick;
+                let options = record_options(&self.preferences);
+                self.shot = Some(Arc::new(Mutex::new(overlay::Session::with_options(
+                    freeze, record, options,
+                ))));
             }
             Err(error) => {
-                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                if self.capture_hidden_window {
+                    self.capture_hidden_window = false;
+                    self.reveal_window(ctx);
+                }
                 self.notify_error(format!("截屏失败：{error}"));
             }
         }
@@ -1078,29 +1251,475 @@ impl ClipSyncApp {
             return;
         }
 
-        // None until the user is done, Some(None) for a cancelled shot, Some(Some) for a crop.
-        let shot = session.lock().ok().and_then(|mut guard| {
+        let record_pick = self.record_pick;
+        // None until the user is done.
+        let picked = session.lock().ok().and_then(|mut guard| {
             let outcome = guard.take_outcome()?;
             Some(match outcome {
                 overlay::Outcome::Cancel => None,
-                overlay::Outcome::Crop(rect) => {
+                overlay::Outcome::StartRecording { rect, options } if record_pick => {
+                    Some(Err((rect, options)))
+                }
+                overlay::Outcome::StartRecording { .. } => None,
+                overlay::Outcome::Crop { rect, marks } => {
                     let image = guard.take_image()?;
                     let size = Vec2::new(image.width() as f32, image.height() as f32);
                     let (x, y, width, height) = overlay::crop_px(rect, size, guard.scale());
                     let cropped = image::imageops::crop_imm(&image, x, y, width, height).to_image();
-                    screenshot::encode(cropped).ok()
+                    screenshot::encode(cropped, &marks, (x, y), guard.scale())
+                        .ok()
+                        .map(Ok)
                 }
             })
         });
-        let Some(shot) = shot else { return };
+        let Some(picked) = picked else { return };
         overlay::reveal(ctx, false);
         self.shot_visible = false;
         self.shot = None;
-        // 框选/取消结束后再抬主窗，避免截屏过程中毛玻璃窗叠在遮罩上
-        self.reveal_window(ctx);
-        if let Some(shot) = shot {
-            self.commit_shot(shot);
+        self.record_pick = false;
+        // 录屏不要把主窗抬回来：用户按下快捷键时它可能还在托盘里，抬出来就是「录屏时窗口又蹦出来」。
+        // 截屏/取消才还原；录屏开始前先把窗口藏好，停止后再按原来的样子还回去。
+        match picked {
+            Some(Ok(shot)) => {
+                if self.capture_hidden_window {
+                    self.capture_hidden_window = false;
+                    self.reveal_window(ctx);
+                }
+                self.commit_shot(shot);
+            }
+            Some(Err((rect, options))) => {
+                // 不要在这里先藏窗：begin_recording 要靠 window_visible 记住录前是不是露着的，
+                // 提前藏掉会让录完的窗口再也回不来。
+                self.apply_record_options(&options);
+                self.begin_recording(
+                    ctx,
+                    rect.min.x,
+                    rect.min.y,
+                    rect.width(),
+                    rect.height(),
+                    options,
+                );
+            }
+            None => {
+                if self.capture_hidden_window {
+                    self.capture_hidden_window = false;
+                    self.reveal_window(ctx);
+                }
+            }
         }
+    }
+
+    fn toggle_recording(&mut self, ctx: &egui::Context) {
+        match self.record_phase {
+            RecordPhase::Recording => {
+                self.stop_recording(ctx);
+                return;
+            }
+            RecordPhase::Preparing | RecordPhase::Stopping => {
+                self.notify("上一条录屏指令还在处理，稍等一下");
+                return;
+            }
+            RecordPhase::Idle => {}
+        }
+        if self.shot.is_some() || self.capture_at.is_some() {
+            return;
+        }
+        if !screenshot::request_access() {
+            self.notify_error(
+                "缺少屏幕录制权限：系统设置 → 隐私与安全性 → 屏幕与系统音频录制，勾上 ClipSyncRust；勾完要退出重开一次才生效",
+            );
+            return;
+        }
+        if self.preferences.record_region() {
+            self.record_pick = true;
+            self.start_capture(ctx);
+        } else {
+            let options = record_options(&self.preferences);
+            self.begin_recording(ctx, 0.0, 0.0, 0.0, 0.0, options);
+        }
+    }
+
+    fn begin_recording(
+        &mut self,
+        ctx: &egui::Context,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        options: overlay::RecordOptions,
+    ) {
+        if self.record_phase != RecordPhase::Idle {
+            return;
+        }
+        let dir = std::env::temp_dir().join("clipsync-recordings");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("recording-{}.mp4", new_id()));
+        self.record_phase = RecordPhase::Preparing;
+        self.record_started = None;
+        self.record_path = Some(path.clone());
+        self.record_exclude_sent = false;
+        self.record_excluded = false;
+        self.record_rechecked = false;
+        self.record_stop.store(false, Ordering::Relaxed);
+        // 主窗口马上要藏起来，eframe 不会再主动跑 tick；开一个轻量泵定时唤醒根窗口，
+        // 让 Started 回信、计时和停止请求都能被处理。停止/失败时把开关放下。
+        self.record_pump.store(true, Ordering::Relaxed);
+        let pump = self.record_pump.clone();
+        let pump_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            while pump.load(Ordering::Relaxed) {
+                pump_ctx.request_repaint_of(egui::ViewportId::ROOT);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        // 录像里不该有我们自己的窗口，也不该在开录瞬间蹦出来：先藏好，记下原来是不是露着的，
+        // 停止后再决定要不要抬回来（本来收在托盘里就继续收着）。
+        self.record_restore_window = self.window_visible || self.capture_hidden_window;
+        self.capture_hidden_window = false;
+        // 录制操作栏是主窗口的 deferred 子窗口：主窗口一藏，它也会跟着消失。
+        // 录屏时把主窗口调成透明并让鼠标穿透，用户看不见也点不到，子窗口还能正常显示。
+        self.window_visible = false;
+        crate::overlay::set_main_window_hidden(true);
+        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+        self.record_worker
+            .send(record::Job::Start(record::StartSpec {
+                x: x as f64,
+                y: y as f64,
+                w: w as f64,
+                h: h as f64,
+                mic: options.mic,
+                system_audio: options.system_audio,
+                fps: options.quality.fps() as i32,
+                long_edge: options.quality.long_edge(),
+                mic_device: options.mic_device,
+                path,
+            }));
+        ctx.request_repaint_after_for(Duration::from_millis(80), egui::ViewportId::ROOT);
+    }
+
+    /// 工具条选过的画质和声音来源写回设置，下次打开沿用。
+    fn apply_record_options(&mut self, options: &overlay::RecordOptions) {
+        self.preferences
+            .set_record_long_edge(options.quality.long_edge());
+        self.preferences.set_record_fps(options.quality.fps());
+        self.preferences
+            .set_record_system_audio(options.system_audio);
+        self.preferences.set_record_mic(options.mic);
+        self.preferences.set_record_mic_device(&options.mic_device);
+    }
+
+    fn on_record_started(&mut self, ctx: &egui::Context, result: Result<(), String>) {
+        if self.record_phase != RecordPhase::Preparing {
+            return;
+        }
+        match result {
+            Ok(()) => {
+                self.record_phase = RecordPhase::Recording;
+                self.record_started = Some(Instant::now());
+                let hotkey = self.preferences.record_hotkey().to_string();
+                self.notify(format!(
+                    "录屏已开始：再按一次 {hotkey}，或点顶部计时条上的「结束录制」"
+                ));
+            }
+            Err(error) => {
+                self.record_phase = RecordPhase::Idle;
+                self.record_pump.store(false, Ordering::Relaxed);
+                if let Some(path) = self.record_path.take() {
+                    let _ = std::fs::remove_file(path);
+                }
+                // 开录失败时把窗口还回去，不然用户连错误提示都看不到。
+                self.restore_record_window(ctx);
+                self.notify_error(error);
+            }
+        }
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
+
+    fn stop_recording(&mut self, ctx: &egui::Context) {
+        if self.record_phase != RecordPhase::Recording {
+            return;
+        }
+        let Some(path) = self.record_path.clone() else {
+            self.record_phase = RecordPhase::Idle;
+            self.record_pump.store(false, Ordering::Relaxed);
+            return;
+        };
+        self.record_phase = RecordPhase::Stopping;
+        self.record_started = None;
+        self.record_worker.send(record::Job::Stop(path));
+        ctx.request_repaint_after(Duration::from_millis(120));
+    }
+
+    fn on_record_stopped(
+        &mut self,
+        ctx: &egui::Context,
+        stop_error: Option<String>,
+        bytes: Vec<u8>,
+    ) {
+        if self.record_phase != RecordPhase::Stopping {
+            return;
+        }
+        self.record_phase = RecordPhase::Idle;
+        self.record_pump.store(false, Ordering::Relaxed);
+        self.record_exclude_sent = false;
+        self.record_excluded = false;
+        self.record_rechecked = false;
+        // 开录前窗口是露着的才抬回来；本来收在托盘里就继续收着。
+        self.restore_record_window(ctx);
+        let Some(temp) = self.record_path.take() else {
+            return;
+        };
+        // 没收尾的 mp4 没有 moov，播放器打不开；宁可丢掉也不能当成功写进列表。
+        if !crate::record::is_finished(&bytes) {
+            let _ = std::fs::remove_file(&temp);
+            let reason = stop_error.unwrap_or_else(|| "录像没有正常收尾".to_string());
+            self.notify_error(format!("{reason}，文件不完整，已丢弃"));
+            return;
+        }
+        let id = new_id();
+        let name = format!("录屏-{}.mp4", &id[..8]);
+        // 预览和列表要同一条真实路径；adopt 失败时再写一份缓存兜底。
+        let cached = crate::paths::adopt_cache(&id, &name, &temp)
+            .ok()
+            .or_else(|| crate::paths::write_cache(&id, &name, &bytes).ok());
+        if let Some(path) = cached.as_ref() {
+            let _ = self.clipboard.write_files(&[PathBuf::from(path)]);
+        }
+        // 缓存写失败也别把预览吞掉：临时文件还在，先让用户能看能删。
+        let preview_path = cached
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| temp.clone());
+        self.record_preview = Some(preview::Preview::open(preview_path, name.clone()));
+        if bytes.len() as i64 > MAX_FILE_BYTES {
+            let clip_id = id.clone();
+            self.record_file_entry(id, &name, "video/mp4", &bytes, cached);
+            if let Some(preview) = self.record_preview.as_mut() {
+                preview.set_clip_id(clip_id);
+            }
+            self.notify(format!(
+                "录像已留在本机，超过 {}MB 无法同步",
+                clipsync_core::files::max_mb()
+            ));
+            return;
+        }
+        if matches!(self.status, Status::Online { .. }) && self.room_crypto.is_some() {
+            self.start_uploads(vec![UploadRequest {
+                name,
+                mime: "video/mp4".to_string(),
+                bytes,
+                target: UploadTarget::Publish { cache: true },
+                cached,
+            }]);
+            self.notify("录像已存进列表，也放进了剪贴板");
+        } else {
+            let clip_id = id.clone();
+            self.record_file_entry(id, &name, "video/mp4", &bytes, cached);
+            if let Some(preview) = self.record_preview.as_mut() {
+                preview.set_clip_id(clip_id);
+            }
+            self.notify("录像已留在本机列表，也放进了剪贴板");
+        }
+    }
+
+    /// 收录屏工作线程的回信，推进状态机。
+    fn drain_record(&mut self, ctx: &egui::Context) {
+        while let Some(event) = self.record_worker.poll() {
+            match event {
+                record::Event::Started(result) => self.on_record_started(ctx, result),
+                record::Event::Excluded(result) => {
+                    if self.record_phase == RecordPhase::Recording {
+                        self.record_excluded = result.is_ok();
+                        ctx.request_repaint();
+                    }
+                }
+                record::Event::Stopped { error, bytes } => {
+                    self.on_record_stopped(ctx, error, bytes);
+                }
+            }
+        }
+    }
+
+    fn service_recording(&mut self, ctx: &egui::Context) {
+        let id = egui::ViewportId::from_hash_of("record-bar");
+        if self.record_stop.swap(false, Ordering::Relaxed) {
+            self.stop_recording(ctx);
+        }
+        if self.record_phase == RecordPhase::Idle {
+            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Visible(false));
+            return;
+        }
+        if self.record_phase == RecordPhase::Preparing {
+            // 录制条等真的开录了再露面：它出现在排除快照之前，提前建就会录进片头。
+            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Visible(false));
+            ctx.request_repaint_after(Duration::from_millis(60));
+            return;
+        }
+        let stopping = self.record_phase == RecordPhase::Stopping;
+        let mut secs = 0u64;
+        let mut visible = true;
+        if !stopping {
+            let Some(started) = self.record_started else {
+                ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Visible(false));
+                return;
+            };
+            let elapsed = started.elapsed();
+            if elapsed >= Duration::from_secs(RECORD_LIMIT_SEC) {
+                self.stop_recording(ctx);
+                self.notify("已录满 120 分钟，自动停了");
+                return;
+            }
+            // 录制条是开录后才建的窗口，开录时的排除快照里没有它：先建好但藏着，重刷过滤器把它
+            // 摘出去，再让它见人。拿不到就退回到看得见为准，不能让录制条永远不出现。
+            if !self.record_exclude_sent && elapsed >= Duration::from_millis(150) {
+                self.record_exclude_sent = true;
+                self.record_worker.send(record::Job::Exclude);
+            }
+            if self.record_excluded
+                && !self.record_rechecked
+                && elapsed >= Duration::from_millis(700)
+            {
+                self.record_rechecked = true;
+                self.record_worker.send(record::Job::Exclude);
+            }
+            secs = elapsed.as_secs();
+            visible = self.record_excluded || elapsed >= Duration::from_secs(1);
+        }
+        let stop = self.record_stop.clone();
+        let label = if stopping {
+            "正在保存…".to_string()
+        } else {
+            format!(
+                "{} / {}",
+                record_clock(secs),
+                record_clock(RECORD_LIMIT_SEC)
+            )
+        };
+        ctx.show_viewport_deferred(
+            id,
+            egui::ViewportBuilder::default()
+                .with_title("ClipSyncRust 录制")
+                .with_decorations(false)
+                .with_always_on_top()
+                .with_resizable(false)
+                .with_inner_size([RECORD_BAR_WIDTH, RECORD_BAR_HEIGHT])
+                .with_taskbar(false)
+                .with_visible(visible),
+            move |ui, _| {
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::NONE
+                            .fill(Color32::from_black_alpha(240))
+                            .corner_radius(28)
+                            .inner_margin(Margin::symmetric(18, 10))
+                            .stroke(Stroke::new(
+                                1.0,
+                                Color32::from_rgba_unmultiplied(0xff, 0x45, 0x3a, 170),
+                            )),
+                    )
+                    .show_inside(ui, |ui| {
+                        ui.horizontal_centered(|ui| {
+                            let (dot, _) =
+                                ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                            ui.painter().circle_filled(dot.center(), 5.0, RECORD_RED);
+                            ui.add_space(10.0);
+                            ui.label(
+                                RichText::new(label.clone())
+                                    .color(Color32::WHITE)
+                                    .size(14.0)
+                                    .monospace(),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if !stopping {
+                                    let button = egui::Button::new(
+                                        RichText::new("结束录制").color(Color32::WHITE).size(13.0),
+                                    )
+                                    .fill(RECORD_RED)
+                                    .corner_radius(18)
+                                    .min_size(Vec2::new(88.0, 36.0));
+                                    if ui.add(button).clicked() {
+                                        stop.store(true, Ordering::Relaxed);
+                                        ui.ctx().request_repaint();
+                                    }
+                                }
+                            });
+                        });
+                    });
+            },
+        );
+        let monitor = ctx
+            .input(|i| i.viewport().monitor_size)
+            .unwrap_or(Vec2::new(1440.0, 900.0));
+        // 和录屏工具条同一个位置：顶部居中、菜单栏下面。录制过程中它一直留在那儿。
+        let position = Pos2::new(
+            ((monitor.x - RECORD_BAR_WIDTH) / 2.0).max(0.0),
+            (crate::overlay::top_inset() + RECORD_BAR_TOP_GAP).max(0.0),
+        );
+        ctx.send_viewport_cmd_to(id, egui::ViewportCommand::OuterPosition(position));
+        ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Visible(visible));
+        ctx.request_repaint_after(if visible {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_millis(100)
+        });
+    }
+
+    /// 录后预览窗口：保持 viewport 注册、收回动作、把下载结果变成提示。
+    fn service_preview(&mut self, ctx: &egui::Context) {
+        while let Ok(result) = self.preview_save_rx.try_recv() {
+            match result {
+                Ok(written) => self.notify(format!("已存到下载目录：{written}")),
+                Err(error) => self.notify_error(error),
+            }
+        }
+        let Some(mut preview) = self.record_preview.take() else {
+            return;
+        };
+        preview.show(ctx);
+        match preview.take_action() {
+            None => {}
+            Some(preview::Action::Close) => {
+                preview.close(ctx);
+                return;
+            }
+            Some(preview::Action::Share) => {
+                let path = PathBuf::from(preview.path());
+                if !path.is_file() {
+                    self.notify_error("文件已经不在，无法分享");
+                } else if self.clipboard.write_files(&[path]) {
+                    self.notify("录像已放进剪贴板，可直接粘贴");
+                } else {
+                    self.notify_error("写入剪贴板失败");
+                }
+            }
+            Some(preview::Action::Download) => {
+                let path = PathBuf::from(preview.path());
+                let name = preview.name().to_string();
+                let tx = self.preview_save_tx.clone();
+                std::thread::spawn(move || {
+                    let result = match std::fs::read(&path) {
+                        Ok(bytes) => crate::paths::save_to_downloads(&name, &bytes)
+                            .map_err(|error| format!("保存失败：{error}")),
+                        Err(error) => Err(format!("读取录像失败：{error}")),
+                    };
+                    let _ = tx.send(result);
+                });
+            }
+            Some(preview::Action::Delete) => {
+                let clip_id = preview.clip_id().map(str::to_string);
+                let path = preview.path().to_string();
+                if let Some(id) = clip_id {
+                    self.history.remove(&[id]);
+                    self.history.flush();
+                }
+                // 记录不在列表里（还在上传）时，remove 不会碰文件，这里补一刀。
+                crate::paths::delete_cache(Some(&path));
+                preview.close(ctx);
+                self.notify("已删除这段录像");
+                return;
+            }
+        }
+        self.record_preview = Some(preview);
     }
 
     fn commit_shot(&mut self, shot: screenshot::Shot) {
@@ -1224,7 +1843,7 @@ impl ClipSyncApp {
                         .id_salt("settings-scroll")
                         .auto_shrink([false, false])
                         .scroll_bar_visibility(
-                            egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                            egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
                         )
                         .show(ui, |ui| {
                             ui.set_width(width);
@@ -1245,6 +1864,102 @@ impl ClipSyncApp {
                                     language_label(self.language),
                                 ) {
                                     action = Some(SettingsAction::Language);
+                                }
+                            });
+                            ui.add_space(14.0);
+
+                            // 录屏/截屏放最前面：窗口不高，放到底下要滚很久，用户会以为没有这些设置。
+                            let record_hotkey = self.preferences.record_hotkey().to_string();
+                            let region = self.preferences.record_region();
+                            let mic = self.preferences.record_mic();
+                            let system_audio = self.preferences.record_system_audio();
+                            let long_edge = self.preferences.record_long_edge();
+                            let fps = self.preferences.record_fps();
+                            let mic_device = self.record_mic_label();
+                            let size_label = match long_edge {
+                                1920 => "1080p",
+                                1280 => "720p",
+                                _ => "原始",
+                            };
+                            settings_group(ui, "录屏", |ui| {
+                                if self.hotkeys.is_some() {
+                                    if settings_nav_row(ui, "录屏快捷键", &record_hotkey) {
+                                        action = Some(SettingsAction::RecordHotkey);
+                                    }
+                                    settings_footnote(
+                                        ui,
+                                        "点这一行，然后按下要使用的组合键。再按一次或点停止条结束，最长 60 秒",
+                                    );
+                                    settings_divider(ui);
+                                }
+                                if settings_nav_row(
+                                    ui,
+                                    "录制范围",
+                                    if region { "区域" } else { "整屏" },
+                                ) {
+                                    action = Some(SettingsAction::RecordMode);
+                                }
+                                settings_divider(ui);
+                                if settings_nav_row(ui, "画面大小", size_label) {
+                                    action = Some(SettingsAction::RecordSize);
+                                }
+                                settings_divider(ui);
+                                if settings_nav_row(ui, "帧率", &format!("{fps} fps")) {
+                                    action = Some(SettingsAction::RecordFps);
+                                }
+                                settings_divider(ui);
+                                if settings_switch_row(
+                                    ui,
+                                    "录麦克风",
+                                    "说话声混进录像。关掉就只有画面和系统声（若系统声也开着）",
+                                    mic,
+                                ) {
+                                    action = Some(SettingsAction::RecordMic(!mic));
+                                }
+                                if mic {
+                                    settings_divider(ui);
+                                    if settings_nav_row(ui, "麦克风设备", &mic_device) {
+                                        action = Some(SettingsAction::RecordMicDevice);
+                                    }
+                                    settings_footnote(
+                                        ui,
+                                        "用哪个输入设备。选「系统默认」就跟着系统当前输入走",
+                                    );
+                                }
+                                settings_divider(ui);
+                                if settings_switch_row(
+                                    ui,
+                                    "录系统声音",
+                                    "电脑正在播放的声音。和麦克风可以同时开",
+                                    system_audio,
+                                ) {
+                                    action = Some(SettingsAction::RecordSystem(!system_audio));
+                                }
+                            });
+                            ui.add_space(14.0);
+
+                            let hotkey = self.preferences.screenshot_hotkey().to_string();
+                            let keep_window = self.preferences.screenshot_keep_window();
+                            settings_group(ui, "截屏", |ui| {
+                                if self.hotkeys.is_some() {
+                                    if settings_nav_row(ui, "截屏快捷键", &hotkey) {
+                                        action = Some(SettingsAction::Hotkey);
+                                    }
+                                    settings_footnote(
+                                        ui,
+                                        "点这一行，然后按下要使用的组合键。按一下快捷键打开框选：图进剪贴板，也存进列表",
+                                    );
+                                    settings_divider(ui);
+                                }
+                                if settings_switch_row(
+                                    ui,
+                                    "截图时保留本窗口",
+                                    "开着时冻屏里还能看见 ClipSyncRust；关掉会先藏起本窗口再截，画面里就不会出现自己",
+                                    keep_window,
+                                ) {
+                                    action = Some(SettingsAction::ScreenshotKeepWindow(
+                                        !keep_window,
+                                    ));
                                 }
                             });
                             ui.add_space(14.0);
@@ -1343,32 +2058,6 @@ impl ClipSyncApp {
                                 }
                             });
                             ui.add_space(14.0);
-
-                            let hotkey = self.preferences.screenshot_hotkey().to_string();
-                            let keep_window = self.preferences.screenshot_keep_window();
-                            if self.hotkeys.is_some() {
-                                settings_group(ui, "截屏", |ui| {
-                                    if settings_nav_row(ui, "截屏快捷键", &hotkey) {
-                                        action = Some(SettingsAction::Hotkey);
-                                    }
-                                    settings_footnote(
-                                        ui,
-                                        "按一下打开框选：切好的图进剪贴板，也存进列表发给同屋",
-                                    );
-                                    settings_divider(ui);
-                                    if settings_switch_row(
-                                        ui,
-                                        "截图时保留本窗口",
-                                        "开着时冻屏里还能看见 ClipSyncRust；关掉会先藏起本窗口再截，画面里就不会出现自己",
-                                        keep_window,
-                                    ) {
-                                        action = Some(SettingsAction::ScreenshotKeepWindow(
-                                            !keep_window,
-                                        ));
-                                    }
-                                });
-                                ui.add_space(14.0);
-                            }
 
                             let delete_expired = self.preferences.delete_expired();
                             let retention = self.preferences.retention_days();
@@ -1507,7 +2196,25 @@ impl ClipSyncApp {
             SettingsAction::Theme => self.open(Overlay::Choice(SettingsChoice::Theme)),
             SettingsAction::Language => self.open(Overlay::Choice(SettingsChoice::Language)),
             SettingsAction::Retention => self.open(Overlay::Choice(SettingsChoice::Retention)),
-            SettingsAction::Hotkey => self.open(Overlay::Hotkey { error: None }),
+            SettingsAction::Hotkey => self.open(Overlay::Hotkey {
+                record: false,
+                error: None,
+            }),
+            SettingsAction::RecordHotkey => self.open(Overlay::Hotkey {
+                record: true,
+                error: None,
+            }),
+            SettingsAction::RecordMode => self.open(Overlay::Choice(SettingsChoice::RecordMode)),
+            SettingsAction::RecordSize => self.open(Overlay::Choice(SettingsChoice::RecordSize)),
+            SettingsAction::RecordFps => self.open(Overlay::Choice(SettingsChoice::RecordFps)),
+            SettingsAction::RecordMicDevice => {
+                self.record_inputs = record::inputs();
+                self.open(Overlay::Choice(SettingsChoice::RecordMicDevice));
+            }
+            SettingsAction::RecordMic(enabled) => self.preferences.set_record_mic(enabled),
+            SettingsAction::RecordSystem(enabled) => {
+                self.preferences.set_record_system_audio(enabled);
+            }
             SettingsAction::Nickname => self.open(Overlay::Nickname {
                 input: self.preferences.nickname().to_string(),
             }),
@@ -1685,18 +2392,39 @@ impl ClipSyncApp {
                 id: id.to_string(),
                 ts: record.ts,
             },
+            cached: None,
         }]);
     }
 
     fn pick_files(&mut self) {
-        if !matches!(self.status, Status::Online { .. }) || self.room_crypto.is_none() {
-            return;
-        }
         let Some(paths) = rfd::FileDialog::new().pick_files() else {
             return;
         };
+        self.ingest_paths(paths);
+    }
+
+    /// 选择器与窗口拖入共用：未进房明确报错；目录跳过；普通文件走现有上传。
+    fn ingest_paths(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        if !matches!(self.status, Status::Online { .. }) || self.room_crypto.is_none() {
+            self.notify_error("进房间后才能发送文件");
+            return;
+        }
         let mut uploads = Vec::new();
         for path in paths {
+            if path.is_dir() {
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                self.notify_error(format!("跳过了文件夹：{name}"));
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
             let name = path
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
@@ -1722,6 +2450,7 @@ impl ClipSyncApp {
                 mime: clipsync_core::files::mime_for_name(&name).to_string(),
                 bytes,
                 target: UploadTarget::Publish { cache: false },
+                cached: None,
             });
         }
         self.start_uploads(uploads);
@@ -2066,6 +2795,10 @@ impl ClipSyncApp {
             .collect()
     }
 
+    fn visible_count(&self) -> usize {
+        visible_count(&self.history, &self.query, self.regex, self.case_sensitive)
+    }
+
     fn move_cursor(&mut self, visible: &[String], delta: isize, extend: bool) {
         if visible.is_empty() {
             self.cursor = None;
@@ -2314,6 +3047,7 @@ impl ClipSyncApp {
             AppEvent::Open(id) => self.open_record(&id),
             AppEvent::Download(id) => self.download_record(&id),
             AppEvent::Zoom(id) => self.open_zoom(&id),
+            AppEvent::DragOut(id) => self.queue_drag_out(&id),
             AppEvent::Menu(id, action) => self.handle_menu(id, action),
             AppEvent::Share => self.open(Overlay::Share),
             AppEvent::Retry => {
@@ -2321,6 +3055,22 @@ impl ClipSyncApp {
                 self.status = Status::Connecting;
             }
         }
+    }
+
+    /// 多选时拖其中一条则拖整批；文本→临时 txt，已缓存文件走本机路径。
+    fn queue_drag_out(&mut self, id: &str) {
+        let ids: Vec<String> = if self.pick_mode && self.picked.contains(id) {
+            self.picked.iter().cloned().collect()
+        } else {
+            vec![id.to_string()]
+        };
+        let records: Vec<&Record> = ids.iter().filter_map(|rid| self.record(rid)).collect();
+        let paths = crate::drag_out::prepare_paths(&records);
+        if paths.is_empty() {
+            self.notify_error("没有可拖出的本机文件（文本会生成 txt，文件需已下载）");
+            return;
+        }
+        self.pending_drag_out = Some(paths);
     }
 
     fn handle_menu(&mut self, id: String, action: MenuAction) {
@@ -2459,15 +3209,28 @@ impl ClipSyncApp {
         self.drain_events();
         self.drain_jobs();
         self.drain_updates();
+        self.drain_record(ctx);
+        if self
+            .hotkeys
+            .as_ref()
+            .is_some_and(|hotkeys| hotkeys.take_record_pressed())
+        {
+            self.toggle_recording(ctx);
+        }
         if self
             .hotkeys
             .as_ref()
             .is_some_and(|hotkeys| hotkeys.take_pressed())
+            && self.record_phase == RecordPhase::Idle
         {
+            self.record_pick = false;
             self.start_capture(ctx);
         }
         self.take_capture(ctx);
         self.service_shot(ctx);
+        self.service_recording(ctx);
+        self.service_preview(ctx);
+        self.poll_file_drops(ctx);
         self.poll_clipboard();
         self.poll_translation();
         self.expire_toast();
@@ -2475,17 +3238,96 @@ impl ClipSyncApp {
             self.update,
             UpdateState::Checking | UpdateState::Downloading { .. }
         );
+        let drop_hover = self.file_drop_hovering(ctx);
         let wait = if self.toast.is_some()
             || self.translate_rx.is_some()
             || self.transfer.is_some()
             || !self.pending_downloads.is_empty()
             || update_busy
+            || drop_hover
         {
             Duration::from_millis(120)
         } else {
             POLL_INTERVAL
         };
         ctx.request_repaint_after(wait);
+    }
+
+    /// 主屏且没有对话框/截屏遮罩时才接拖入。
+    fn accepts_file_drops(&self) -> bool {
+        self.screen == Screen::Main
+            && self.overlay.is_none()
+            && self.shot.is_none()
+            && !self.shot_visible
+    }
+
+    fn file_drop_hovering(&self, ctx: &egui::Context) -> bool {
+        self.accepts_file_drops() && ctx.input(|i| !i.raw.hovered_files.is_empty())
+    }
+
+    fn poll_file_drops(&mut self, ctx: &egui::Context) {
+        let send_file = matches!(self.overlay, Some(Overlay::SendFile));
+        if !self.accepts_file_drops() && !send_file {
+            return;
+        }
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path().to_path_buf())
+                .collect()
+        });
+        if dropped.is_empty() {
+            return;
+        }
+        if send_file && !self.drop_inside_send_file(ctx) {
+            return;
+        }
+        if send_file {
+            self.overlay = None;
+        }
+        self.ingest_paths(dropped);
+    }
+
+    /// 松手点在发送文件框里，或上一帧光标还在框里（松手当帧坐标有时已经空了）。
+    fn drop_inside_send_file(&self, ctx: &egui::Context) -> bool {
+        let zone = ctx.data(|data| data.get_temp::<Rect>(Id::new("send-file-zone")));
+        let hot = ctx
+            .data(|data| data.get_temp::<bool>(Id::new("send-file-hot")))
+            .unwrap_or(false);
+        let pos = ctx.input(|input| input.pointer.hover_pos());
+        match (zone, pos) {
+            (Some(rect), Some(pos)) => rect.contains(pos) || hot,
+            (Some(_), None) => hot,
+            _ => false,
+        }
+    }
+
+    fn paint_drop_overlay(&self, ctx: &egui::Context) {
+        if !self.file_drop_hovering(ctx) {
+            return;
+        }
+        let screen = ctx.content_rect();
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            Order::Foreground,
+            Id::new("file-drop-overlay"),
+        ));
+        painter.rect_filled(screen, 0.0, Color32::from_black_alpha(110));
+        let label = "松开以发送文件";
+        let font = FontId::proportional(16.0);
+        let galley =
+            ctx.fonts_mut(|fonts| fonts.layout_no_wrap(label.to_string(), font, theme::p().text));
+        let pad = Vec2::new(28.0, 18.0);
+        let size = galley.size() + pad * 2.0;
+        let card = Rect::from_center_size(screen.center(), size);
+        painter.rect(
+            card,
+            CornerRadius::same(18),
+            theme::with_alpha(theme::p().surface, 235),
+            Stroke::new(2.0, theme::with_alpha(theme::p().accent, 220)),
+            StrokeKind::Inside,
+        );
+        painter.galley(card.min + pad, galley, theme::p().text);
     }
 
     fn draw(&mut self, ui: &mut Ui) {
@@ -2574,6 +3416,7 @@ impl ClipSyncApp {
         }
 
         self.selection_bar(&ctx);
+        self.paint_drop_overlay(&ctx);
         self.show_toast(&ctx);
         self.show_overlay(&ctx);
         self.ensure_zoom(&ctx);
@@ -2587,8 +3430,11 @@ impl eframe::App for ClipSyncApp {
         self.tick(ctx);
     }
 
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         self.draw(ui);
+        if let Some(paths) = self.pending_drag_out.take() {
+            crate::drag_out::begin(frame, paths);
+        }
     }
 }
 
@@ -2801,7 +3647,7 @@ impl ClipSyncApp {
                 });
             }
             if icons::icon_button(ui, Icon::Attach, online, "发送文件").clicked() {
-                self.pick_files();
+                self.open(Overlay::SendFile);
             }
             let select_tip = if self.pick_mode {
                 "退出多选"
@@ -2830,6 +3676,17 @@ impl ClipSyncApp {
                 .clicked()
             {
                 self.ask_delete();
+            }
+            // 条数跟着当前搜索走：搜着的是命中数，清空搜索就是全部。
+            let total = self.visible_count();
+            if total > 0 {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("共 {total} 条记录"))
+                            .font(FontId::proportional(11.5))
+                            .color(theme::p().muted),
+                    );
+                });
             }
         });
     }
@@ -2976,7 +3833,7 @@ impl ClipSyncApp {
         }
         if !self.mismatch.is_empty() {
             let text = format!(
-                "同屋的 {} 安全码与本机不一致：多半是某一端的房间密码打错了，两边收不到彼此的剪贴板",
+                "同屋的 {} 发来的东西本机解不开：多半是某一端的房间密码打错了，两边收不到彼此的剪贴板",
                 self.mismatch.join("、")
             );
             banner(ui, Icon::Warning, theme::p().red, true, &text, None);
@@ -3366,7 +4223,7 @@ impl ClipSyncApp {
                         ui.add_space(12.0);
                         field_label(ui, "同屋设备");
                         ui.add_space(4.0);
-                        if self.peers.is_empty() {
+                        if self.peers.is_empty() && self.mismatch.is_empty() {
                             hint(ui, "暂时没有其他设备。");
                         } else {
                             for peer in &self.peers {
@@ -3386,26 +4243,37 @@ impl ClipSyncApp {
                                     ui.with_layout(
                                         Layout::right_to_left(Align::Center),
                                         |ui| {
-                                            let (label, color) = if !connected {
-                                                ("未知", theme::p().faint)
-                                            } else if safety
-                                                .as_deref()
-                                                .is_some_and(|mine| {
-                                                    !peer.safety.is_empty()
-                                                        && mine.starts_with(&peer.safety)
-                                                })
-                                            {
+                                            let (label, color) = if connected {
                                                 ("一致", theme::p().green)
-                                            } else if peer.safety.is_empty() {
-                                                ("未知", theme::p().faint)
                                             } else {
-                                                ("不一致", theme::p().red)
+                                                ("未知", theme::p().faint)
                                             };
                                             ui.label(
                                                 RichText::new(label)
                                                     .size(11.0)
                                                     .strong()
                                                     .color(color),
+                                            );
+                                        },
+                                    );
+                                });
+                                ui.add_space(6.0);
+                            }
+                            for label in &self.mismatch {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(label)
+                                            .size(12.5)
+                                            .color(theme::p().text),
+                                    );
+                                    ui.with_layout(
+                                        Layout::right_to_left(Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                RichText::new("解不开")
+                                                    .size(11.0)
+                                                    .strong()
+                                                    .color(theme::p().red),
                                             );
                                         },
                                     );
@@ -3540,6 +4408,48 @@ impl ClipSyncApp {
                                     })
                                     .unwrap_or(1),
                             ),
+                            SettingsChoice::RecordMode => (
+                                "录制范围",
+                                Icon::Select,
+                                vec!["区域".to_string(), "整屏".to_string()],
+                                if self.preferences.record_region() { 0 } else { 1 },
+                            ),
+                            SettingsChoice::RecordSize => (
+                                "画面大小",
+                                Icon::Select,
+                                vec!["原始".to_string(), "1080p".to_string(), "720p".to_string()],
+                                match self.preferences.record_long_edge() {
+                                    1920 => 1,
+                                    1280 => 2,
+                                    _ => 0,
+                                },
+                            ),
+                            SettingsChoice::RecordFps => (
+                                "帧率",
+                                Icon::Select,
+                                vec!["60 fps".to_string(), "30 fps".to_string(), "15 fps".to_string()],
+                                match self.preferences.record_fps() {
+                                    60 => 0,
+                                    15 => 2,
+                                    _ => 1,
+                                },
+                            ),
+                            SettingsChoice::RecordMicDevice => {
+                                let selected = self.preferences.record_mic_device();
+                                let mut labels = vec!["系统默认".to_string()];
+                                labels.extend(
+                                    self.record_inputs
+                                        .iter()
+                                        .map(|input| input.name.clone()),
+                                );
+                                let index = self
+                                    .record_inputs
+                                    .iter()
+                                    .position(|input| input.id == selected)
+                                    .map(|at| at + 1)
+                                    .unwrap_or(0);
+                                ("麦克风设备", Icon::Select, labels, index)
+                            }
                         };
                         dialog_header(ui, icon, title);
                         ui.add_space(8.0);
@@ -3599,6 +4509,34 @@ impl ClipSyncApp {
                                     SettingsChoice::Retention => DialogAction::SetRetention(
                                         RETENTION_CHOICES[index],
                                     ),
+                                    SettingsChoice::RecordMode => {
+                                        DialogAction::SetRecordRegion(index == 0)
+                                    }
+                                    SettingsChoice::RecordSize => DialogAction::SetRecordLongEdge(
+                                        match index {
+                                            1 => 1920,
+                                            2 => 1280,
+                                            _ => 0,
+                                        },
+                                    ),
+                                    SettingsChoice::RecordFps => DialogAction::SetRecordFps(
+                                        match index {
+                                            0 => 60,
+                                            2 => 15,
+                                            _ => 30,
+                                        },
+                                    ),
+                                    SettingsChoice::RecordMicDevice => {
+                                        let id = if index == 0 {
+                                            String::new()
+                                        } else {
+                                            self.record_inputs
+                                                .get(index - 1)
+                                                .map(|input| input.id.clone())
+                                                .unwrap_or_default()
+                                        };
+                                        DialogAction::SetRecordMicDevice(id)
+                                    }
                                 };
                             }
                         }
@@ -3638,8 +4576,17 @@ impl ClipSyncApp {
                             });
                         });
                     }
-                    Overlay::Hotkey { error } => {
-                        dialog_header(ui, Icon::Select, "截屏快捷键");
+                    Overlay::Hotkey { record, error } => {
+                        let hotkey = if *record {
+                            self.preferences.record_hotkey().to_string()
+                        } else {
+                            hotkey.clone()
+                        };
+                        dialog_header(
+                            ui,
+                            Icon::Select,
+                            if *record { "录屏快捷键" } else { "截屏快捷键" },
+                        );
                         ui.add_space(10.0);
                         ui.label(
                             RichText::new(hotkey.as_str())
@@ -3657,7 +4604,7 @@ impl ClipSyncApp {
                             }
                             None => hint(
                                 ui,
-                                "直接按下新的组合键就能替换，需要带上 Command、Control 或 Alt",
+                                "现在按下要使用的组合键，需要带上 Command、Control 或 Alt",
                             ),
                         }
                         let pressed = ui.input_mut(|input| {
@@ -3676,7 +4623,11 @@ impl ClipSyncApp {
                                 close = true;
                             } else if let Some(spec) = screenshot::spec(key, modifiers) {
                                 *error = None;
-                                action = DialogAction::SetHotkey(spec);
+                                action = if *record {
+                                    DialogAction::SetRecordHotkey(spec)
+                                } else {
+                                    DialogAction::SetHotkey(spec)
+                                };
                             } else {
                                 *error =
                                     Some("这个键做不了全局快捷键，再按一次别的组合键".to_string());
@@ -4131,6 +5082,57 @@ impl ClipSyncApp {
                             });
                         }
                     }
+                    Overlay::SendFile => {
+                        dialog_header(ui, Icon::Attach, "发送文件");
+                        ui.add_space(12.0);
+                        let width = ui.available_width();
+                        let (rect, _) =
+                            ui.allocate_exact_size(Vec2::new(width, 112.0), Sense::hover());
+                        let hovering = ui.input(|input| {
+                            !input.raw.hovered_files.is_empty()
+                                && input
+                                    .pointer
+                                    .hover_pos()
+                                    .is_some_and(|pos| rect.contains(pos))
+                        });
+                        ui.ctx().data_mut(|data| {
+                            data.insert_temp(Id::new("send-file-zone"), rect);
+                            data.insert_temp(Id::new("send-file-hot"), hovering);
+                        });
+                        let stroke = if hovering {
+                            Stroke::new(2.0, theme::p().accent)
+                        } else {
+                            Stroke::new(1.5, theme::p().accent.gamma_multiply(0.55))
+                        };
+                        ui.painter().rect(
+                            rect,
+                            CornerRadius::same(14),
+                            if hovering {
+                                theme::p().accent.gamma_multiply(0.12)
+                            } else {
+                                Color32::from_white_alpha(8)
+                            },
+                            stroke,
+                            StrokeKind::Inside,
+                        );
+                        ui.painter().text(
+                            rect.center(),
+                            Align2::CENTER_CENTER,
+                            "把文件拖到这个框里就能上传",
+                            FontId::proportional(14.0),
+                            theme::p().text,
+                        );
+                        ui.add_space(14.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if accent_button(ui, "从电脑选择").clicked() {
+                                action = DialogAction::PickFiles;
+                            }
+                            ui.add_space(8.0);
+                            if secondary_button(ui, "取消").clicked() {
+                                close = true;
+                            }
+                        });
+                    }
                 }
             });
         // 磨砂衬在对话框底下（对齐 Compose Popup + GlassCard）
@@ -4238,9 +5240,41 @@ impl ClipSyncApp {
             DialogAction::SetHotkey(spec) => match self.set_screenshot_hotkey(&spec) {
                 Ok(()) => keep = false,
                 Err(error) => {
-                    overlay = Overlay::Hotkey { error: Some(error) };
+                    overlay = Overlay::Hotkey {
+                        record: false,
+                        error: Some(error),
+                    };
                 }
             },
+            DialogAction::SetRecordHotkey(spec) => match self.set_record_hotkey(&spec) {
+                Ok(()) => keep = false,
+                Err(error) => {
+                    overlay = Overlay::Hotkey {
+                        record: true,
+                        error: Some(error),
+                    };
+                }
+            },
+            DialogAction::SetRecordRegion(region) => {
+                self.preferences.set_record_region(region);
+                keep = false;
+            }
+            DialogAction::SetRecordLongEdge(edge) => {
+                self.preferences.set_record_long_edge(edge);
+                keep = false;
+            }
+            DialogAction::SetRecordFps(fps) => {
+                self.preferences.set_record_fps(fps);
+                keep = false;
+            }
+            DialogAction::SetRecordMicDevice(id) => {
+                self.preferences.set_record_mic_device(&id);
+                keep = false;
+            }
+            DialogAction::PickFiles => {
+                self.pick_files();
+                keep = false;
+            }
         }
         if keep && self.overlay.is_none() {
             self.overlay = Some(overlay);
@@ -4435,7 +5469,8 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
         ),
     );
     let id = ui.scope_id().with(("clip-row", record.id.as_str()));
-    let card_response = ui.interact(card, id.with("card"), Sense::click());
+    // click_and_drag：点按仍激活；拖动手势开始则拖出到访达。
+    let card_response = ui.interact(card, id.with("card"), Sense::click_and_drag());
     let text_y = card.top() + top_pad;
     let line_y = text_y + line_center;
     if scroll_to {
@@ -4745,6 +5780,8 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
         events.push(event);
     } else if zoom_clicked {
         events.push(AppEvent::Zoom(record.id.clone()));
+    } else if card_response.drag_started() {
+        events.push(AppEvent::DragOut(record.id.clone()));
     } else if card_response.clicked() && !more_response.clicked() {
         if pick_mode {
             events.push(AppEvent::TogglePick(record.id.clone()));
@@ -5434,6 +6471,11 @@ fn language_label(language: Language) -> &'static str {
     }
 }
 
+/// 工具栏上「共 N 条记录」的那个 N：走的是和列表同一套搜索，搜着就只数命中的。
+fn visible_count(history: &History, query: &str, regex: bool, case_sensitive: bool) -> usize {
+    history.search(query, regex, case_sensitive).len()
+}
+
 const SETTINGS_ROW_HEIGHT: f32 = 48.0;
 const SETTINGS_SWITCH_HEIGHT: f32 = 52.0;
 const SETTINGS_PAD: f32 = 14.0;
@@ -5842,6 +6884,21 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+/// 设置页存的是长边 + 帧率；工具条用三档预设，打开时按长边映射回去。
+fn record_options(preferences: &Preferences) -> overlay::RecordOptions {
+    overlay::RecordOptions {
+        quality: overlay::RecordQuality::of(preferences.record_long_edge()),
+        system_audio: preferences.record_system_audio(),
+        mic: preferences.record_mic(),
+        mic_device: preferences.record_mic_device().to_string(),
+    }
+}
+
+/// 录制条上的时长：分钟不封顶，120 分钟就是 120:00。
+fn record_clock(seconds: u64) -> String {
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
 fn selection_payload(items: &[Record], picked: &BTreeSet<String>) -> Option<String> {
     let parts: Vec<String> = items
         .iter()
@@ -5980,6 +7037,53 @@ mod tests {
                 .chars()
                 .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit()));
         }
+    }
+
+    #[test]
+    fn the_toolbar_count_follows_the_search() {
+        let dir = std::env::temp_dir().join(format!("clipsync-count-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut history = super::History::open(dir.join("history.json"));
+        for (index, text) in ["alpha one", "beta two", "alpha three"].iter().enumerate() {
+            history.add(super::Record {
+                id: format!("id{index}"),
+                kind: super::KIND_TEXT.to_string(),
+                ts: 1_730_000_000_000,
+                sender_id: String::new(),
+                sender_name: "test".to_string(),
+                text: text.to_string(),
+                file: None,
+                pinned: false,
+                order: 0,
+                note: String::new(),
+            });
+        }
+
+        assert_eq!(
+            super::visible_count(&history, "", false, false),
+            3,
+            "没搜索时算全部"
+        );
+        assert_eq!(
+            super::visible_count(&history, "alpha", false, false),
+            2,
+            "搜索时算命中"
+        );
+        assert_eq!(
+            super::visible_count(&history, "ALPHA", false, false),
+            2,
+            "不分大小写"
+        );
+        assert_eq!(
+            super::visible_count(&history, "ALPHA", false, true),
+            0,
+            "分大小写时不算"
+        );
+        assert_eq!(super::visible_count(&history, "nothing", false, false), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

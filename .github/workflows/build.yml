@@ -125,6 +125,7 @@ jobs:
             <key>LSMinimumSystemVersion</key><string>12.0</string>
             <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
             <key>NSHighResolutionCapable</key><true/>
+            <key>NSMicrophoneUsageDescription</key><string>ClipSyncRust 录屏时把麦克风混进录像</string>
           </dict>
           </plist>
           PLIST

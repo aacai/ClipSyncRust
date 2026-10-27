@@ -70,6 +70,16 @@ struct StoredPreferences {
     screenshot_hotkey: String,
     /// 对齐 Compose `screenshotKeepWindow`：默认保留，关掉才在抓屏前藏主窗。
     screenshot_keep_window: bool,
+    record_hotkey: String,
+    /// "Region" 或 "Screen"，和 Compose 的 RecordMode 名字一致。
+    record_mode: String,
+    record_mic: bool,
+    /// AVCaptureDevice.uniqueID；空串表示系统默认输入。
+    record_mic_device: String,
+    record_system_audio: bool,
+    /// 长边像素。0 表示按屏幕原始大小。
+    record_long_edge: i32,
+    record_fps: u32,
     last_room_code: Option<String>,
 }
 
@@ -113,6 +123,13 @@ impl Default for StoredPreferences {
             retention_days: DEFAULT_RETENTION_DAYS,
             screenshot_hotkey: crate::screenshot::DEFAULT_HOTKEY.to_string(),
             screenshot_keep_window: true,
+            record_hotkey: crate::screenshot::DEFAULT_RECORD_HOTKEY.to_string(),
+            record_mode: "Region".to_string(),
+            record_mic: true,
+            record_mic_device: String::new(),
+            record_system_audio: true,
+            record_long_edge: 0,
+            record_fps: 30,
             last_room_code: None,
         }
     }
@@ -182,6 +199,42 @@ impl Preferences {
 
     pub fn screenshot_keep_window(&self) -> bool {
         self.stored.screenshot_keep_window
+    }
+
+    pub fn record_hotkey(&self) -> &str {
+        &self.stored.record_hotkey
+    }
+
+    /// 区域框选。其它值都当整屏。
+    pub fn record_region(&self) -> bool {
+        self.stored.record_mode != "Screen"
+    }
+
+    pub fn record_mic(&self) -> bool {
+        self.stored.record_mic
+    }
+
+    /// 空串表示系统默认输入设备。
+    pub fn record_mic_device(&self) -> &str {
+        &self.stored.record_mic_device
+    }
+
+    pub fn record_system_audio(&self) -> bool {
+        self.stored.record_system_audio
+    }
+
+    pub fn record_long_edge(&self) -> i32 {
+        match self.stored.record_long_edge {
+            1280 | 1920 => self.stored.record_long_edge,
+            _ => 0,
+        }
+    }
+
+    pub fn record_fps(&self) -> u32 {
+        match self.stored.record_fps {
+            15 | 60 => self.stored.record_fps,
+            _ => 30,
+        }
     }
 
     pub fn last_room_code(&self) -> Option<&str> {
@@ -258,6 +311,47 @@ impl Preferences {
 
     pub fn set_screenshot_keep_window(&mut self, enabled: bool) {
         self.stored.screenshot_keep_window = enabled;
+        self.save();
+    }
+
+    pub fn set_record_hotkey(&mut self, spec: &str) {
+        self.stored.record_hotkey = spec.to_string();
+        self.save();
+    }
+
+    pub fn set_record_region(&mut self, region: bool) {
+        self.stored.record_mode = if region { "Region" } else { "Screen" }.to_string();
+        self.save();
+    }
+
+    pub fn set_record_mic(&mut self, enabled: bool) {
+        self.stored.record_mic = enabled;
+        self.save();
+    }
+
+    pub fn set_record_mic_device(&mut self, id: &str) {
+        self.stored.record_mic_device = id.trim().to_string();
+        self.save();
+    }
+
+    pub fn set_record_system_audio(&mut self, enabled: bool) {
+        self.stored.record_system_audio = enabled;
+        self.save();
+    }
+
+    pub fn set_record_long_edge(&mut self, edge: i32) {
+        self.stored.record_long_edge = match edge {
+            1280 | 1920 => edge,
+            _ => 0,
+        };
+        self.save();
+    }
+
+    pub fn set_record_fps(&mut self, fps: u32) {
+        self.stored.record_fps = match fps {
+            15 | 60 => fps,
+            _ => 30,
+        };
         self.save();
     }
 

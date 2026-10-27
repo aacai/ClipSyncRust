@@ -31,11 +31,36 @@ getrandom = { workspace = true }
 zeroize = { workspace = true }
 global-hotkey = { workspace = true }
 xcap = { workspace = true }
+ab_glyph = "0.2.32"
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+drag = "2.1"
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
+cc = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSData"] }
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSScreen", "NSWindow", "NSPasteboard"] }
+objc2-foundation = { version = "0.3", features = ["NSData", "NSGeometry", "NSString", "NSURL"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSScreen",
+    "NSWindow",
+    "NSView",
+    "NSResponder",
+    "NSPasteboard",
+] }
+objc2-av-foundation = { version = "0.3", features = [
+    "AVAnimation",
+    "AVPlayer",
+    "AVPlayerItem",
+    "AVPlayerLayer",
+    "objc2-core-media",
+    "objc2-quartz-core",
+] }
+objc2-core-graphics = "0.3"
+objc2-core-media = "0.3"
+objc2-quartz-core = "0.3"
 
 # cargo wix 只从这里取两个 guid：upgrade-guid 固定下来，新包才会升级旧安装而不是
 # 并存两份；path-guid 不固定就每次 init 换一个组件 GUID，旧条目留在注册表里没人清。

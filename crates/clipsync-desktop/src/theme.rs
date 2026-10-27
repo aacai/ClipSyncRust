@@ -315,7 +315,7 @@ fn visuals(dark: bool) -> Visuals {
 /// faces by box centre rather than by baseline, so a Han glyph next to latin digits lands
 /// on a different line. Huawei's licence asks for a notice in the software, which the
 /// about panel carries.
-const PRIMARY_FACE: &[u8] = include_bytes!("../assets/HarmonyOS_Sans_SC_Regular.ttf");
+pub(crate) const PRIMARY_FACE: &[u8] = include_bytes!("../assets/HarmonyOS_Sans_SC_Regular.ttf");
 
 fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(primary_fonts());

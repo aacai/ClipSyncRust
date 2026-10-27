@@ -5,7 +5,7 @@ use clipsync_core::files::{
     decrypt_file, encrypt_file, max_mb, sanitize_file_name, upload_file_name,
     validate_outgoing_file, RejectReason, MAX_FILE_BYTES,
 };
-use clipsync_core::protocol::{file_mid, now_millis};
+use clipsync_core::protocol::{now_millis, random_mid};
 use clipsync_core::RoomCrypto;
 
 use crate::paths;
@@ -14,7 +14,7 @@ use crate::transfer::TransferClient;
 pub struct JobContext {
     pub crypto: Arc<RoomCrypto>,
     pub client: Arc<TransferClient>,
-    pub device_id: String,
+    pub clip_topic: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +28,8 @@ pub struct UploadRequest {
     pub mime: String,
     pub bytes: Vec<u8>,
     pub target: UploadTarget,
+    /// The payload already sits in the cache at this path — don't write a second copy.
+    pub cached: Option<String>,
 }
 
 #[derive(Debug)]
@@ -143,20 +145,20 @@ pub fn perform_upload(
     if let Some(reason) = validate_outgoing_file(&safe, size) {
         return Err(reject_message(reason, &safe));
     }
-    let encrypted = encrypt_file(&context.crypto, &safe, &request.mime, &request.bytes)
+    let encrypted = encrypt_file(&context.crypto, &context.clip_topic, &safe, &request.mime, &request.bytes)
         .map_err(|error| format!("加密失败：{error}"))?;
     let link = context
         .client
         .upload(&upload_file_name(), &encrypted.cipher, on_progress)?;
     let (id, ts) = match &request.target {
-        UploadTarget::Publish { .. } => (
-            file_mid(&safe, request.bytes.len(), &context.device_id),
-            now_millis(),
-        ),
+        UploadTarget::Publish { .. } => (random_mid(), now_millis()),
         UploadTarget::Resend { id, ts } => (id.clone(), *ts),
     };
     let local_path = if matches!(&request.target, UploadTarget::Publish { cache: true }) {
-        paths::write_cache(&id, &safe, &request.bytes).ok()
+        request
+            .cached
+            .clone()
+            .or_else(|| paths::write_cache(&id, &safe, &request.bytes).ok())
     } else {
         None
     };
@@ -195,6 +197,7 @@ pub fn perform_download(
     let cipher = context.client.download(&request.link, on_progress)?;
     let plain = decrypt_file(
         &context.crypto,
+        &context.clip_topic,
         &request.name,
         &request.mime,
         request.size,
@@ -251,6 +254,10 @@ mod tests {
     };
     use crate::transfer::TransferClient;
 
+    fn topic() -> String {
+        clipsync_core::protocol::clip_topic("testhash")
+    }
+
     fn context() -> JobContext {
         JobContext {
             crypto: std::sync::Arc::new(RoomCrypto::open("TESTROOM", "pw").unwrap()),
@@ -258,7 +265,7 @@ mod tests {
                 "http://127.0.0.1:1/",
                 "http://127.0.0.1:1/",
             )),
-            device_id: "device-1".to_string(),
+            clip_topic: topic(),
         }
     }
 
@@ -283,7 +290,7 @@ mod tests {
     fn a_download_is_decrypted_cached_and_reported() {
         let room = RoomCrypto::open("TESTROOM", "pw").unwrap();
         let plain = b"hello file bytes".to_vec();
-        let encrypted = encrypt_file(&room, "photo.png", "image/png", &plain).unwrap();
+        let encrypted = encrypt_file(&room, &topic(), "photo.png", "image/png", &plain).unwrap();
         let link = serve_once(encrypted.cipher.clone());
         let request = DownloadRequest {
             id: "download-test".to_string(),
@@ -310,7 +317,7 @@ mod tests {
     fn a_tampered_download_is_rejected_before_caching() {
         let room = RoomCrypto::open("TESTROOM", "pw").unwrap();
         let plain = b"content".to_vec();
-        let mut encrypted = encrypt_file(&room, "a.txt", "text/plain", &plain).unwrap();
+        let mut encrypted = encrypt_file(&room, &topic(), "a.txt", "text/plain", &plain).unwrap();
         let last = encrypted.cipher.len() - 1;
         encrypted.cipher[last] ^= 0xff;
         let link = serve_once(encrypted.cipher);
@@ -349,6 +356,7 @@ mod tests {
             mime: "text/plain".to_string(),
             bytes: Vec::new(),
             target: UploadTarget::Publish { cache: false },
+            cached: None,
         };
         let error = super::perform_upload(&context(), request, |_, _| {}).unwrap_err();
         assert_eq!(error, "空文件无法分享：empty.txt");

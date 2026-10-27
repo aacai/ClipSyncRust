@@ -77,6 +77,26 @@ pub fn write_cache(id: &str, name: &str, bytes: &[u8]) -> std::io::Result<String
     Ok(path.to_string_lossy().to_string())
 }
 
+/// Moves a finished temp file into the cache, so a clipboard handoff and the history entry point
+/// at the same durable copy instead of a file under `/tmp`.
+pub fn adopt_cache(id: &str, name: &str, source: &Path) -> std::io::Result<String> {
+    let safe = sanitize_file_name(name);
+    let name = if safe.is_empty() {
+        "file"
+    } else {
+        safe.as_str()
+    };
+    let dir = cache_dir().join(id);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(name);
+    if std::fs::rename(source, &path).is_err() {
+        // Temp and cache can sit on different volumes; fall back to copying.
+        std::fs::copy(source, &path)?;
+        let _ = std::fs::remove_file(source);
+    }
+    Ok(path.to_string_lossy().to_string())
+}
+
 pub fn delete_cache(path: Option<&str>) {
     let Some(path) = path else {
         return;
@@ -121,7 +141,21 @@ pub fn save_to_downloads(name: &str, bytes: &[u8]) -> std::io::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{numbered_name, sanitize_file_name};
+    use super::{adopt_cache, cache_dir, delete_cache, numbered_name, sanitize_file_name};
+    use std::path::Path;
+
+    #[test]
+    fn adopting_a_temp_file_moves_it_into_the_cache() {
+        let source = std::env::temp_dir().join(format!("adopt-{}.mp4", std::process::id()));
+        std::fs::write(&source, b"mp4").unwrap();
+        let id = format!("adopt-test-{}", std::process::id());
+        let path = adopt_cache(&id, "录屏.mp4", &source).unwrap();
+        assert!(!source.exists(), "temp file should be gone");
+        assert!(Path::new(&path).starts_with(cache_dir()));
+        assert_eq!(std::fs::read(&path).unwrap(), b"mp4");
+        delete_cache(Some(&path));
+        assert!(!Path::new(&path).exists());
+    }
 
     #[test]
     fn file_names_cannot_escape_or_use_windows_reserved_words() {

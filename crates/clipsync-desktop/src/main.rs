@@ -1,10 +1,13 @@
 mod app;
 mod autostart;
 mod clipboard;
+mod drag_out;
 mod icons;
 mod jobs;
 mod overlay;
 mod paths;
+mod preview;
+mod record;
 mod screenshot;
 mod settings;
 mod store;
