@@ -245,9 +245,7 @@ int cs_record_start(double x, double y, double w, double h, int mic, int system_
         out.outputURL = url;
         out.outputFileType = AVFileTypeMPEG4;
         out.videoCodecType = AVVideoCodecTypeH264;
-        if (@available(macOS 27.0, *)) {
-            out.mixesAudioWithMicrophone = YES;
-        }
+        // 系统声音与麦克风本来就是混成一条轨（mixesAudioWithMicrophone 默认 YES，且要 macOS 27 才有这个属性）
         SCRecordingOutput *output = [[SCRecordingOutput alloc] initWithConfiguration:out delegate:recorder];
         NSError *addError = nil;
         if (![stream addRecordingOutput:output error:&addError]) {
@@ -316,8 +314,11 @@ const char *cs_record_inputs(void) {
             [types addObject:AVCaptureDeviceTypeMicrophone];
             [types addObject:AVCaptureDeviceTypeExternal];
         } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
             [types addObject:AVCaptureDeviceTypeBuiltInMicrophone];
             [types addObject:AVCaptureDeviceTypeExternalUnknown];
+#pragma clang diagnostic pop
         }
         AVCaptureDeviceDiscoverySession *session = [AVCaptureDeviceDiscoverySession
             discoverySessionWithDeviceTypes:types
