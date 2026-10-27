@@ -88,10 +88,6 @@ pub fn safety_number(room_key: &[u8]) -> String {
         .join(" ")
 }
 
-pub fn safety_prefix(safety: &str) -> String {
-    safety.split(' ').next().unwrap_or_default().to_string()
-}
-
 /// kotlinx 的 String.length 是 UTF-16 码元数，网页端与 Android 都按这个长度显示。
 pub fn utf16_len(text: &str) -> usize {
     text.chars()
@@ -110,15 +106,9 @@ pub fn sha256_hex_prefix(data: &[u8], hex_chars: usize) -> String {
     hex::encode(&sha256(data)[..hex_chars / 2])
 }
 
-pub fn text_mid(payload: &str, device_id: &str) -> String {
-    let mut bytes = payload.as_bytes().to_vec();
-    bytes.extend_from_slice(device_id.as_bytes());
-    sha256_hex_prefix(&bytes, 16)
-}
-
-pub fn file_mid(name: &str, size: usize, device_id: &str) -> String {
-    let mut bytes = name.as_bytes().to_vec();
-    bytes.extend_from_slice(size.to_string().as_bytes());
-    bytes.extend_from_slice(device_id.as_bytes());
-    sha256_hex_prefix(&bytes, 16)
+/// mid 在信封里是明文：用内容算 id 等于让中转服务器拿一句猜测反查是谁发的。
+pub fn random_mid() -> String {
+    let mut raw = [0u8; 8];
+    getrandom::fill(&mut raw).expect("os random unavailable");
+    hex::encode(raw)
 }

@@ -31,16 +31,21 @@ pub struct FilePayload {
     pub expires_at: i64,
 }
 
+/// presence 的内容整条进密文：昵称、系统、在线状态都不再是明文的了。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PresenceEnvelope {
     #[serde(default = "protocol_version")]
     pub v: i32,
+    pub ct: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresencePayload {
     pub dev: String,
     pub name: String,
+    pub os: String,
     pub online: bool,
     pub ts: i64,
-    pub sp: String,
-    pub os: String,
     #[serde(default)]
     pub answer: bool,
 }
@@ -67,13 +72,7 @@ impl Default for PresenceEnvelope {
     fn default() -> Self {
         Self {
             v: PROTOCOL_VERSION,
-            dev: String::new(),
-            name: String::new(),
-            online: false,
-            ts: 0,
-            sp: String::new(),
-            os: String::new(),
-            answer: false,
+            ct: String::new(),
         }
     }
 }

@@ -8,9 +8,8 @@ use mqtt5::{
 };
 
 use crate::engine::{Config, LinkFactory};
-use crate::envelope::PresenceEnvelope;
 use crate::link::{LinkEvent, MqttLink, KEEP_ALIVE_SECONDS};
-use crate::protocol::{client_id, now_millis, presence_topic};
+use crate::protocol::{client_id, presence_topic};
 use crate::secrets;
 
 pub struct BrokerLink {
@@ -22,21 +21,23 @@ pub struct BrokerLink {
 }
 
 impl BrokerLink {
-    pub fn new(config: &Config, hash: &str, safety_prefix: &str) -> Self {
-        let presence = offline_presence(config, safety_prefix);
-        let options = ConnectOptions::new(client_id(hash, &config.device_id))
+    pub fn new(config: &Config, hash: &str, will_payload: &str) -> Self {
+        let mut options = ConnectOptions::new(client_id(hash, &config.device_id))
             .with_clean_start(true)
             .with_keep_alive(Duration::from_secs(u64::from(KEEP_ALIVE_SECONDS)))
             .with_credentials(secrets::USERNAME, secrets::PASSWORD)
             // 断线重连归引擎管：它那边的退避会一路加到 60s，库再自己试一轮就成两套心跳了。
-            .with_automatic_reconnect(false)
-            .with_will(
+            .with_automatic_reconnect(false);
+        // 遗嘱由引擎事先加密好交进来：broker 只会原样转发，不会再帮我们算一次
+        if !will_payload.is_empty() {
+            options = options.with_will(
                 WillMessage::new(
                     presence_topic(hash, &config.device_id),
-                    presence.into_bytes(),
+                    will_payload.as_bytes().to_vec(),
                 )
                 .with_qos(QoS::AtLeastOnce),
             );
+        }
         let (out, events) = unbounded();
         Self {
             client: MqttClient::with_options(options.clone()),
@@ -127,26 +128,13 @@ impl MqttLink for BrokerLink {
     }
 }
 
-fn offline_presence(config: &Config, safety_prefix: &str) -> String {
-    serde_json::to_string(&PresenceEnvelope {
-        dev: config.device_id.clone(),
-        name: config.device_name.clone(),
-        online: false,
-        ts: now_millis(),
-        sp: safety_prefix.to_string(),
-        os: config.device_os.clone(),
-        ..Default::default()
-    })
-    .unwrap_or_default()
-}
-
 #[derive(Clone)]
 pub struct BrokerLinks;
 
 impl LinkFactory for BrokerLinks {
     type Link = BrokerLink;
 
-    fn create(&self, config: &Config, hash: &str, safety_prefix: &str) -> BrokerLink {
-        BrokerLink::new(config, hash, safety_prefix)
+    fn create(&self, config: &Config, hash: &str, will_payload: &str) -> BrokerLink {
+        BrokerLink::new(config, hash, will_payload)
     }
 }

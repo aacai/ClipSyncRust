@@ -11,7 +11,7 @@ pub mod secrets;
 pub use engine::{
     Clip, Config, EngineHandle, Event, FileAttachment, FileUpload, LinkFactory, Peer, Status,
 };
-pub use envelope::{ClipEnvelope, ClipPayload, FilePayload, PresenceEnvelope};
+pub use envelope::{ClipEnvelope, ClipPayload, FilePayload, PresenceEnvelope, PresencePayload};
 pub use link::{LinkEvent, MqttLink};
 pub use mqtt::{BrokerLink, BrokerLinks};
 pub use protocol::{Channel, RoomTopic};

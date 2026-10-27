@@ -1,8 +1,10 @@
 use base64::{prelude::BASE64_STANDARD, Engine};
-use clipsync_core::envelope::{ClipEnvelope, ClipPayload, FilePayload, PresenceEnvelope};
+use clipsync_core::envelope::{
+    ClipEnvelope, ClipPayload, FilePayload, PresenceEnvelope, PresencePayload,
+};
 use clipsync_core::protocol::{
-    client_id, clip_topic, file_mid, parse_topic, presence_topic, room_filter, room_hash,
-    safety_number, safety_prefix, sync_topic, text_mid, Channel,
+    client_id, clip_topic, parse_topic, presence_topic, random_mid, room_filter, room_hash,
+    safety_number, sync_topic, Channel,
 };
 use clipsync_core::room::RoomCrypto;
 
@@ -98,20 +100,25 @@ fn safety_number_matches_independent_sha256() {
     let key =
         hex::decode("0c507ff2ecd664e9c25d92bc01ab781e257e2a85c7f72b9b911ccdbd1513e16e").unwrap();
     assert_eq!(safety_number(&key), "157 030 228 012 167 001");
-    assert_eq!(safety_prefix("157 030 228 012 167 001"), "157");
     assert_eq!(
-        RoomCrypto::open(ROOM, "hunter2").unwrap().safety_prefix(),
-        "157"
+        RoomCrypto::open(ROOM, "hunter2").unwrap().safety_number(),
+        "157 030 228 012 167 001"
     );
 }
 
 #[test]
-fn message_ids_match_independent_sha256() {
-    assert_eq!(text_mid(BROWSER_TEXT, "dev-1"), "261a17dceecbce2d");
-    assert_eq!(
-        file_mid("report.pdf", 5 * 1024 * 1024, "dev-1"),
-        "a9fddd59602bfaeb"
-    );
+fn message_ids_are_opaque_random_hex() {
+    let ids: Vec<String> = (0..64).map(|_| random_mid()).collect();
+    for id in &ids {
+        assert_eq!(id.len(), 16, "{id}");
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "{id}"
+        );
+    }
+    let unique: std::collections::HashSet<&String> = ids.iter().collect();
+    assert_eq!(unique.len(), ids.len());
 }
 
 #[test]
@@ -156,18 +163,34 @@ fn topic_parsing_rejects_foreign_shapes() {
 #[test]
 fn presence_json_is_byte_identical_to_kotlin() {
     let wire = serde_json::to_string(&PresenceEnvelope {
-        dev: "d1".into(),
-        name: "Pixel".into(),
-        online: true,
-        ts: 1700000000000,
-        sp: "482".into(),
-        os: "Android".into(),
+        ct: "abc".into(),
         ..Default::default()
     })
     .unwrap();
+    assert_eq!(wire, "{\"v\":1,\"ct\":\"abc\"}");
     assert_eq!(
-        wire,
-        "{\"v\":1,\"dev\":\"d1\",\"name\":\"Pixel\",\"online\":true,\"ts\":1700000000000,\"sp\":\"482\",\"os\":\"Android\",\"answer\":false}"
+        serde_json::to_string(&PresencePayload {
+            dev: "d1".into(),
+            name: "Pixel".into(),
+            os: "Android".into(),
+            online: true,
+            ts: 1700000000000,
+            answer: false,
+        })
+        .unwrap(),
+        "{\"dev\":\"d1\",\"name\":\"Pixel\",\"os\":\"Android\",\"online\":true,\"ts\":1700000000000,\"answer\":false}"
+    );
+    assert!(serde_json::from_str::<PresencePayload>(
+        "{\"dev\":\"d1\",\"name\":\"Pixel\",\"os\":\"Android\",\"online\":true,\"ts\":1,\"answer\":true}"
+    )
+    .unwrap()
+    .answer);
+    assert!(
+        !serde_json::from_str::<PresencePayload>(
+            "{\"dev\":\"d1\",\"name\":\"Pixel\",\"os\":\"Android\",\"online\":true,\"ts\":1}"
+        )
+        .unwrap()
+        .answer
     );
 }
 
@@ -223,10 +246,8 @@ fn kotlin_json_decodes_into_rust_structs() {
     )
     .unwrap();
     assert_eq!(envelope.mid, "m");
-    let presence: PresenceEnvelope =
-        serde_json::from_str("{\"v\":1,\"dev\":\"d\",\"name\":\"n\",\"online\":true,\"ts\":1,\"sp\":\"482\",\"os\":\"macOS\",\"answer\":true}")
-            .unwrap();
-    assert!(presence.answer);
+    let presence: PresenceEnvelope = serde_json::from_str("{\"v\":1,\"ct\":\"c\"}").unwrap();
+    assert_eq!(presence.ct, "c");
     let no_v: ClipEnvelope = serde_json::from_str(
         "{\"mid\":\"m\",\"ts\":1,\"dev\":\"d\",\"name\":\"n\",\"kind\":\"text\",\"ct\":\"c\"}",
     )

@@ -7,10 +7,10 @@ use clipsync_core::engine::{self, Config, Event, FileUpload, LinkFactory, Status
 use clipsync_core::files::MAX_FILE_BYTES;
 use clipsync_core::link::{LinkEvent, MqttLink};
 use clipsync_core::protocol::{
-    clip_topic, file_mid, presence_topic, room_filter, room_hash, sync_topic, PROTOCOL_VERSION,
+    clip_topic, presence_topic, room_filter, room_hash, sync_topic, PROTOCOL_VERSION,
 };
 use clipsync_core::room::RoomCrypto;
-use clipsync_core::{ClipEnvelope, ClipPayload, FilePayload, PresenceEnvelope};
+use clipsync_core::{ClipEnvelope, ClipPayload, FilePayload, PresenceEnvelope, PresencePayload};
 
 const ROOM: &str = "TESTROOM01";
 const ME: &str = "dev-me";
@@ -19,6 +19,7 @@ const ME: &str = "dev-me";
 struct Broker {
     published: Mutex<Vec<(String, String)>>,
     filters: Mutex<Vec<String>>,
+    will: Mutex<Option<(String, String)>>,
     inject: Mutex<Option<Sender<LinkEvent>>>,
     links: AtomicUsize,
     refuse_connect: AtomicBool,
@@ -32,6 +33,10 @@ impl Broker {
 
     fn filters(&self) -> Vec<String> {
         self.filters.lock().unwrap().clone()
+    }
+
+    fn will(&self) -> Option<(String, String)> {
+        self.will.lock().unwrap().clone()
     }
 
     fn links(&self) -> usize {
@@ -64,9 +69,13 @@ struct FakeLink {
 impl LinkFactory for FakeLinks {
     type Link = FakeLink;
 
-    fn create(&self, _config: &Config, _hash: &str, _safety_prefix: &str) -> FakeLink {
+    fn create(&self, config: &Config, hash: &str, will_payload: &str) -> FakeLink {
         let (inject, events) = unbounded();
         *self.broker.inject.lock().unwrap() = Some(inject.clone());
+        *self.broker.will.lock().unwrap() = Some((
+            presence_topic(hash, &config.device_id),
+            will_payload.to_string(),
+        ));
         self.broker.links.fetch_add(1, Ordering::SeqCst);
         FakeLink {
             broker: Arc::clone(&self.broker),
@@ -122,7 +131,6 @@ struct Harness {
     broker: Arc<Broker>,
     hash: String,
     safety: String,
-    prefix: String,
 }
 
 fn config() -> Config {
@@ -147,14 +155,12 @@ impl Harness {
             broker: Arc::clone(&broker),
         });
         let safety = crypto().safety_number();
-        let prefix = safety.split(' ').next().unwrap_or_default().to_string();
         let hash = room_hash(ROOM);
         let harness = Self {
             engine,
             broker,
             hash,
             safety,
-            prefix,
         };
         harness.engine.join(config());
         harness
@@ -189,19 +195,66 @@ impl Harness {
         }
     }
 
-    fn presence(&self, dev: &str, name: &str, online: bool) -> (String, String) {
-        let payload = serde_json::to_string(&PresenceEnvelope {
-            v: PROTOCOL_VERSION,
+    /// presence 整条进密文，AAD 是它落进的那条 topic。
+    fn presence(&self, dev: &str, name: &str, online: bool, with: &RoomCrypto) -> (String, String) {
+        self.presence_at(dev, name, online, 0, with)
+    }
+
+    fn presence_at(
+        &self,
+        dev: &str,
+        name: &str,
+        online: bool,
+        ts_delta: i64,
+        with: &RoomCrypto,
+    ) -> (String, String) {
+        let topic = presence_topic(&self.hash, dev);
+        let wire = self.presence_wire(topic.clone(), dev, name, online, false, ts_delta, with);
+        (topic, wire)
+    }
+
+    fn roll_call(&self, dev: &str, name: &str, with: &RoomCrypto) -> (String, String) {
+        let topic = sync_topic(&self.hash);
+        let wire = self.presence_wire(topic.clone(), dev, name, true, true, 0, with);
+        (topic, wire)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn presence_wire(
+        &self,
+        topic: String,
+        dev: &str,
+        name: &str,
+        online: bool,
+        answer: bool,
+        ts_delta: i64,
+        with: &RoomCrypto,
+    ) -> String {
+        let json = serde_json::to_string(&PresencePayload {
             dev: dev.to_string(),
             name: name.to_string(),
-            online,
-            ts: clipsync_core::protocol::now_millis(),
-            sp: self.prefix.clone(),
             os: "kotlin".to_string(),
-            answer: false,
+            online,
+            ts: clipsync_core::protocol::now_millis() + ts_delta,
+            answer,
         })
         .unwrap();
-        (presence_topic(&self.hash, dev), payload)
+        let ct = with
+            .encrypt(json.as_bytes(), topic.as_bytes())
+            .expect("encrypt");
+        serde_json::to_string(&PresenceEnvelope {
+            v: PROTOCOL_VERSION,
+            ct,
+        })
+        .unwrap()
+    }
+
+    fn open_presence(&self, topic: &str, wire: &str) -> PresencePayload {
+        let envelope: PresenceEnvelope = serde_json::from_str(wire).unwrap();
+        let plain = crypto()
+            .decrypt(&envelope.ct, topic.as_bytes())
+            .expect("decrypt");
+        serde_json::from_str(&String::from_utf8(plain).unwrap()).unwrap()
     }
 
     fn clip(&self, dev: &str, name: &str, text: &str, with: &RoomCrypto) -> (String, String) {
@@ -262,12 +315,26 @@ async fn join_subscribes_then_announces_and_calls_roll() {
     let published = h.broker.published();
     assert_eq!(published.len(), 2);
     assert_eq!(published[0].0, presence_topic(&h.hash, ME));
-    let first: PresenceEnvelope = serde_json::from_str(&published[0].1).unwrap();
+    let first = h.open_presence(&published[0].0, &published[0].1);
     assert!(first.online);
-    assert_eq!(first.sp, h.prefix);
+    assert_eq!(first.dev, ME);
+    assert_eq!(first.name, "Me");
     assert_eq!(published[1].0, sync_topic(&h.hash));
-    let roll: PresenceEnvelope = serde_json::from_str(&published[1].1).unwrap();
+    let roll = h.open_presence(&published[1].0, &published[1].1);
     assert!(roll.answer);
+    assert_eq!(roll.dev, ME);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_presence_will_is_handed_over_encrypted() {
+    let mut h = Harness::start().await;
+    h.online().await;
+
+    let (topic, wire) = h.broker.will().expect("a link was opened");
+    assert_eq!(topic, presence_topic(&h.hash, ME));
+    let payload = h.open_presence(&topic, &wire);
+    assert_eq!(payload.dev, ME);
+    assert!(!payload.online);
 }
 
 #[tokio::test(start_paused = true)]
@@ -318,7 +385,7 @@ async fn presence_builds_the_roster_and_flags_a_key_mismatch() {
     let mut h = Harness::start().await;
     h.online().await;
 
-    let (topic, wire) = h.presence("p1", "Alice", true);
+    let (topic, wire) = h.presence("p1", "Alice", true, &crypto());
     h.broker.inject(LinkEvent::Message {
         topic,
         payload: wire,
@@ -331,24 +398,14 @@ async fn presence_builds_the_roster_and_flags_a_key_mismatch() {
         other => panic!("expected peers, got {other:?}"),
     }
     match h.next().await {
-        Event::KeyMismatch(names) => assert!(names.is_empty()),
+        Event::KeyMismatch(ids) => assert!(ids.is_empty()),
         other => panic!("expected no mismatch, got {other:?}"),
     }
 
     let stranger = RoomCrypto::open("OTHERROOM", "").unwrap();
-    let wire = serde_json::to_string(&PresenceEnvelope {
-        v: PROTOCOL_VERSION,
-        dev: "p2".to_string(),
-        name: "Bob".to_string(),
-        online: true,
-        ts: clipsync_core::protocol::now_millis(),
-        sp: stranger.safety_prefix(),
-        os: "kotlin".to_string(),
-        answer: false,
-    })
-    .unwrap();
+    let (topic, wire) = h.presence("p2", "Bob", true, &stranger);
     h.broker.inject(LinkEvent::Message {
-        topic: presence_topic(&h.hash, "p2"),
+        topic,
         payload: wire,
     });
 
@@ -357,35 +414,123 @@ async fn presence_builds_the_roster_and_flags_a_key_mismatch() {
         other => panic!("expected peers, got {other:?}"),
     }
     match h.next().await {
-        Event::KeyMismatch(names) => assert_eq!(names, vec!["Bob".to_string()]),
+        Event::KeyMismatch(ids) => assert_eq!(ids, vec!["p2".to_string()]),
         other => panic!("expected a mismatch, got {other:?}"),
+    }
+
+    // 那台设备改对了密码：能解开的那一条把警告撤掉。时间戳要比上一条新才认。
+    let (topic, wire) = h.presence_at("p2", "Bob", true, 1_000, &crypto());
+    h.broker.inject(LinkEvent::Message {
+        topic,
+        payload: wire,
+    });
+    wait_peers(&mut h, 2).await;
+    match h.next().await {
+        Event::KeyMismatch(ids) => assert!(ids.is_empty()),
+        other => panic!("expected the mismatch to clear, got {other:?}"),
     }
 }
 
 #[tokio::test(start_paused = true)]
-async fn goodbye_presence_removes_the_peer() {
+async fn the_mismatch_list_stops_growing_at_the_cap() {
     let mut h = Harness::start().await;
     h.online().await;
-    let (topic, wire) = h.presence("p1", "Alice", true);
+    let stranger = RoomCrypto::open("OTHERROOM", "").unwrap();
+
+    for index in 0..12 {
+        let (topic, wire) = h.presence(&peer_id(index), "Phone", true, &stranger);
+        h.broker.inject(LinkEvent::Message {
+            topic,
+            payload: wire,
+        });
+    }
+
+    // 每记下一条都发一对 Peers/KeyMismatch；到上限后剩下的那几条什么都不发
+    let mut lists = Vec::new();
+    for _ in 0..16 {
+        if let Event::KeyMismatch(ids) = h.next().await {
+            lists.push(ids);
+        }
+    }
+    assert_eq!(lists.len(), 8);
+    assert_eq!(lists[7].len(), 8);
+    assert_eq!(lists[7], (0..8).map(peer_id).collect::<Vec<_>>());
+}
+
+/// 等「解不开」名单变成 expected 这一份；顺带盯住不该溜进来的正文。
+async fn wait_mismatch(h: &mut Harness, expected: &[&str]) {
+    let want: Vec<String> = expected.iter().map(|name| name.to_string()).collect();
+    loop {
+        match h.next().await {
+            Event::KeyMismatch(ids) if ids == want => return,
+            Event::Clip(clip) => panic!("a foreign-key clip slipped in: {clip:?}"),
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_mismatch_is_named_from_the_clip_envelope() {
+    let mut h = Harness::start().await;
+    h.online().await;
+    let stranger = RoomCrypto::open("OTHERROOM", "").unwrap();
+
+    let (topic, wire) = h.presence("p2", "Bob", true, &stranger);
+    h.broker.inject(LinkEvent::Message {
+        topic,
+        payload: wire,
+    });
+    wait_mismatch(&mut h, &["p2"]).await;
+
+    // 密文照旧解不开，信封署名却是明文的：名单改口叫昵称
+    let (topic, wire) = h.clip("p2", "Bob", "hello", &stranger);
+    h.broker.inject(LinkEvent::Message {
+        topic,
+        payload: wire,
+    });
+    wait_mismatch(&mut h, &["Bob"]).await;
+}
+
+fn peer_id(index: usize) -> String {
+    format!("peer-{index:02}")
+}
+
+#[tokio::test(start_paused = true)]
+async fn goodbye_presence_removes_the_peer_and_a_foreign_roll_call_is_ignored() {
+    let mut h = Harness::start().await;
+    h.online().await;
+    let stranger = RoomCrypto::open("OTHERROOM", "").unwrap();
+    let (topic, wire) = h.presence("p1", "Alice", true, &crypto());
     h.broker.inject(LinkEvent::Message {
         topic,
         payload: wire,
     });
     wait_peers(&mut h, 1).await;
+    let before = h.broker.published().len();
 
-    let (topic, wire) = h.presence("p1", "Alice", false);
+    // 解不开的点名帧不该换来一条自报
+    let (topic, wire) = h.roll_call("p9", "Ghost", &stranger);
+    h.broker.inject(LinkEvent::Message {
+        topic,
+        payload: wire,
+    });
+    let (topic, wire) = h.presence("p1", "Alice", false, &crypto());
     h.broker.inject(LinkEvent::Message {
         topic,
         payload: wire,
     });
     wait_peers(&mut h, 0).await;
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(h.broker.published().len(), before);
 }
 
 #[tokio::test(start_paused = true)]
 async fn peers_expire_after_three_heartbeats() {
     let mut h = Harness::start().await;
     h.online().await;
-    let (topic, wire) = h.presence("p1", "Alice", true);
+    let (topic, wire) = h.presence("p1", "Alice", true, &crypto());
     h.broker.inject(LinkEvent::Message {
         topic,
         payload: wire,
@@ -408,19 +553,21 @@ async fn foreign_traffic_never_reaches_the_roster() {
     });
     h.broker.inject(LinkEvent::Message {
         topic: presence_topic(&h.hash, "impostor"),
-        payload: "{\"v\":1,\"dev\":\"ghost\",\"name\":\"Ghost\",\"online\":true,\"ts\":1,\"sp\":\"000\",\"os\":\"x\"}".to_string(),
+        payload:
+            "{\"v\":1,\"dev\":\"ghost\",\"name\":\"Ghost\",\"online\":true,\"ts\":1,\"os\":\"x\"}"
+                .to_string(),
     });
     h.broker.inject(LinkEvent::Message {
         topic: presence_topic(&h.hash, "p1"),
         payload: "not json".to_string(),
     });
 
-    let (topic, wire) = h.presence("p1", "Alice", true);
+    let (topic, wire) = h.presence("p1", "Alice", true, &crypto());
     h.broker.inject(LinkEvent::Message {
         topic,
         payload: wire,
     });
-    wait_peers(&mut h, 1).await;
+    wait_peers_clean(&mut h, 1).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -472,8 +619,41 @@ async fn leave_announces_offline_before_closing() {
 
     let published = h.broker.published();
     assert_eq!(published.len(), before + 1);
-    let last: PresenceEnvelope = serde_json::from_str(&published[before].1).unwrap();
+    let last = h.open_presence(&published[before].0, &published[before].1);
     assert!(!last.online);
+    assert_eq!(last.dev, ME);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_roll_call_gets_answered_but_is_never_a_peer() {
+    let mut h = Harness::start().await;
+    h.online().await;
+    let before = h.broker.published().len();
+
+    let (topic, wire) = h.roll_call("p9", "Ghost", &crypto());
+    h.broker.inject(LinkEvent::Message {
+        topic,
+        payload: wire,
+    });
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+
+    let published = h.broker.published();
+    assert_eq!(published.len(), before + 1);
+    assert_eq!(published[before].0, presence_topic(&h.hash, ME));
+    assert_eq!(
+        h.open_presence(&published[before].0, &published[before].1)
+            .dev,
+        ME
+    );
+    let mut roster = Vec::new();
+    while let Ok(event) = h.engine.events.try_recv() {
+        if let Event::Peers(peers) = event {
+            roster = peers;
+        }
+    }
+    assert!(roster.is_empty(), "a roll call is not a peer");
 }
 
 #[tokio::test(start_paused = true)]
@@ -508,7 +688,7 @@ async fn publish_file_sends_encrypted_metadata_and_announces_the_record() {
     let bytes = b"hello";
     let sha = clipsync_core::crypto::sha256_hex(bytes);
     let upload = FileUpload {
-        mid: file_mid("report.pdf", bytes.len(), ME),
+        mid: "0f1e2d3c4b5a6978".into(),
         ts: 1_700_000_000_000,
         name: "report.pdf".into(),
         mime: "application/pdf".into(),
@@ -657,6 +837,17 @@ async fn wait_peers(h: &mut Harness, want: usize) {
             if peers.len() == want {
                 return;
             }
+        }
+    }
+}
+
+/// 同一件事，但任何进「解不开」名单的帧都算 bug。
+async fn wait_peers_clean(h: &mut Harness, want: usize) {
+    loop {
+        match h.next().await {
+            Event::Peers(peers) if peers.len() == want => return,
+            Event::KeyMismatch(ids) => assert!(ids.is_empty(), "junk reached the list: {ids:?}"),
+            _ => {}
         }
     }
 }

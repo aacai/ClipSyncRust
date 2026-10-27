@@ -4,12 +4,12 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::envelope::{ClipEnvelope, ClipPayload, FilePayload, PresenceEnvelope};
+use crate::envelope::{ClipEnvelope, ClipPayload, FilePayload, PresenceEnvelope, PresencePayload};
 use crate::files::{sanitize_file_name, MAX_FILE_BYTES};
 use crate::link::{self, LinkEvent, LinkHandle, MqttLink};
 use crate::protocol::{
-    clip_topic, now_millis, parse_topic, presence_topic, room_filter, room_hash, safety_prefix,
-    sync_topic, text_mid, utf16_len, Channel, KIND_FILE, PROTOCOL_VERSION,
+    clip_topic, now_millis, parse_topic, presence_topic, random_mid, room_filter, room_hash,
+    sync_topic, utf16_len, Channel, KIND_FILE, PROTOCOL_VERSION,
 };
 use crate::room::RoomCrypto;
 
@@ -18,6 +18,9 @@ pub const PRESENCE_TTL: Duration = Duration::from_millis(360_000);
 pub const RECOVERY_BASE: Duration = Duration::from_millis(5_000);
 pub const RECOVERY_MAX: Duration = Duration::from_millis(60_000);
 pub const KIND_TEXT: &str = "text";
+// 密钥不一致的名单是陌生人也能往我们频道灌帧喂出来的，给它一个上限
+const MAX_UNKNOWN_KEY: usize = 8;
+const MISMATCH_ID_CHARS: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -46,8 +49,13 @@ pub enum Status {
 pub struct Peer {
     pub id: String,
     pub name: String,
-    pub safety: String,
     pub os: String,
+}
+
+/// 解不开的那批：署名先从 clip 信封的明文里补，补不到只剩设备号前缀。
+struct Mismatch {
+    seen: Instant,
+    label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,7 +112,7 @@ pub enum Command {
 
 pub trait LinkFactory: Send + Sync + 'static {
     type Link: MqttLink + Send + Sync + 'static;
-    fn create(&self, config: &Config, hash: &str, safety_prefix: &str) -> Self::Link;
+    fn create(&self, config: &Config, hash: &str, will_payload: &str) -> Self::Link;
 }
 
 pub struct EngineHandle {
@@ -157,13 +165,13 @@ struct Engine<F: LinkFactory> {
     crypto: Option<RoomCrypto>,
     hash: String,
     safety: String,
-    safety_prefix: String,
     status: Status,
     link: Option<LinkHandle>,
     inbound: Option<async_channel::Receiver<LinkEvent>>,
     peers: HashMap<String, Peer>,
     seen: HashMap<String, Instant>,
     presence_ts: HashMap<String, i64>,
+    unknown_key: HashMap<String, Mismatch>,
     backoff: Duration,
 }
 
@@ -176,13 +184,13 @@ impl<F: LinkFactory> Engine<F> {
             crypto: None,
             hash: String::new(),
             safety: String::new(),
-            safety_prefix: String::new(),
             status: Status::Idle,
             link: None,
             inbound: None,
             peers: HashMap::new(),
             seen: HashMap::new(),
             presence_ts: HashMap::new(),
+            unknown_key: HashMap::new(),
             backoff: RECOVERY_BASE,
         }
     }
@@ -297,7 +305,6 @@ impl<F: LinkFactory> Engine<F> {
             }
         };
         self.safety = crypto.safety_number();
-        self.safety_prefix = safety_prefix(&self.safety);
         self.crypto = Some(crypto);
         self.hash = hash;
         self.open_link(&config, heartbeat, recovery).await;
@@ -309,7 +316,9 @@ impl<F: LinkFactory> Engine<F> {
         heartbeat: &mut Option<Instant>,
         recovery: &mut Option<Instant>,
     ) {
-        let created = self.links.create(config, &self.hash, &self.safety_prefix);
+        let created = self
+            .links
+            .create(config, &self.hash, &self.will_wire(config));
         let (handle, events, boot) = link::spawn(created);
         self.link = Some(handle);
         self.inbound = Some(events);
@@ -387,27 +396,41 @@ impl<F: LinkFactory> Engine<F> {
         };
         match parsed.channel {
             Channel::Clip => self.on_clip(topic, payload).await,
-            Channel::Presence => self.on_presence(&parsed, payload).await,
-            Channel::Sync => self.on_roll_call(payload).await,
+            Channel::Presence => self.on_presence(topic, &parsed, payload).await,
+            Channel::Sync => self.on_roll_call(topic, payload).await,
         }
     }
 
     async fn on_clip(&mut self, topic: &str, raw: &str) {
-        let (Some(crypto), Some(config)) = (self.crypto.as_ref(), self.desired.as_ref()) else {
-            return;
-        };
         let Ok(envelope) = serde_json::from_str::<ClipEnvelope>(raw) else {
             return;
         };
         if envelope.v != PROTOCOL_VERSION {
             return;
         }
-        if envelope.dev == config.device_id {
+        if self
+            .desired
+            .as_ref()
+            .is_some_and(|config| config.device_id == envelope.dev)
+        {
             return;
         }
         if let Some(peer) = self.peers.get(&envelope.dev) {
             self.seen.insert(peer.id.clone(), Instant::now());
         }
+        let mut labeled = false;
+        if !envelope.name.is_empty() {
+            if let Some(mismatch) = self.unknown_key.get_mut(&envelope.dev) {
+                mismatch.label = envelope.name.clone();
+                labeled = true;
+            }
+        }
+        if labeled {
+            self.publish_peers();
+        }
+        let Some(crypto) = self.crypto.as_ref() else {
+            return;
+        };
         if envelope.kind == KIND_FILE {
             self.on_file_clip(&envelope, crypto, topic);
             return;
@@ -466,57 +489,86 @@ impl<F: LinkFactory> Engine<F> {
         }));
     }
 
-    async fn on_presence(&mut self, parsed: &crate::RoomTopic, raw: &str) {
-        let Some(config) = self.desired.clone() else {
+    async fn on_presence(&mut self, topic: &str, parsed: &crate::RoomTopic, raw: &str) {
+        let (Some(config), Some(crypto)) = (self.desired.clone(), self.crypto.as_ref()) else {
             return;
         };
-        if parsed.device_id.as_deref() == Some(config.device_id.as_str()) {
+        let Some(device_id) = parsed.device_id.clone() else {
+            return;
+        };
+        if device_id == config.device_id {
             return;
         }
         let Ok(envelope) = serde_json::from_str::<PresenceEnvelope>(raw) else {
             return;
         };
-        if envelope.dev == config.device_id {
+        if envelope.v != PROTOCOL_VERSION {
             return;
         }
-        if let Some(last) = self.presence_ts.get(&envelope.dev) {
-            if envelope.ts < *last {
+        let Ok(plain) = crypto.decrypt(&envelope.ct, topic.as_bytes()) else {
+            // 像一条正经 presence 却解不开：同一间房、不同钥匙，报出来让人去对安全码
+            self.note_unknown_key(&device_id);
+            return;
+        };
+        let Ok(payload) = serde_json::from_str::<PresencePayload>(&String::from_utf8_lossy(&plain))
+        else {
+            return;
+        };
+        if payload.dev == config.device_id {
+            return;
+        }
+        if self.unknown_key.remove(&device_id).is_some() {
+            self.publish_peers();
+        }
+        if let Some(last) = self.presence_ts.get(&payload.dev) {
+            if payload.ts < *last {
                 return;
             }
         }
-        self.presence_ts.insert(envelope.dev.clone(), envelope.ts);
-        let fresh = !self.peers.contains_key(&envelope.dev);
-        if envelope.online {
-            self.seen.insert(envelope.dev.clone(), Instant::now());
+        self.presence_ts.insert(payload.dev.clone(), payload.ts);
+        let fresh = !self.peers.contains_key(&payload.dev);
+        if payload.online {
+            self.seen.insert(payload.dev.clone(), Instant::now());
             self.peers.insert(
-                envelope.dev.clone(),
+                payload.dev.clone(),
                 Peer {
-                    id: envelope.dev.clone(),
-                    name: envelope.name,
-                    safety: envelope.sp,
-                    os: envelope.os,
+                    id: payload.dev.clone(),
+                    name: payload.name,
+                    os: payload.os,
                 },
             );
         } else {
-            self.peers.remove(&envelope.dev);
-            self.seen.remove(&envelope.dev);
-            self.presence_ts.remove(&envelope.dev);
+            self.peers.remove(&payload.dev);
+            self.seen.remove(&payload.dev);
+            self.presence_ts.remove(&payload.dev);
+            self.unknown_key.remove(&payload.dev);
         }
         self.prune_peers();
         self.publish_peers();
-        if fresh && envelope.online {
+        if fresh && payload.online {
             self.publish_presence(true).await;
         }
     }
 
-    async fn on_roll_call(&mut self, raw: &str) {
-        let Some(config) = self.desired.as_ref() else {
+    async fn on_roll_call(&mut self, topic: &str, raw: &str) {
+        let (Some(config), Some(crypto)) = (self.desired.as_ref(), self.crypto.as_ref()) else {
             return;
         };
         let Ok(envelope) = serde_json::from_str::<PresenceEnvelope>(raw) else {
             return;
         };
-        if envelope.dev == config.device_id {
+        if envelope.v != PROTOCOL_VERSION {
+            return;
+        }
+        // sync 频道没有设备号，解不开就只当没听见；那台设备随后会在自己的 presence 频道报上来
+        let Ok(plain) = crypto.decrypt(&envelope.ct, topic.as_bytes()) else {
+            return;
+        };
+        let Ok(payload) = serde_json::from_str::<PresencePayload>(&String::from_utf8_lossy(&plain))
+        else {
+            return;
+        };
+        if payload.dev == config.device_id {
             return;
         }
         self.publish_presence(true).await;
@@ -538,7 +590,7 @@ impl<F: LinkFactory> Engine<F> {
             Err(_) => return,
         };
         let envelope = ClipEnvelope {
-            mid: text_mid(&payload, &config.device_id),
+            mid: random_mid(),
             ts: now_millis(),
             dev: config.device_id.clone(),
             name: config.device_name.clone(),
@@ -615,24 +667,49 @@ impl<F: LinkFactory> Engine<F> {
         }
     }
 
+    /// presence 整条进密文，AAD 用它落进的那条 topic：点名帧在 sync 频道，正常帧在各自的 presence 频道。
+    fn presence_wire(
+        &self,
+        topic: &str,
+        config: &Config,
+        online: bool,
+        answer: bool,
+    ) -> Option<String> {
+        let crypto = self.crypto.as_ref()?;
+        let json = serde_json::to_string(&PresencePayload {
+            dev: config.device_id.clone(),
+            name: config.device_name.clone(),
+            os: config.device_os.clone(),
+            online,
+            ts: now_millis(),
+            answer,
+        })
+        .ok()?;
+        let ct = crypto.encrypt(json.as_bytes(), topic.as_bytes()).ok()?;
+        serde_json::to_string(&PresenceEnvelope {
+            ct,
+            ..Default::default()
+        })
+        .ok()
+    }
+
+    /// 遗嘱在握手时就定死内容：断线后由 broker 原样发出去，所以这里得先加密好。
+    fn will_wire(&self, config: &Config) -> String {
+        let topic = presence_topic(&self.hash, &config.device_id);
+        self.presence_wire(&topic, config, false, false)
+            .unwrap_or_default()
+    }
+
     async fn publish_presence(&mut self, online: bool) {
         let Some(config) = self.desired.clone() else {
             return;
         };
-        let payload = serde_json::to_string(&PresenceEnvelope {
-            dev: config.device_id.clone(),
-            name: config.device_name.clone(),
-            online,
-            ts: now_millis(),
-            sp: self.safety_prefix.clone(),
-            os: config.device_os.clone(),
-            ..Default::default()
-        })
-        .unwrap();
+        let topic = presence_topic(&self.hash, &config.device_id);
+        let Some(wire) = self.presence_wire(&topic, &config, online, false) else {
+            return;
+        };
         if let Some(handle) = self.link.clone() {
-            let _ = handle
-                .publish(&presence_topic(&self.hash, &config.device_id), &payload)
-                .await;
+            let _ = handle.publish(&topic, &wire).await;
         }
     }
 
@@ -640,19 +717,12 @@ impl<F: LinkFactory> Engine<F> {
         let Some(config) = self.desired.clone() else {
             return;
         };
-        let payload = serde_json::to_string(&PresenceEnvelope {
-            dev: config.device_id.clone(),
-            name: config.device_name.clone(),
-            online: true,
-            ts: now_millis(),
-            sp: self.safety_prefix.clone(),
-            os: config.device_os.clone(),
-            answer: true,
-            ..Default::default()
-        })
-        .unwrap();
+        let topic = sync_topic(&self.hash);
+        let Some(wire) = self.presence_wire(&topic, &config, true, true) else {
+            return;
+        };
         if let Some(handle) = self.link.clone() {
-            let _ = handle.publish(&sync_topic(&self.hash), &payload).await;
+            let _ = handle.publish(&topic, &wire).await;
         }
     }
 
@@ -664,28 +734,47 @@ impl<F: LinkFactory> Engine<F> {
             .filter(|(_, seen)| **seen < cutoff)
             .map(|(id, _)| id.clone())
             .collect();
-        for id in gone {
-            self.peers.remove(&id);
-            self.seen.remove(&id);
-            self.presence_ts.remove(&id);
+        for id in &gone {
+            self.peers.remove(id);
+            self.seen.remove(id);
+            self.presence_ts.remove(id);
+        }
+        let stale: Vec<String> = self
+            .unknown_key
+            .iter()
+            .filter(|(_, m)| m.seen < cutoff)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &stale {
+            self.unknown_key.remove(id);
+        }
+        if !gone.is_empty() || !stale.is_empty() {
+            self.publish_peers();
         }
     }
 
+    /// 往我们频道灌一条像模像样却解不开的 presence，代价是把名单灌到上限为止。
+    fn note_unknown_key(&mut self, device_id: &str) {
+        if self.unknown_key.contains_key(device_id) || self.unknown_key.len() >= MAX_UNKNOWN_KEY {
+            return;
+        }
+        self.unknown_key.insert(
+            device_id.to_string(),
+            Mismatch {
+                seen: Instant::now(),
+                label: device_id.chars().take(MISMATCH_ID_CHARS).collect(),
+            },
+        );
+        self.publish_peers();
+    }
+
     fn publish_peers(&mut self) {
-        let mut peers: Vec<Peer> = self
-            .peers
-            .values()
-            .filter(|peer| peer.safety == self.safety_prefix)
-            .cloned()
-            .collect();
+        let mut peers: Vec<Peer> = self.peers.values().cloned().collect();
         peers.sort_by(|a, b| a.name.cmp(&b.name));
-        let mut mismatch: Vec<String> = self
-            .peers
-            .values()
-            .filter(|peer| !peer.safety.is_empty() && peer.safety != self.safety_prefix)
-            .map(|peer| peer.name.clone())
-            .collect();
+        let mut mismatch: Vec<String> =
+            self.unknown_key.values().map(|m| m.label.clone()).collect();
         mismatch.sort();
+        mismatch.truncate(MAX_UNKNOWN_KEY);
         let _ = self.events.send(Event::Peers(peers));
         let _ = self.events.send(Event::KeyMismatch(mismatch));
     }
@@ -694,6 +783,7 @@ impl<F: LinkFactory> Engine<F> {
         self.peers.clear();
         self.seen.clear();
         self.presence_ts.clear();
+        self.unknown_key.clear();
         self.publish_peers();
     }
 

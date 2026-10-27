@@ -47,19 +47,20 @@ pub enum FileCryptoError {
     SizeMismatch,
 }
 
-pub fn file_aad(name: &str, mime: &str, size: i64, sha256: &str) -> Vec<u8> {
-    format!("{name}\n{mime}\n{size}\n{sha256}").into_bytes()
+pub fn file_aad(topic: &str, name: &str, mime: &str, size: i64, sha256: &str) -> Vec<u8> {
+    format!("{topic}\n{name}\n{mime}\n{size}\n{sha256}").into_bytes()
 }
 
-/// 文件字节用元数据做 AAD：换包、改大小或改名都会在 GCM 阶段失败。
+/// 文件字节用 topic + 元数据做 AAD：换房间搬运、改大小或改名都会在 GCM 阶段失败。
 pub fn encrypt_file(
     room: &RoomCrypto,
+    topic: &str,
     name: &str,
     mime: &str,
     plain: &[u8],
 ) -> Result<EncryptedFile, RoomError> {
     let sha = sha256_hex(plain);
-    let aad = file_aad(name, mime, plain.len() as i64, &sha);
+    let aad = file_aad(topic, name, mime, plain.len() as i64, &sha);
     Ok(EncryptedFile {
         cipher: room.encrypt_bytes(plain, &aad)?,
         name: name.to_string(),
@@ -71,13 +72,14 @@ pub fn encrypt_file(
 
 pub fn decrypt_file(
     room: &RoomCrypto,
+    topic: &str,
     name: &str,
     mime: &str,
     size: i64,
     sha256: &str,
     cipher: &[u8],
 ) -> Result<Vec<u8>, FileCryptoError> {
-    let aad = file_aad(name, mime, size, sha256);
+    let aad = file_aad(topic, name, mime, size, sha256);
     let plain = room.decrypt_bytes(cipher, &aad)?;
     if sha256_hex(&plain) != sha256 {
         return Err(FileCryptoError::ShaMismatch);
@@ -237,18 +239,20 @@ mod tests {
     use super::*;
 
     const ROOM: &str = "TESTROOM01";
+    const TOPIC: &str = "cs/v1/61232506/clip";
     const PAYLOAD: &[u8] = "ClipSync 文件内容 📡\nsecond line".as_bytes();
 
     #[test]
     fn roundtrip_preserves_content() {
         let alice = RoomCrypto::open(ROOM, "").unwrap();
         let bob = RoomCrypto::open(ROOM, "").unwrap();
-        let enc = encrypt_file(&alice, "shot.png", "image/png", PAYLOAD).unwrap();
+        let enc = encrypt_file(&alice, TOPIC, "shot.png", "image/png", PAYLOAD).unwrap();
         assert_eq!(enc.size, PAYLOAD.len() as i64);
         assert_eq!(enc.name, "shot.png");
         assert_eq!(enc.sha256.len(), 64);
         let plain = decrypt_file(
             &bob,
+            TOPIC,
             &enc.name,
             &enc.mime,
             enc.size,
@@ -262,20 +266,31 @@ mod tests {
     #[test]
     fn tampered_cipher_fails() {
         let room = RoomCrypto::open(ROOM, "").unwrap();
-        let enc = encrypt_file(&room, "a.bin", "application/octet-stream", PAYLOAD).unwrap();
+        let enc = encrypt_file(&room, TOPIC, "a.bin", "application/octet-stream", PAYLOAD).unwrap();
         let mut cipher = enc.cipher.clone();
         let middle = cipher.len() / 2;
         cipher[middle] ^= 0xFF;
-        assert!(decrypt_file(&room, &enc.name, &enc.mime, enc.size, &enc.sha256, &cipher).is_err());
+        assert!(decrypt_file(
+            &room,
+            TOPIC,
+            &enc.name,
+            &enc.mime,
+            enc.size,
+            &enc.sha256,
+            &cipher
+        )
+        .is_err());
     }
 
     #[test]
     fn wrong_room_password_fails() {
         let alice = RoomCrypto::open(ROOM, "pw1").unwrap();
         let mallory = RoomCrypto::open(ROOM, "pw2").unwrap();
-        let enc = encrypt_file(&alice, "a.bin", "application/octet-stream", PAYLOAD).unwrap();
+        let enc =
+            encrypt_file(&alice, TOPIC, "a.bin", "application/octet-stream", PAYLOAD).unwrap();
         assert!(decrypt_file(
             &mallory,
+            TOPIC,
             &enc.name,
             &enc.mime,
             enc.size,
@@ -288,9 +303,10 @@ mod tests {
     #[test]
     fn metadata_substitution_fails() {
         let room = RoomCrypto::open(ROOM, "").unwrap();
-        let enc = encrypt_file(&room, "real.png", "image/png", PAYLOAD).unwrap();
+        let enc = encrypt_file(&room, TOPIC, "real.png", "image/png", PAYLOAD).unwrap();
         assert!(decrypt_file(
             &room,
+            TOPIC,
             "fake.png",
             &enc.mime,
             enc.size,
@@ -300,6 +316,7 @@ mod tests {
         .is_err());
         assert!(decrypt_file(
             &room,
+            TOPIC,
             &enc.name,
             &enc.mime,
             enc.size + 1,
@@ -310,10 +327,35 @@ mod tests {
     }
 
     #[test]
+    fn another_room_cannot_replay_the_cipher() {
+        let room = RoomCrypto::open(ROOM, "").unwrap();
+        let enc = encrypt_file(&room, TOPIC, "a.bin", "application/octet-stream", PAYLOAD).unwrap();
+        assert!(decrypt_file(
+            &room,
+            "cs/v1/otherhash/clip",
+            &enc.name,
+            &enc.mime,
+            enc.size,
+            &enc.sha256,
+            &enc.cipher
+        )
+        .is_err());
+    }
+
+    #[test]
     fn empty_file_roundtrip() {
         let room = RoomCrypto::open(ROOM, "").unwrap();
-        let enc = encrypt_file(&room, "empty.txt", "text/plain", b"").unwrap();
-        let plain = decrypt_file(&room, &enc.name, &enc.mime, 0, &enc.sha256, &enc.cipher).unwrap();
+        let enc = encrypt_file(&room, TOPIC, "empty.txt", "text/plain", b"").unwrap();
+        let plain = decrypt_file(
+            &room,
+            TOPIC,
+            &enc.name,
+            &enc.mime,
+            0,
+            &enc.sha256,
+            &enc.cipher,
+        )
+        .unwrap();
         assert!(plain.is_empty());
     }
 
@@ -330,10 +372,10 @@ mod tests {
     }
 
     #[test]
-    fn file_aad_pins_all_metadata() {
+    fn file_aad_pins_topic_and_metadata() {
         assert_eq!(
-            String::from_utf8(file_aad("a.png", "image/png", 7, "ab")).unwrap(),
-            "a.png\nimage/png\n7\nab"
+            String::from_utf8(file_aad("t", "a.png", "image/png", 7, "ab")).unwrap(),
+            "t\na.png\nimage/png\n7\nab"
         );
     }
 

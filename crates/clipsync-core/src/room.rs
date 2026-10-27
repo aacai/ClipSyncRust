@@ -5,7 +5,7 @@ use crate::crypto::{
     aes_gcm_decrypt, aes_gcm_encrypt, argon2id, random_iv, sha256, CryptoError, IV_SIZE, KEY_SIZE,
     TAG_SIZE,
 };
-use crate::protocol::{safety_number, safety_prefix};
+use crate::protocol::safety_number;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RoomError {
@@ -65,10 +65,6 @@ impl RoomCrypto {
 
     pub fn safety_number(&self) -> String {
         safety_number(&self.key[..])
-    }
-
-    pub fn safety_prefix(&self) -> String {
-        safety_prefix(&self.safety_number())
     }
 
     pub fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> Result<String, RoomError> {
