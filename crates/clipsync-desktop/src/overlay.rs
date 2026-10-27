@@ -1876,8 +1876,7 @@ fn resize_cursor(handle: Handle) -> CursorIcon {
 /// 工具栏图标：18×18 点的小线条，和 Compose `draw*Icon` 一一对应。
 fn paint_shot_icon(painter: &egui::Painter, action: ShotAction, rect: Rect, color: Color32) {
     let center = rect.center();
-    let scale = 18.0 / 18.0;
-    let p = |x: f32, y: f32| Pos2::new(center.x - 9.0 * scale + x, center.y - 9.0 * scale + y);
+    let p = |x: f32, y: f32| Pos2::new(center.x + x - 9.0, center.y + y - 9.0);
     let stroke = Stroke::new(1.6, color);
     match action {
         ShotAction::Tool(ShotTool::Select) => {
