@@ -1022,7 +1022,7 @@ dependencies = [
 
 [[package]]
 name = "clipsync-core"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1041,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "clipsync-desktop"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "ab_glyph",
  "arboard",

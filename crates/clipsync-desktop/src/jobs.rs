@@ -145,8 +145,14 @@ pub fn perform_upload(
     if let Some(reason) = validate_outgoing_file(&safe, size) {
         return Err(reject_message(reason, &safe));
     }
-    let encrypted = encrypt_file(&context.crypto, &context.clip_topic, &safe, &request.mime, &request.bytes)
-        .map_err(|error| format!("加密失败：{error}"))?;
+    let encrypted = encrypt_file(
+        &context.crypto,
+        &context.clip_topic,
+        &safe,
+        &request.mime,
+        &request.bytes,
+    )
+    .map_err(|error| format!("加密失败：{error}"))?;
     let link = context
         .client
         .upload(&upload_file_name(), &encrypted.cipher, on_progress)?;
