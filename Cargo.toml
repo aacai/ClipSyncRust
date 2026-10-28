@@ -53,3 +53,7 @@ debug-assertions = false
 [profile.release]
 debug = false
 strip = "debuginfo"
+# 发布产物只有一台机器上的 GUI，编译时间换体积：跨 crate LTO + 单 codegen unit
+# 能把 15MB 的 __text 压掉一大截（依赖里 eframe/ravif/arboard 都吃这个）。
+lto = "fat"
+codegen-units = 1
