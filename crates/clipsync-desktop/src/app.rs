@@ -46,9 +46,7 @@ const RECORD_BAR_WIDTH: f32 = 420.0;
 const RECORD_BAR_HEIGHT: f32 = 56.0;
 /// 操作栏离菜单栏的间距，和录屏工具条一致。
 const RECORD_BAR_TOP_GAP: f32 = 8.0;
-/// Time for the app window to actually leave the screen before the grab.
 const CAPTURE_HIDE_DELAY: Duration = Duration::from_millis(140);
-/// 状态卡片上那个内存读数多久取一次：每帧都去问内核没必要。
 const MEMORY_SAMPLE: Duration = Duration::from_secs(5);
 const THUMB_MAX_SIDE: u32 = 256;
 /// 同时在库里留着的缩略图张数：一屏十几行，留出滚动余量就够，再多就是白占显存。
@@ -662,9 +660,13 @@ impl ClipSyncApp {
             if self.clipboard.is_echo(&clip.text) {
                 return;
             }
-            self.clipboard.write(&clip.text);
+            let placed = self.clipboard.write(&clip.text);
             if inserted {
-                self.notify(format!("收到 {sender} 的文本，已进剪贴板"));
+                if placed {
+                    self.notify(format!("收到 {sender} 的文本，已进剪贴板"));
+                } else {
+                    self.notify_error(format!("收到 {sender} 的文本，但写入剪贴板失败"));
+                }
             }
         }
     }
@@ -2302,8 +2304,11 @@ impl ClipSyncApp {
         if text.is_empty() {
             return;
         }
-        self.clipboard.write(text);
-        self.notify(message);
+        if self.clipboard.write(text) {
+            self.notify(message);
+        } else {
+            self.notify_error("写入剪贴板失败");
+        }
     }
 
     fn copy_record(&mut self, id: &str) {
@@ -2754,8 +2759,11 @@ impl ClipSyncApp {
             return;
         }
         let json = self.history.export_json(&ids);
-        self.clipboard.write(&json);
-        self.notify(format!("已把 {} 条导出到剪贴板", ids.len()));
+        if self.clipboard.write(&json) {
+            self.notify(format!("已把 {} 条导出到剪贴板", ids.len()));
+        } else {
+            self.notify_error("写入剪贴板失败");
+        }
     }
 
     fn pin_selection(&mut self) {
@@ -3285,8 +3293,6 @@ impl ClipSyncApp {
         });
     }
 
-    /// 每 5 秒问一次内核，中间的帧直接复用上一次读数。
-    /// 不用额外催重绘：空闲时 `POLL_INTERVAL` 本来就会把帧推到 800ms 内。
     fn service_memory(&mut self) {
         if self.memory_at.elapsed() < MEMORY_SAMPLE {
             return;
@@ -6461,7 +6467,6 @@ fn status_label(status: &Status) -> &'static str {
     }
 }
 
-/// 状态后面挂上这个进程的内存读数；问不到就只显示状态，不留「未知」占位。
 fn status_line(status: &Status, memory: Option<u64>) -> String {
     let label = status_label(status);
     match memory {

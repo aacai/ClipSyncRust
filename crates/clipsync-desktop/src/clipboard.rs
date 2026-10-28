@@ -11,6 +11,9 @@ use clipsync_core::files::MAX_FILE_BYTES;
 
 pub const POLL_INTERVAL: Duration = Duration::from_millis(800);
 
+const WRITE_ATTEMPTS: usize = 6;
+const WRITE_RETRY: Duration = Duration::from_millis(25);
+
 /// How long a text we broadcast stays "ours". Long enough that the room's reply can no
 /// longer overwrite a copy the user just made, short enough that copying the same text
 /// again five minutes later is still a real clip.
@@ -204,11 +207,23 @@ impl ClipboardWatcher {
         self.own_image = None;
     }
 
-    pub fn write(&mut self, text: &str) {
+    pub fn write(&mut self, text: &str) -> bool {
         self.filter.wrote(text);
-        if let Some(clipboard) = self.clipboard.as_mut() {
-            let _ = clipboard.set_text(text);
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            return false;
+        };
+        let mut placed = false;
+        for attempt in 0..WRITE_ATTEMPTS {
+            match clipboard.set_text(text) {
+                Ok(()) => {
+                    placed = true;
+                    break;
+                }
+                Err(_) if attempt + 1 < WRITE_ATTEMPTS => std::thread::sleep(WRITE_RETRY),
+                Err(_) => break,
+            }
         }
+        placed && clipboard.get_text().is_ok_and(|back| back == text)
     }
 
     pub fn note_published(&mut self, text: &str) {
@@ -449,5 +464,25 @@ mod tests {
         assert_eq!(a, image_hash(&[1, 2, 3, 4], 1, 1));
         assert_ne!(a, image_hash(&[1, 2, 3, 5], 1, 1));
         assert_ne!(a, image_hash(&[1, 2, 3, 4], 2, 1));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn writing_text_reports_true_only_when_the_pasteboard_has_it() {
+        use super::ClipboardWatcher;
+        let mut watcher = ClipboardWatcher::new();
+        let Some(clipboard) = watcher.clipboard.as_mut() else {
+            return;
+        };
+        let Ok(original) = clipboard.get_text() else {
+            return;
+        };
+        let text = format!("clipsync-write-check-{}", std::process::id());
+        assert!(watcher.write(&text));
+        assert_eq!(
+            watcher.clipboard.as_mut().and_then(|c| c.get_text().ok()),
+            Some(text)
+        );
+        assert!(watcher.write(&original));
     }
 }
