@@ -46,16 +46,37 @@ pub fn latest() -> Result<Release, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(20))
         .build();
-    let response = agent
+    let response = match agent
         .get(ENDPOINT)
         .set("User-Agent", "ClipSync")
         .set("Accept", "application/vnd.github+json")
         .call()
-        .map_err(|error| format!("连不上发布页：{error}"))?;
+    {
+        Ok(response) => response,
+        Err(ureq::Error::Status(code, response)) => {
+            let body = response.into_string().unwrap_or_default();
+            return Err(status_detail(code, &body));
+        }
+        Err(ureq::Error::Transport(error)) => return Err(format!("连不上发布页：{error}")),
+    };
     let raw = response
         .into_string()
         .map_err(|error| format!("发布页返回的内容读不出来：{error}"))?;
     decode_release(&raw)
+}
+
+/// 被拒绝时 GitHub 会把原因写在 body 的 message 里（限流就是这条），别只报个状态码。
+fn status_detail(code: u16, body: &str) -> String {
+    let reason = serde_json::from_str::<ReleaseDto>(body)
+        .ok()
+        .and_then(|dto| dto.message)
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| format!("HTTP {code}"));
+    let reason = reason.trim();
+    format!(
+        "发布页拒绝了这个请求：{}",
+        reason.chars().take(200).collect::<String>()
+    )
 }
 
 pub fn download(url: &str, mut on_progress: impl FnMut(i64)) -> Result<Vec<u8>, String> {
@@ -230,7 +251,10 @@ pub fn arch() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{asset_for, decode_release, installer_extension, is_behind, Release, ReleaseAsset};
+    use super::{
+        asset_for, decode_release, installer_extension, is_behind, status_detail, Release,
+        ReleaseAsset,
+    };
 
     fn release(assets: &[(&str, &str, i64)]) -> Release {
         Release {
@@ -282,6 +306,30 @@ mod tests {
         assert_eq!(
             decode_release(r#"{"tag_name":"","message":"API rate limit exceeded"}"#).unwrap_err(),
             "API rate limit exceeded"
+        );
+    }
+
+    #[test]
+    fn a_refused_request_reports_the_reason_github_gave() {
+        assert_eq!(
+            status_detail(403, r#"{"message":"API rate limit exceeded for 1.2.3.4."}"#),
+            "发布页拒绝了这个请求：API rate limit exceeded for 1.2.3.4."
+        );
+        // 状态码错误时 body 未必是 JSON，读不懂也不能把码丢了
+        assert_eq!(
+            status_detail(404, "<html>404: Not Found</html>"),
+            "发布页拒绝了这个请求：HTTP 404"
+        );
+        assert_eq!(
+            status_detail(451, r#"{"message":"   "}"#),
+            "发布页拒绝了这个请求：HTTP 451"
+        );
+        let long = format!("x{}", ".".repeat(300));
+        assert_eq!(
+            status_detail(403, &format!(r#"{{"message":"{long}"}}"#))
+                .chars()
+                .count(),
+            "发布页拒绝了这个请求：".chars().count() + 200
         );
     }
 
