@@ -49,6 +49,10 @@ const RECORD_BAR_TOP_GAP: f32 = 8.0;
 /// Time for the app window to actually leave the screen before the grab.
 const CAPTURE_HIDE_DELAY: Duration = Duration::from_millis(140);
 const THUMB_MAX_SIDE: u32 = 256;
+/// 同时在库里留着的缩略图张数：一屏十几行，留出滚动余量就够，再多就是白占显存。
+const THUMB_CACHE: usize = 48;
+/// 视口上下各多准备这么高的行，快速滚动时不至于先看到空位。
+const THUMB_SCAN: f32 = 640.0;
 const ZOOM_MAX_SIDE: u32 = 2048;
 const REPO_URL: &str = "https://github.com/aacai/ClipSyncRust";
 
@@ -102,6 +106,7 @@ pub struct ClipSyncApp {
     /// 本帧末尾交给系统拖出（访达/资源管理器）。
     pending_drag_out: Option<Vec<PathBuf>>,
     thumbnails: HashMap<String, ThumbEntry>,
+    thumb_tick: u64,
     zoom: Option<String>,
     zoom_texture: Option<(String, TextureHandle)>,
     zoom_failed: Option<String>,
@@ -168,7 +173,7 @@ enum RecordPhase {
     /// 指令已发出，ScreenCaptureKit 还没回「开始」。
     Preparing,
     Recording,
-    /// 已请求停止，正在等 moov 写完并把文件读回来。
+    /// 已请求停止，正在等 moov 落盘并把收尾结论带回来。
     Stopping,
 }
 
@@ -234,6 +239,7 @@ struct ThumbEntry {
     path: String,
     texture: Option<TextureHandle>,
     attempted: bool,
+    used: u64,
 }
 
 #[derive(Clone)]
@@ -360,7 +366,9 @@ struct RowView<'a> {
     online: bool,
     can_up: bool,
     can_down: bool,
-    thumb: Option<&'a TextureHandle>,
+    /// 该行是否给缩略图留位置（由记录决定）。
+    slot: bool,
+    thumb: Option<TextureHandle>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -446,6 +454,7 @@ impl ClipSyncApp {
             pending_cache: HashMap::new(),
             pending_drag_out: None,
             thumbnails: HashMap::new(),
+            thumb_tick: 0,
             zoom: None,
             zoom_texture: None,
             zoom_failed: None,
@@ -849,7 +858,8 @@ impl ClipSyncApp {
     fn record_local_file(&mut self, name: &str, mime: &str, bytes: &[u8]) {
         let id = new_id();
         let path = crate::paths::write_cache(&id, name, bytes).ok();
-        self.record_file_entry(id, name, mime, bytes, path);
+        let sha256 = clipsync_core::crypto::sha256_hex(bytes);
+        self.record_file_entry(id, name, mime, bytes.len() as i64, sha256, path);
     }
 
     fn record_file_entry(
@@ -857,7 +867,8 @@ impl ClipSyncApp {
         id: String,
         name: &str,
         mime: &str,
-        bytes: &[u8],
+        size: i64,
+        sha256: String,
         local_path: Option<String>,
     ) {
         let ts = now_millis();
@@ -872,8 +883,8 @@ impl ClipSyncApp {
             file: Some(FileInfo {
                 name: name.to_string(),
                 mime: mime.to_string(),
-                size: bytes.len() as i64,
-                sha256: clipsync_core::crypto::sha256_hex(bytes),
+                size,
+                sha256,
                 link: String::new(),
                 expires_at: 0,
                 cached: local_path.is_some(),
@@ -1454,7 +1465,9 @@ impl ClipSyncApp {
         &mut self,
         ctx: &egui::Context,
         stop_error: Option<String>,
-        bytes: Vec<u8>,
+        temp: PathBuf,
+        size: i64,
+        finished: bool,
     ) {
         if self.record_phase != RecordPhase::Stopping {
             return;
@@ -1466,11 +1479,9 @@ impl ClipSyncApp {
         self.record_rechecked = false;
         // 开录前窗口是露着的才抬回来；本来收在托盘里就继续收着。
         self.restore_record_window(ctx);
-        let Some(temp) = self.record_path.take() else {
-            return;
-        };
+        self.record_path = None;
         // 没收尾的 mp4 没有 moov，播放器打不开；宁可丢掉也不能当成功写进列表。
-        if !crate::record::is_finished(&bytes) {
+        if !finished {
             let _ = std::fs::remove_file(&temp);
             let reason = stop_error.unwrap_or_else(|| "录像没有正常收尾".to_string());
             self.notify_error(format!("{reason}，文件不完整，已丢弃"));
@@ -1478,47 +1489,44 @@ impl ClipSyncApp {
         }
         let id = new_id();
         let name = format!("录屏-{}.mp4", &id[..8]);
-        // 预览和列表要同一条真实路径；adopt 失败时再写一份缓存兜底。
-        let cached = crate::paths::adopt_cache(&id, &name, &temp)
-            .ok()
-            .or_else(|| crate::paths::write_cache(&id, &name, &bytes).ok());
-        if let Some(path) = cached.as_ref() {
-            let _ = self.clipboard.write_files(&[PathBuf::from(path)]);
-        }
-        // 缓存写失败也别把预览吞掉：临时文件还在，先让用户能看能删。
-        let preview_path = cached
-            .as_ref()
+        // 字节已经在盘上了，搬不进缓存也守着临时文件继续用，别再抄一份。
+        let stored = crate::paths::adopt_cache(&id, &name, &temp)
             .map(PathBuf::from)
-            .unwrap_or_else(|| temp.clone());
-        self.record_preview = Some(preview::Preview::open(preview_path, name.clone()));
-        if bytes.len() as i64 > MAX_FILE_BYTES {
+            .unwrap_or_else(|_| temp.clone());
+        let _ = self.clipboard.write_files(std::slice::from_ref(&stored));
+        self.record_preview = Some(preview::Preview::open(stored.clone(), name.clone()));
+        let syncable = matches!(self.status, Status::Online { .. }) && self.room_crypto.is_some();
+        if !syncable || size > MAX_FILE_BYTES {
             let clip_id = id.clone();
-            self.record_file_entry(id, &name, "video/mp4", &bytes, cached);
+            let sha256 = clipsync_core::crypto::sha256_hex_file(&stored).unwrap_or_default();
+            let local_path = Some(stored.to_string_lossy().into_owned());
+            self.record_file_entry(id, &name, "video/mp4", size, sha256, local_path);
             if let Some(preview) = self.record_preview.as_mut() {
                 preview.set_clip_id(clip_id);
             }
-            self.notify(format!(
-                "录像已留在本机，超过 {}MB 无法同步",
-                clipsync_core::files::max_mb()
-            ));
+            self.notify(if size > MAX_FILE_BYTES {
+                format!(
+                    "录像已留在本机，超过 {}MB 无法同步",
+                    clipsync_core::files::max_mb()
+                )
+            } else {
+                "录像已留在本机列表，也放进了剪贴板".to_string()
+            });
             return;
         }
-        if matches!(self.status, Status::Online { .. }) && self.room_crypto.is_some() {
-            self.start_uploads(vec![UploadRequest {
-                name,
-                mime: "video/mp4".to_string(),
-                bytes,
-                target: UploadTarget::Publish { cache: true },
-                cached,
-            }]);
-            self.notify("录像已存进列表，也放进了剪贴板");
-        } else {
-            let clip_id = id.clone();
-            self.record_file_entry(id, &name, "video/mp4", &bytes, cached);
-            if let Some(preview) = self.record_preview.as_mut() {
-                preview.set_clip_id(clip_id);
+        // 只有真要同步才把整段读进来：加密上传绕不开这一份。
+        match std::fs::read(&stored) {
+            Ok(bytes) => {
+                self.start_uploads(vec![UploadRequest {
+                    name,
+                    mime: "video/mp4".to_string(),
+                    bytes,
+                    target: UploadTarget::Publish { cache: true },
+                    cached: Some(stored.to_string_lossy().into_owned()),
+                }]);
+                self.notify("录像已存进列表，也放进了剪贴板");
             }
-            self.notify("录像已留在本机列表，也放进了剪贴板");
+            Err(error) => self.notify_error(format!("录像读不出来：{error}")),
         }
     }
 
@@ -1533,9 +1541,12 @@ impl ClipSyncApp {
                         ctx.request_repaint();
                     }
                 }
-                record::Event::Stopped { error, bytes } => {
-                    self.on_record_stopped(ctx, error, bytes);
-                }
+                record::Event::Stopped {
+                    error,
+                    path,
+                    size,
+                    finished,
+                } => self.on_record_stopped(ctx, error, path, size, finished),
             }
         }
     }
@@ -2523,45 +2534,79 @@ impl ClipSyncApp {
         self.delete_records(ids);
     }
 
-    fn ensure_thumbnails(&mut self, ctx: &egui::Context) {
-        let wanted: Vec<(String, String)> = self
-            .history
-            .items
-            .iter()
-            .filter_map(|record| {
-                let file = record.file.as_ref()?;
-                if !is_image(&file.mime) {
-                    return None;
-                }
-                let path = file.local_path.as_ref().filter(|_| file.cached)?;
-                Some((record.id.clone(), path.clone()))
-            })
-            .collect();
-        for (id, path) in wanted {
-            let stale = self
-                .thumbnails
-                .get(&id)
-                .map_or(true, |entry| entry.path != path);
-            if stale {
-                let texture = load_texture(ctx, &path, THUMB_MAX_SIDE, format!("thumb-{id}"));
-                self.thumbnails.insert(
-                    id,
-                    ThumbEntry {
-                        path,
-                        texture,
-                        attempted: true,
-                    },
-                );
-            } else if let Some(entry) = self.thumbnails.get_mut(&id) {
-                if !entry.attempted {
-                    entry.attempted = true;
-                    entry.texture =
-                        load_texture(ctx, &entry.path, THUMB_MAX_SIDE, format!("thumb-{id}"));
-                }
-            }
-        }
+    /// 条目没了就把纹理放掉，别让显存里留着已删除记录的图。
+    fn prune_thumbnails(&mut self) {
         self.thumbnails
             .retain(|id, _| self.history.items.iter().any(|record| &record.id == id));
+    }
+
+    /// 行上要不要留缩略图的位置：看记录本身，不看纹理到没到，否则图晚一帧就会让行跳。
+    fn has_thumb_slot(record: &Record) -> bool {
+        record
+            .file
+            .as_ref()
+            .is_some_and(|file| file.cached && file.local_path.is_some() && is_image(&file.mime))
+    }
+
+    fn thumb_key(record: &Record) -> Option<(String, String)> {
+        if !Self::has_thumb_slot(record) {
+            return None;
+        }
+        let file = record.file.as_ref()?;
+        Some((record.id.clone(), file.local_path.clone()?))
+    }
+
+    /// 缩略图按需解码：一次全屏解码就是几十 MB，500 条历史全部预解码能把峰值顶到 200MB。
+    /// 缓存只留最近的 THUMB_CACHE 张，划过去的旧图腾地方。
+    fn load_thumb(
+        &mut self,
+        ctx: &egui::Context,
+        id: String,
+        path: String,
+    ) -> Option<TextureHandle> {
+        self.thumb_tick += 1;
+        let used = self.thumb_tick;
+        let known = self
+            .thumbnails
+            .get(&id)
+            .filter(|entry| entry.path == path)
+            .map(|entry| (entry.attempted, entry.texture.clone()));
+        if let Some((attempted, texture)) = known {
+            if attempted {
+                if let Some(entry) = self.thumbnails.get_mut(&id) {
+                    entry.used = used;
+                }
+                return texture;
+            }
+        } else {
+            self.thumbnails.insert(
+                id.clone(),
+                ThumbEntry {
+                    path: path.clone(),
+                    texture: None,
+                    attempted: false,
+                    used,
+                },
+            );
+        }
+        if self.thumbnails.len() > THUMB_CACHE {
+            let laziest = self
+                .thumbnails
+                .iter()
+                .filter(|(held, _)| *held != &id)
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(held, _)| held.clone());
+            if let Some(laziest) = laziest {
+                self.thumbnails.remove(&laziest);
+            }
+        }
+        let texture = load_texture(ctx, &path, THUMB_MAX_SIDE, format!("thumb-{id}"));
+        if let Some(entry) = self.thumbnails.get_mut(&id) {
+            entry.attempted = true;
+            entry.used = used;
+            entry.texture = texture.clone();
+        }
+        texture
     }
 
     fn open_zoom(&mut self, id: &str) {
@@ -3342,7 +3387,7 @@ impl ClipSyncApp {
             self.history.flush();
             return;
         }
-        self.ensure_thumbnails(&ctx);
+        self.prune_thumbnails();
         self.ensure_zoom(&ctx);
         self.header_bottom = self.header(&ctx);
 
@@ -3378,7 +3423,19 @@ impl ClipSyncApp {
                                 let now = now_millis();
                                 let online = matches!(self.status, Status::Online { .. });
                                 ui.spacing_mut().item_spacing.y = 0.0;
+                                let area = ui.clip_rect();
                                 for (position, index) in visible.iter().enumerate() {
+                                    let row_top = ui.cursor().top();
+                                    // 视口附近才解码，远处的行等滚过来再补。
+                                    let key = if row_top + THUMB_SCAN >= area.top()
+                                        && row_top <= area.bottom() + THUMB_SCAN
+                                    {
+                                        ClipSyncApp::thumb_key(&self.history.items[*index])
+                                    } else {
+                                        None
+                                    };
+                                    let thumb = key
+                                        .and_then(|(id, path)| self.load_thumb(ui.ctx(), id, path));
                                     let record = &self.history.items[*index];
                                     let info = self.history.move_info(&record.id);
                                     let view = RowView {
@@ -3390,10 +3447,8 @@ impl ClipSyncApp {
                                         online,
                                         can_up: info.is_some_and(|info| info.position > info.from),
                                         can_down: info.is_some_and(|info| info.position < info.to),
-                                        thumb: self
-                                            .thumbnails
-                                            .get(&record.id)
-                                            .and_then(|entry| entry.texture.as_ref()),
+                                        slot: ClipSyncApp::has_thumb_slot(record),
+                                        thumb,
                                     };
                                     let scroll =
                                         self.nav_scroll.as_deref() == Some(record.id.as_str());
@@ -4894,10 +4949,8 @@ impl ClipSyncApp {
                             .find(|record| &record.id == id)
                             .cloned();
                         if let Some(record) = record {
-                            if let Some(texture) = self
-                                .thumbnails
-                                .get(id)
-                                .and_then(|entry| entry.texture.clone())
+                            if let Some(texture) = Self::thumb_key(&record)
+                                .and_then(|(thumb_id, path)| self.load_thumb(ui.ctx(), thumb_id, path))
                             {
                                 let image = ui.add(
                                     egui::Image::new(&texture)
@@ -5402,6 +5455,7 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
         online,
         can_up,
         can_down,
+        slot,
         thumb,
     } = view;
     let font = FontId::proportional(14.0);
@@ -5417,7 +5471,7 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
         4.0
     };
     let action_reserve = 8.0 + quick_actions * 30.0 + (quick_actions - 1.0) * 2.0 + 8.0;
-    let thumb_gap = if thumb.is_some() { 54.0 } else { 8.0 };
+    let thumb_gap = if slot { 54.0 } else { 8.0 };
     let avail = ui.available_width();
     let card_w = (avail - theme::ROW_INSET * 2.0).max(240.0);
     let text_w = (card_w - left_pad - number_w - thumb_gap - action_reserve - 10.0).max(150.0);
@@ -5453,7 +5507,7 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
     let galley = ui.ctx().fonts_mut(|fonts| fonts.layout_job(body));
     let text_h = galley.size().y.max(20.0);
     let line_center = first_line_center(&galley);
-    let (top_pad, thumb_top) = if thumb.is_some() {
+    let (top_pad, thumb_top) = if slot {
         ((9.0 + 16.0 - line_center).max(10.0), 9.0)
     } else {
         (10.0, 0.0)
@@ -5553,7 +5607,7 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
     }
 
     let mut zoom_clicked = false;
-    if let Some(texture) = thumb {
+    if let Some(texture) = &thumb {
         let thumb_rect = Rect::from_min_size(
             Pos2::new(
                 card.left() + left_pad + number_w + 8.0,
@@ -6954,6 +7008,17 @@ fn relative_time(ts: i64, now: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{human_left, random_room_code, relative_time, sanitize_room, selection_payload};
+    use std::sync::Mutex;
+
+    /// `ClipSyncApp::new` 抓一次真剪贴板，而 NSPasteboard 的类型缓存不容两个线程同时动：
+    /// 并发构造直接 SIGSEGV 在 `objc_msgSend`。真程序只有一条 UI 线程，所以只有测试需要这把锁。
+    static PASTEBOARD: Mutex<()> = Mutex::new(());
+
+    fn app_lock() -> std::sync::MutexGuard<'static, ()> {
+        PASTEBOARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn relative_time_speaks_chinese() {
@@ -7090,6 +7155,8 @@ mod tests {
     fn list_viewport_clips_at_the_glass_header_top() {
         use clipsync_core::{engine, mqtt::BrokerLinks};
 
+        let _pasteboard = app_lock();
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -7178,6 +7245,219 @@ mod tests {
                 rect.min.y,
             );
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thumbnails_only_load_the_rows_near_the_viewport() {
+        use clipsync_core::{engine, mqtt::BrokerLinks};
+
+        let _pasteboard = app_lock();
+
+        fn png() -> Vec<u8> {
+            let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                64,
+                64,
+                image::Rgba([9, 200, 60, 255]),
+            ));
+            let mut out = std::io::Cursor::new(Vec::new());
+            image
+                .write_to(&mut out, image::ImageFormat::Png)
+                .expect("png");
+            out.into_inner()
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+
+        let dir = std::env::temp_dir().join(format!("clipsync-thumbs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (_show_tx, show_rx) = std::sync::mpsc::channel();
+        let mut app = super::ClipSyncApp::new(
+            engine::spawn(BrokerLinks),
+            super::History::open(dir.join("history.json")),
+            super::Settings::open(dir.join("settings.json"), "thumbs-test"),
+            super::Preferences::open(dir.join("preferences.json")),
+            None,
+            show_rx,
+            None,
+        );
+        for index in 0..70 {
+            let path = dir.join(format!("clip{index}.png"));
+            std::fs::write(&path, png()).unwrap();
+            app.history.add(super::Record {
+                id: format!("id{index}"),
+                kind: super::KIND_FILE.to_string(),
+                ts: 1_730_000_000_000,
+                sender_id: String::new(),
+                sender_name: "test".to_string(),
+                text: format!("图 {index}"),
+                file: Some(super::FileInfo {
+                    name: format!("clip{index}.png"),
+                    mime: "image/png".to_string(),
+                    size: 64,
+                    sha256: String::new(),
+                    link: String::new(),
+                    expires_at: 0,
+                    cached: true,
+                    local_path: Some(path.to_string_lossy().into_owned()),
+                }),
+                pinned: false,
+                order: 0,
+                note: String::new(),
+            });
+        }
+
+        let ctx = egui::Context::default();
+        super::theme::configure(&ctx);
+        super::theme::apply(&ctx, super::ThemeMode::Dark);
+        super::icons::install(&ctx);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(920.0, 620.0));
+        let mut input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        input.events = vec![egui::Event::PointerMoved(egui::pos2(460.0, 400.0))];
+        let mut output = ctx.run_ui(input, |ui| app.draw(ui));
+        output.textures_delta.clear();
+
+        let loaded = app.thumbnails.len();
+        assert!(loaded > 0, "视口内的行该有缩略图");
+        assert!(
+            loaded < 70,
+            "只解码视口附近的行，不该把 70 张全部解码（实际 {loaded}）"
+        );
+        assert!(loaded <= super::THUMB_CACHE, "缓存越过了上限 {loaded}");
+        assert!(!app.thumbnails.contains_key("id69"), "屏幕外的旧行不该解码");
+
+        // 位置留给缩略图的槽位由记录决定，纹理晚一帧也不会让行高跳动。
+        let with_file = app
+            .history
+            .items
+            .iter()
+            .filter(|record| super::ClipSyncApp::has_thumb_slot(record))
+            .count();
+        assert_eq!(with_file, 70, "每条都该给缩略图留位置");
+
+        // 挨张点名：缓存只留最近用的 THUMB_CACHE 张，最早的要给新行腾地方。
+        let keys: Vec<(String, String)> = app
+            .history
+            .items
+            .iter()
+            .filter_map(super::ClipSyncApp::thumb_key)
+            .collect();
+        assert_eq!(keys.len(), 70);
+        for (id, path) in &keys {
+            app.load_thumb(&ctx, id.clone(), path.clone());
+        }
+        assert_eq!(app.thumbnails.len(), super::THUMB_CACHE);
+        for (index, _) in keys.iter().take(70 - super::THUMB_CACHE) {
+            let id = format!("id{index}");
+            assert!(!app.thumbnails.contains_key(&id), "{id} 早该被踢掉");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 停止回信只带路径：几百 MB 的录像不该为了写一条列表整段读进 RAM。
+    #[test]
+    fn a_stopped_recording_is_listed_from_its_path() {
+        use clipsync_core::{engine, mqtt::BrokerLinks};
+
+        fn top_box(kind: &[u8; 4], payload: usize) -> Vec<u8> {
+            let mut out = ((8 + payload) as u32).to_be_bytes().to_vec();
+            out.extend_from_slice(kind);
+            out.extend(std::iter::repeat_n(0u8, payload));
+            out
+        }
+
+        let _pasteboard = app_lock();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+
+        let dir = std::env::temp_dir().join(format!("clipsync-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (_show_tx, show_rx) = std::sync::mpsc::channel();
+        let mut app = super::ClipSyncApp::new(
+            engine::spawn(BrokerLinks),
+            super::History::open(dir.join("history.json")),
+            super::Settings::open(dir.join("settings.json"), "stop-test"),
+            super::Preferences::open(dir.join("preferences.json")),
+            None,
+            show_rx,
+            None,
+        );
+        let ctx = egui::Context::default();
+
+        // mdat 撑到 200KB，顶层扫描必须跳过它才看得见后面的 moov。
+        let mut clip = top_box(b"ftyp", 16);
+        clip.extend(top_box(b"mdat", 200_000));
+        clip.extend(top_box(b"moov", 240));
+        let temp = dir.join("take.mp4");
+        std::fs::write(&temp, &clip).unwrap();
+        let size = clip.len() as i64;
+        app.record_phase = super::RecordPhase::Stopping;
+        app.record_path = Some(temp.clone());
+        app.on_record_stopped(&ctx, None, temp.clone(), size, true);
+
+        let file = app.history.items[0]
+            .file
+            .as_ref()
+            .expect("录完的像该进列表");
+        assert_eq!(file.size, size, "大小取自磁盘");
+        assert_eq!(
+            file.sha256,
+            clipsync_core::crypto::sha256_hex(&clip),
+            "流式哈希要和整段读一致"
+        );
+        assert_eq!(file.mime, "video/mp4");
+        assert!(file.cached);
+        let stored = file.local_path.clone().expect("本机留着");
+        assert!(
+            std::path::Path::new(&stored).starts_with(crate::paths::cache_dir()),
+            "{stored} 该搬进缓存"
+        );
+        assert!(!temp.exists(), "临时文件是搬走的，不是复制一份再留原件");
+        assert_eq!(std::fs::read(&stored).unwrap().len(), size as usize);
+        assert_eq!(
+            app.record_preview.as_ref().expect("就地预览").path(),
+            stored,
+            "预览和列表要同一条路径"
+        );
+        assert!(
+            !app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.kind == super::ToastKind::Error),
+            "本机留下就该是提示，不是报错"
+        );
+        crate::paths::delete_cache(Some(&stored));
+
+        // 半成品：当场删掉，列表里不该多一条。
+        let broken = dir.join("broken.mp4");
+        let mut half = top_box(b"ftyp", 16);
+        half.extend(top_box(b"mdat", 32));
+        std::fs::write(&broken, &half).unwrap();
+        app.record_phase = super::RecordPhase::Stopping;
+        app.record_path = Some(broken.clone());
+        app.on_record_stopped(&ctx, None, broken.clone(), half.len() as i64, false);
+        assert!(!broken.exists(), "没有 moov 的录像要当场删掉");
+        assert_eq!(app.history.items.len(), 1, "半成品进不了列表");
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.kind == super::ToastKind::Error));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

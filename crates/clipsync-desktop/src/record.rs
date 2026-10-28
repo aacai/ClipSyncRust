@@ -1,6 +1,7 @@
 //! macOS 录屏：链接 `native/record.m` 里的 ScreenCaptureKit。其它平台直接拒绝。
 
 use std::ffi::{CStr, CString};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -51,7 +52,7 @@ pub struct StartSpec {
 pub enum Job {
     Start(StartSpec),
     Exclude,
-    /// 停止后由工作线程把录像读回来：主线程既不碰信号量也不碰几 MB 的字节。
+    /// 停止后由工作线程收尾：主线程既不碰信号量也不碰几百 MB 的字节。
     Stop(PathBuf),
 }
 
@@ -59,9 +60,12 @@ pub enum Job {
 pub enum Event {
     Started(Result<(), String>),
     Excluded(Result<(), String>),
+    /// 录像留在盘上：回信只给路径、大小和「有没有写完 moov」。
     Stopped {
         error: Option<String>,
-        bytes: Vec<u8>,
+        path: PathBuf,
+        size: i64,
+        finished: bool,
     },
 }
 
@@ -121,8 +125,14 @@ fn run_worker(jobs: Receiver<Job>, events: Sender<Event>) {
             }
             Job::Stop(path) => {
                 let error = stop().err();
-                let bytes = std::fs::read(&path).unwrap_or_default();
-                let _ = events.send(Event::Stopped { error, bytes });
+                let size = std::fs::metadata(&path).map_or(0, |meta| meta.len() as i64);
+                let finished = size > 0 && is_finished(&path);
+                let _ = events.send(Event::Stopped {
+                    error,
+                    path,
+                    size,
+                    finished,
+                });
             }
         }
     }
@@ -260,36 +270,45 @@ pub fn exclude_self() -> Result<(), String> {
 }
 
 /// MP4 顶层 box 里必须有 moov 才算收尾完成；没有的就是半成品。
-pub fn is_finished(bytes: &[u8]) -> bool {
-    let mut offset = 0usize;
-    while offset + 8 <= bytes.len() {
-        let head = &bytes[offset..offset + 8];
-        let size = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
-        let kind = &head[4..8];
-        if kind == b"moov" {
+/// 逐块读会误判 box 内部的同名标签，所以要按顶层 box 的头跳着走。
+pub fn is_finished(path: &Path) -> bool {
+    std::fs::File::open(path).is_ok_and(|mut file| has_moov(&mut file))
+}
+
+fn has_moov<R: Read + Seek>(reader: &mut R) -> bool {
+    let len = match reader.seek(SeekFrom::End(0)) {
+        Ok(len) => len,
+        Err(_) => return false,
+    };
+    let mut offset: u64 = 0;
+    let mut head = [0u8; 8];
+    while offset + 8 <= len {
+        if reader.seek(SeekFrom::Start(offset)).is_err() || reader.read_exact(&mut head).is_err() {
+            return false;
+        }
+        let size = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as u64;
+        if &head[4..8] == b"moov" {
             return true;
         }
         let step = match size {
+            // 长度为 0 表示「一直到文件尾」，后面不可能再有 box。
             0 => return false,
             1 => {
-                if offset + 16 > bytes.len() {
+                let mut large = [0u8; 8];
+                if reader.read_exact(&mut large).is_err() {
                     return false;
                 }
-                let large = &bytes[offset + 8..offset + 16];
-                let size = u64::from_be_bytes([
-                    large[0], large[1], large[2], large[3], large[4], large[5], large[6], large[7],
-                ]);
-                usize::try_from(size).unwrap_or(0)
+                u64::from_be_bytes(large)
             }
             size => size,
         };
         if step < 8 {
             return false;
         }
-        offset = match offset.checked_add(step) {
-            Some(next) => next,
+        match offset.checked_add(step) {
+            Some(next) => offset = next,
             None => return false,
-        };
+        }
     }
     false
 }
@@ -316,7 +335,8 @@ fn last_error() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_finished, Event, Job, StartSpec, Worker};
+    use super::{has_moov, is_finished, Event, Job, StartSpec, Worker};
+    use std::io::Cursor;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -326,6 +346,10 @@ mod tests {
         out.extend_from_slice(kind);
         out.extend(std::iter::repeat_n(0u8, payload));
         out
+    }
+
+    fn moov_in(bytes: Vec<u8>) -> bool {
+        has_moov(&mut Cursor::new(bytes))
     }
 
     /// 收一条想要的回信：中间混进来的别的回信直接丢掉，测试只关系心照的那一类。
@@ -361,7 +385,7 @@ mod tests {
         }
     }
 
-    /// 排队、回信、把字节读回来都在工作线程上，没开录也不该报错。
+    /// 排队、回信、收尾判定都在工作线程上，没开录也不该报错。
     #[test]
     fn record_jobs_are_queued_and_answered_off_the_calling_thread() {
         let worker = Worker::spawn();
@@ -382,11 +406,32 @@ mod tests {
         match await_event(&worker, Duration::from_secs(5), |event| {
             matches!(event, Event::Stopped { .. })
         }) {
-            Some(Event::Stopped { error: None, bytes }) => assert_eq!(bytes, content),
+            Some(Event::Stopped {
+                error: None,
+                path: answered,
+                size,
+                finished,
+            }) => {
+                assert_eq!(answered, path);
+                assert_eq!(size, content.len() as i64, "大小取自磁盘，不是字节数");
+                assert!(!finished, "只有 ftyp 的半成品不该报完成");
+            }
             Some(Event::Stopped {
                 error: Some(error), ..
             }) => panic!("stop failed: {error}"),
             other => panic!("no stop answer, got {other:?}"),
+        }
+        // 字节留在盘上：写完 moov 再停一次，判定就该翻过来。
+        let mut finished_clip = content;
+        finished_clip.extend(box_of(b"mdat", 512));
+        finished_clip.extend(box_of(b"moov", 240));
+        std::fs::write(&path, &finished_clip).expect("write the finished clip");
+        worker.send(Job::Stop(path.clone()));
+        match await_event(&worker, Duration::from_secs(5), |event| {
+            matches!(event, Event::Stopped { finished: true, .. })
+        }) {
+            Some(Event::Stopped { size, .. }) => assert_eq!(size, finished_clip.len() as i64),
+            other => panic!("finished clip answered {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -409,53 +454,73 @@ mod tests {
         worker.send(Job::Exclude);
         std::thread::sleep(Duration::from_millis(1200));
         worker.send(Job::Stop(path.clone()));
-        let bytes = match await_event(&worker, Duration::from_secs(15), |event| {
+        let size = match await_event(&worker, Duration::from_secs(15), |event| {
             matches!(event, Event::Stopped { .. })
         }) {
-            Some(Event::Stopped { error, bytes }) => {
+            Some(Event::Stopped {
+                error, finished, ..
+            }) => {
                 if let Some(error) = error {
                     panic!("stop failed: {error}");
                 }
-                bytes
+                assert!(finished, "录完的文件没有 moov");
+                std::fs::metadata(&path).expect("the clip is on disk").len()
             }
             other => panic!("no stop answer, got {other:?}"),
         };
         let _ = std::fs::remove_file(&path);
-        assert!(is_finished(&bytes), "no moov in {} bytes", bytes.len());
-        eprintln!("live recording: {} bytes", bytes.len());
+        assert!(size > 0, "empty mp4 in {size} bytes");
+        eprintln!("live recording: {size} bytes");
     }
 
     #[test]
     fn a_recording_is_only_finished_when_moov_is_written() {
         let mut unfinished = box_of(b"ftyp", 16);
         unfinished.extend(box_of(b"mdat", 512));
-        assert!(!is_finished(&unfinished));
+        assert!(!moov_in(unfinished));
 
         let mut finished = box_of(b"ftyp", 16);
         finished.extend(box_of(b"mdat", 512));
         finished.extend(box_of(b"moov", 240));
-        assert!(is_finished(&finished));
+        assert!(moov_in(finished));
 
         // moov 在前（faststart）也算。
         let mut faststart = box_of(b"ftyp", 16);
         faststart.extend(box_of(b"moov", 240));
         faststart.extend(box_of(b"mdat", 512));
-        assert!(is_finished(&faststart));
+        assert!(moov_in(faststart));
     }
 
     #[test]
     fn a_truncated_or_garbage_file_is_not_finished() {
-        assert!(!is_finished(&[]));
-        assert!(!is_finished(b"ftyp"));
+        assert!(!moov_in(vec![]));
+        assert!(!moov_in(b"ftyp".to_vec()));
         // 声明的长度超过实际字节：写到一半被掐断。
         let mut cut = box_of(b"ftyp", 16);
         cut.extend_from_slice(&2048u32.to_be_bytes());
         cut.extend_from_slice(b"mdat");
-        assert!(!is_finished(&cut));
+        assert!(!moov_in(cut));
         // 长度为 0 表示「一直到文件尾」，后面不可能再有 moov。
         let mut open_ended = box_of(b"ftyp", 16);
         open_ended.extend_from_slice(&0u32.to_be_bytes());
         open_ended.extend_from_slice(b"mdat");
-        assert!(!is_finished(&open_ended));
+        assert!(!moov_in(open_ended));
+    }
+
+    /// 判定走的是文件，不是内存里的字节。
+    #[test]
+    fn is_finished_reads_the_boxes_straight_off_the_disk() {
+        let dir = std::env::temp_dir().join(format!("clipsync-moov-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the moov test dir");
+        let path = dir.join("clip.mp4");
+        let mut bytes = box_of(b"ftyp", 16);
+        bytes.extend(box_of(b"mdat", 512));
+        std::fs::write(&path, &bytes).expect("write the unfinished clip");
+        assert!(!is_finished(&path));
+        bytes.extend(box_of(b"moov", 240));
+        std::fs::write(&path, &bytes).expect("write the finished clip");
+        assert!(is_finished(&path));
+        assert!(!is_finished(&dir.join("missing.mp4")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

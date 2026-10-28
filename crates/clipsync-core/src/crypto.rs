@@ -20,6 +20,23 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(sha256(data))
 }
 
+/// 只为算指纹就把整段文件读进 RAM 太浪费，按块喂哈希器。
+pub fn sha256_hex_file(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 pub fn argon2id(password: &[u8], salt: &[u8]) -> Result<Zeroizing<Vec<u8>>, argon2::Error> {
     argon2id_with(password, salt, ARGON2_T, ARGON2_M_KIB, ARGON2_P)
 }
@@ -92,4 +109,26 @@ pub fn aes_gcm_decrypt(
             },
         )
         .map_err(|_| CryptoError::Aead)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sha256_hex;
+
+    #[test]
+    fn a_streamed_file_hash_matches_the_byte_hash() {
+        // 跨过 64KB 分块边界：少喂或多喂一个字节都会露馅。
+        let payload: Vec<u8> = (0..200_000).map(|index| (index % 251) as u8).collect();
+        let dir = std::env::temp_dir().join(format!("clipsync-sha-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("payload");
+        std::fs::write(&path, &payload).unwrap();
+        assert_eq!(super::sha256_hex_file(&path).unwrap(), sha256_hex(&payload));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_file_reports_an_error_instead_of_a_digest() {
+        assert!(super::sha256_hex_file(std::path::Path::new("/definitely/not/here")).is_err());
+    }
 }
