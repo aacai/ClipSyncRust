@@ -157,10 +157,62 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
     painter.add(Shape::image(atlas.texture, rect, atlas.uv[slot], color));
 }
 
+/// 托盘 / 任务栏图标要的独立位图：同一套轮廓，只是不走纹理上传。
+pub fn raster(icon: Icon, color: Color32) -> egui::IconData {
+    let [red, green, blue, _] = color.to_array();
+    let mut rgba = vec![0u8; CELL * CELL * 4];
+    rasterize(&contours(icon), |x, y, coverage| {
+        let i = (y * CELL + x) * 4;
+        rgba[i] = red;
+        rgba[i + 1] = green;
+        rgba[i + 2] = blue;
+        rgba[i + 3] = coverage;
+    });
+    egui::IconData {
+        rgba,
+        width: CELL as u32,
+        height: CELL as u32,
+    }
+}
+
+/// 系统托盘之外（Windows / Linux）没有模板图可用，把轮廓压在品牌色底上才不像一个悬浮的符号。
+pub fn plate(icon: Icon, background: Color32) -> egui::IconData {
+    let tinted = raster(icon, Color32::WHITE);
+    let side = CELL as f32;
+    let half = side * 0.5;
+    let radius = side * 0.22;
+    let [red, green, blue, _] = background.to_array();
+    let mut rgba = vec![0u8; CELL * CELL * 4];
+    for y in 0..CELL {
+        for x in 0..CELL {
+            let i = (y * CELL + x) * 4;
+            let qx = (x as f32 + 0.5 - half).abs() - (half - radius);
+            let qy = (y as f32 + 0.5 - half).abs() - (half - radius);
+            let outside = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - radius;
+            let plate_alpha = ((0.5 - outside) * 255.0).clamp(0.0, 255.0) as u8;
+            let ink = tinted.rgba[i + 3];
+            // 白轮廓压在底上，底没覆盖到的地方（圆角外）只留轮廓自己的 alpha。
+            rgba[i] = mix(red, 0xff, ink);
+            rgba[i + 1] = mix(green, 0xff, ink);
+            rgba[i + 2] = mix(blue, 0xff, ink);
+            rgba[i + 3] = plate_alpha.max(ink);
+        }
+    }
+    egui::IconData {
+        rgba,
+        width: CELL as u32,
+        height: CELL as u32,
+    }
+}
+
+fn mix(base: u8, ink: u8, coverage: u8) -> u8 {
+    let c = coverage as u32;
+    ((base as u32 * (255 - c) + ink as u32 * c) / 255) as u8
+}
+
 pub fn icon_button(ui: &mut Ui, icon: Icon, enabled: bool, tip: &str) -> Response {
     icon_button_tinted(ui, icon, theme::p().text, enabled, tip)
 }
-
 pub fn icon_button_tinted(
     ui: &mut Ui,
     icon: Icon,
@@ -699,6 +751,40 @@ mod tests {
         let mut grid = vec![0u8; CELL * CELL];
         rasterize(&contours(icon), |x, y, value| grid[y * CELL + x] = value);
         grid
+    }
+
+    #[test]
+    fn tray_bitmap_carries_only_the_requested_tint() {
+        let data = raster(Icon::Clipboard, Color32::WHITE);
+        assert_eq!((data.width, data.height), (CELL as u32, CELL as u32));
+        assert_eq!(data.rgba.len(), CELL * CELL * 4);
+        let inked = data.rgba.chunks_exact(4).filter(|p| p[3] > 0).count();
+        assert!(inked > 1_000, "轮廓几乎是空的：{inked} 个像素");
+        for pixel in data.rgba.chunks_exact(4) {
+            if pixel[3] == 0 {
+                assert_eq!(&pixel[..3], &[0, 0, 0]);
+            } else {
+                assert_eq!(&pixel[..3], &[0xff, 0xff, 0xff]);
+            }
+        }
+    }
+
+    #[test]
+    fn plate_fills_the_body_and_clears_the_rounded_corners() {
+        let data = plate(Icon::Clipboard, Color32::from_rgb(0xc0, 0x42, 0x6b));
+        let pixel = |x: usize, y: usize| -> [u8; 4] {
+            let i = (y * CELL + x) * 4;
+            data.rgba[i..i + 4].try_into().unwrap()
+        };
+        assert_eq!(pixel(0, 0)[3], 0, "圆角外该是全透明");
+        assert_eq!(pixel(CELL - 1, CELL - 1)[3], 0, "圆角外该是全透明");
+        assert_eq!(pixel(CELL / 2, CELL / 2)[3], 255, "底板中心该是实心");
+        assert!(
+            data.rgba
+                .chunks_exact(4)
+                .any(|p| p[3] == 255 && p[..3] == [0xff, 0xff, 0xff]),
+            "白轮廓没压在底上"
+        );
     }
 
     #[test]

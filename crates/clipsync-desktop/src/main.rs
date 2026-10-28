@@ -48,6 +48,8 @@ fn main() -> eframe::Result {
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        // 异步这边只有 broker 连接和文件收发，默认按逻辑核数开 worker 白占栈。
+        .worker_threads(2)
         .build()
         .expect("tokio runtime");
     let _guard = runtime.enter();
@@ -55,13 +57,14 @@ fn main() -> eframe::Result {
     let history = History::open(paths::app_dir().join("history.json"));
     let settings = Settings::open(paths::app_dir().join("settings.json"), &paths::install_id());
     let preferences = Preferences::open(paths::app_dir().join("preferences.json"));
-    let tray = tray::Tray::try_install();
 
     eframe::run_native(
         "ClipSyncRust",
         native_options(),
         Box::new(move |ctx| {
-            configure_shell(&ctx.egui_ctx, preferences.theme());
+            let dark = configure_shell(&ctx.egui_ctx, preferences.theme());
+            // 托盘要在主题定下来之后装：macOS 之外没有模板图，得自己按明暗挑描边色。
+            let tray = tray::Tray::try_install(dark);
             Ok(Box::new(ClipSyncApp::new(
                 engine,
                 history,
@@ -75,10 +78,11 @@ fn main() -> eframe::Result {
     )
 }
 
-fn configure_shell(ctx: &egui::Context, mode: ThemeMode) {
+fn configure_shell(ctx: &egui::Context, mode: ThemeMode) -> bool {
     theme::configure(ctx);
-    theme::apply(ctx, mode);
+    let dark = theme::apply(ctx, mode);
     icons::install(ctx);
+    dark
 }
 
 fn native_options() -> eframe::NativeOptions {
@@ -88,7 +92,11 @@ fn native_options() -> eframe::NativeOptions {
             .with_min_inner_size([680.0, 460.0])
             .with_fullsize_content_view(true)
             .with_titlebar_shown(false)
-            .with_title_shown(false),
+            .with_title_shown(false)
+            .with_icon(icons::plate(
+                icons::Icon::Clipboard,
+                egui::Color32::from_rgb(0xc0, 0x42, 0x6b),
+            )),
         ..Default::default()
     }
 }

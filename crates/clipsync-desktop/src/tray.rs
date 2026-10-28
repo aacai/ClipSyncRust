@@ -3,8 +3,11 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
+use eframe::egui::Color32;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+
+use crate::icons;
 
 pub enum TrayCmd {
     Show,
@@ -17,8 +20,8 @@ pub struct Tray {
 }
 
 impl Tray {
-    pub fn try_install() -> Option<Self> {
-        let icon = tray_rgba().ok()?;
+    pub fn try_install(dark: bool) -> Option<Self> {
+        let icon = tray_icon(dark).ok()?;
         let show_item = MenuItem::new("显示窗口", true, None);
         let quit_item = MenuItem::new("退出", true, None);
         let menu = Menu::new();
@@ -32,7 +35,9 @@ impl Tray {
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("ClipSyncRust")
-            .with_icon(icon)
+            // 菜单栏交给系统按外观上色（只有 macOS 读这个标记），和 compose 端
+            // dark 用白、light 用黑是一回事。
+            .with_icon_templated(icon)
             .build()
             .ok()?;
 
@@ -88,32 +93,13 @@ fn spawn_click_pump(tx: Sender<TrayCmd>) {
         .ok();
 }
 
-/// 没有打包图标时现场画一颗小圆点，够托盘辨认即可。
-fn tray_rgba() -> Result<Icon, tray_icon::BadIcon> {
-    const SIZE: u32 = 32;
-    let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
-    let cx = (SIZE as f32 - 1.0) * 0.5;
-    let cy = cx;
-    let r_outer = 12.0f32;
-    let r_inner = 5.0f32;
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let dx = x as f32 - cx;
-            let dy = y as f32 - cy;
-            let d = (dx * dx + dy * dy).sqrt();
-            let i = ((y * SIZE + x) * 4) as usize;
-            if d <= r_inner {
-                rgba[i] = 0xff;
-                rgba[i + 1] = 0xff;
-                rgba[i + 2] = 0xff;
-                rgba[i + 3] = 0xff;
-            } else if d <= r_outer {
-                rgba[i] = 0x25;
-                rgba[i + 1] = 0x63;
-                rgba[i + 2] = 0xeb;
-                rgba[i + 3] = 0xff;
-            }
-        }
-    }
-    Icon::from_rgba(rgba, SIZE, SIZE)
+/// 托盘用应用自己的剪贴板轮廓，和界面里 `Icon::Clipboard` 同一份 path 数据。
+fn tray_icon(dark: bool) -> Result<Icon, tray_icon::BadIcon> {
+    let tint = if dark {
+        Color32::WHITE
+    } else {
+        Color32::from_rgb(0x1a, 0x1a, 0x1a)
+    };
+    let data = icons::raster(icons::Icon::Clipboard, tint);
+    Icon::from_rgba(data.rgba, data.width, data.height)
 }
