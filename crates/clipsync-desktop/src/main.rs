@@ -20,6 +20,7 @@ mod transfer;
 mod translate;
 mod tray;
 mod update;
+mod win_caption;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -63,6 +64,8 @@ fn main() -> eframe::Result {
         native_options(),
         Box::new(move |ctx| {
             let dark = configure_shell(&ctx.egui_ctx, preferences.theme());
+            // Windows 那条原生标题条得跟着主题色走，放在主题定下来之后。
+            win_caption::tint(dark);
             // 托盘要在主题定下来之后装：macOS 之外没有模板图，得自己按明暗挑描边色。
             let tray = tray::Tray::try_install(dark);
             Ok(Box::new(ClipSyncApp::new(

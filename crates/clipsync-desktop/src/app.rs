@@ -1054,7 +1054,8 @@ impl ClipSyncApp {
     fn set_theme(&mut self, ctx: &egui::Context, mode: ThemeMode) {
         self.theme_mode = mode;
         self.preferences.set_theme(mode);
-        theme::apply(ctx, mode);
+        let dark = theme::apply(ctx, mode);
+        crate::win_caption::tint(dark);
         ctx.request_repaint();
     }
 
