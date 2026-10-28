@@ -112,6 +112,7 @@ pub struct ClipSyncApp {
     zoom_failed: Option<String>,
     watch_clipboard: bool,
     auto_copy: bool,
+    auto_paste_file: bool,
     watch_files: bool,
     watch_images: bool,
     update: UpdateState,
@@ -199,6 +200,7 @@ enum SettingsAction {
     LaunchAtLogin(bool),
     WatchClipboard(bool),
     AutoCopy(bool),
+    AutoPasteFile(bool),
     WatchImages(bool),
     WatchFiles(bool),
     DeleteExpired(bool),
@@ -408,6 +410,7 @@ impl ClipSyncApp {
         let (job_tx, job_rx) = mpsc::channel();
         let watch_clipboard = preferences.watch_clipboard();
         let auto_copy = preferences.auto_copy();
+        let auto_paste_file = preferences.auto_paste_file();
         let watch_files = preferences.watch_files();
         let watch_images = preferences.watch_images();
         let theme_mode = preferences.theme();
@@ -460,6 +463,7 @@ impl ClipSyncApp {
             zoom_failed: None,
             watch_clipboard,
             auto_copy,
+            auto_paste_file,
             watch_files,
             watch_images,
             update: UpdateState::Idle,
@@ -688,6 +692,11 @@ impl ClipSyncApp {
                     self.transfer = None;
                     self.notify_error(message);
                 }
+                JobEvent::DownloadFailed { id, message } => {
+                    self.transfer = None;
+                    self.pending_downloads.remove(&id);
+                    self.notify_error(message);
+                }
             }
         }
     }
@@ -747,7 +756,8 @@ impl ClipSyncApp {
         self.thumbnails.remove(&done.id);
         let name = sanitize_file_name(&done.name);
         match done.after {
-            DownloadAfter::Auto => {}
+            // 收完就替用户放进剪贴板：回窗口 Cmd/Ctrl+V 直接粘走，不用再来列表点复制。
+            DownloadAfter::Auto => self.paste_incoming_file(&name, &done.path),
             DownloadAfter::Cache => self.notify(format!("已下载 {name}")),
             DownloadAfter::Open => {
                 if let Err(error) = crate::paths::open_path(&done.path) {
@@ -762,6 +772,19 @@ impl ClipSyncApp {
                     Err(error) => self.notify_error(format!("写入剪贴板失败：{error}")),
                 }
             }
+        }
+    }
+
+    /// 房间另一头发来的文件下载完了直接进剪贴板；`write_files` 会记下签名，
+    /// 轮询到自家写入时不再二次广播。
+    fn paste_incoming_file(&mut self, name: &str, path: &str) {
+        if !self.auto_paste_file {
+            return;
+        }
+        if self.clipboard.write_files(&[PathBuf::from(path)]) {
+            self.notify(format!("{name} 已放进剪贴板，可直接粘贴"));
+        } else {
+            self.notify_error("写入剪贴板失败");
         }
     }
 
@@ -1083,6 +1106,11 @@ impl ClipSyncApp {
     fn set_auto_copy(&mut self, enabled: bool) {
         self.auto_copy = enabled;
         self.preferences.set_auto_copy(enabled);
+    }
+
+    fn set_auto_paste_file(&mut self, enabled: bool) {
+        self.auto_paste_file = enabled;
+        self.preferences.set_auto_paste_file(enabled);
     }
 
     fn set_watch_images(&mut self, enabled: bool) {
@@ -2026,6 +2054,7 @@ impl ClipSyncApp {
 
                             let watch = self.watch_clipboard;
                             let auto_copy = self.auto_copy;
+                            let auto_paste_file = self.auto_paste_file;
                             let watch_images = self.watch_images;
                             let watch_files = self.watch_files;
                             settings_group(ui, "剪贴板", |ui| {
@@ -2067,6 +2096,16 @@ impl ClipSyncApp {
                                     auto_copy,
                                 ) {
                                     action = Some(SettingsAction::AutoCopy(!auto_copy));
+                                }
+                                settings_divider(ui);
+                                if settings_switch_row(
+                                    ui,
+                                    "收到文件即进剪贴板",
+                                    "同伴发来的文件自动下完就直接放进剪贴板，回窗口 Cmd/Ctrl+V 就能粘走；关掉则要点条目里的复制才写入",
+                                    auto_paste_file,
+                                ) {
+                                    action =
+                                        Some(SettingsAction::AutoPasteFile(!auto_paste_file));
                                 }
                             });
                             ui.add_space(14.0);
@@ -2234,6 +2273,7 @@ impl ClipSyncApp {
             SettingsAction::LaunchAtLogin(enabled) => self.set_launch_at_login(enabled),
             SettingsAction::WatchClipboard(enabled) => self.set_watch_clipboard(enabled),
             SettingsAction::AutoCopy(enabled) => self.set_auto_copy(enabled),
+            SettingsAction::AutoPasteFile(enabled) => self.set_auto_paste_file(enabled),
             SettingsAction::WatchImages(enabled) => self.set_watch_images(enabled),
             SettingsAction::WatchFiles(enabled) => self.set_watch_files(enabled),
             SettingsAction::DeleteExpired(enabled) => self.set_delete_expired(enabled),
@@ -2321,12 +2361,16 @@ impl ClipSyncApp {
     }
 
     fn request_download(&mut self, id: &str, after: DownloadAfter) {
-        if self.pending_downloads.contains(id) {
-            return;
-        }
         let Some(file) = self.history.file(id) else {
             return;
         };
+        if self.pending_downloads.contains(id) {
+            // 任务还在飞就再点一次：得给句话，不然看着就是按钮坏了
+            if after != DownloadAfter::Auto {
+                self.notify(format!("{} 正在下载", sanitize_file_name(&file.name)));
+            }
+            return;
+        }
         let link = file.link.clone();
         if link.trim().is_empty() {
             self.notify_error(format!(
@@ -7459,6 +7503,138 @@ mod tests {
             .toast
             .as_ref()
             .is_some_and(|toast| toast.kind == super::ToastKind::Error));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 下载失败必须解除 `pending_downloads` 占位：那个集合是同一行的去重闸门，
+    /// 失败时不清空就等于这条再也点不动——点下去既没进度条也没提示。
+    #[test]
+    fn a_failed_download_frees_the_row_for_another_try() {
+        use clipsync_core::{engine, mqtt::BrokerLinks};
+
+        let _pasteboard = app_lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+
+        let dir = std::env::temp_dir().join(format!("clipsync-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (_show_tx, show_rx) = std::sync::mpsc::channel();
+        let mut app = super::ClipSyncApp::new(
+            engine::spawn(BrokerLinks),
+            super::History::open(dir.join("history.json")),
+            super::Settings::open(dir.join("settings.json"), "retry-test"),
+            super::Preferences::open(dir.join("preferences.json")),
+            None,
+            show_rx,
+            None,
+        );
+        app.history.add(file_record("clip1", "a.png", "图一"));
+
+        app.pending_downloads.insert("clip1".to_string());
+        app.job_tx
+            .send(super::JobEvent::DownloadFailed {
+                id: "clip1".to_string(),
+                message: "链接过期".to_string(),
+            })
+            .unwrap();
+        app.drain_jobs();
+        assert!(app.pending_downloads.is_empty(), "失败后这条要能重新点下载");
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.text == "链接过期"));
+
+        app.request_download("clip1", super::DownloadAfter::Cache);
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.text.contains("还没有上传链接")));
+
+        // 任务真的在飞时重复点，也要有话，不能装作按钮坏了
+        app.pending_downloads.insert("clip1".to_string());
+        app.request_download("clip1", super::DownloadAfter::Cache);
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.text.contains("正在下载")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 收到文件自动下完后要替用户放进剪贴板；开关关掉则一个字都不该说。
+    /// 断言只到「有没有尝试写剪贴板」为止——CI 的 ubuntu 没有 X，真粘还得肉眼验。
+    #[test]
+    fn an_incoming_file_is_offered_for_paste_when_the_switch_is_on() {
+        use clipsync_core::{engine, mqtt::BrokerLinks};
+
+        let _pasteboard = app_lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+
+        let dir = std::env::temp_dir().join(format!("clipsync-paste-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cached = dir.join("a.png");
+        std::fs::write(&cached, b"not really a png").unwrap();
+
+        let (_show_tx, show_rx) = std::sync::mpsc::channel();
+        let mut app = super::ClipSyncApp::new(
+            engine::spawn(BrokerLinks),
+            super::History::open(dir.join("history.json")),
+            super::Settings::open(dir.join("settings.json"), "paste-test"),
+            super::Preferences::open(dir.join("preferences.json")),
+            None,
+            show_rx,
+            None,
+        );
+        app.history.add(file_record("clip1", "a.png", "图一"));
+        app.history.add(file_record("clip2", "b.png", "图二"));
+
+        let done = |id: &str, after: super::DownloadAfter| {
+            super::JobEvent::Downloaded(super::jobs::DownloadDone {
+                id: id.to_string(),
+                name: "a.png".to_string(),
+                path: cached.to_string_lossy().into_owned(),
+                bytes: None,
+                after,
+            })
+        };
+
+        app.drain_jobs();
+        app.toast = None;
+        app.auto_paste_file = true;
+        app.job_tx
+            .send(done("clip1", super::DownloadAfter::Auto))
+            .unwrap();
+        app.drain_jobs();
+        assert!(
+            app.history.file("clip1").is_some_and(|file| file.cached),
+            "自动下载完要标记已缓存"
+        );
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text.contains("剪贴板")),
+            "开关开着就该尝试写剪贴板"
+        );
+
+        app.toast = None;
+        app.auto_paste_file = false;
+        app.job_tx
+            .send(done("clip2", super::DownloadAfter::Auto))
+            .unwrap();
+        app.drain_jobs();
+        assert!(app.toast.is_none(), "开关关掉就不该碰剪贴板");
+        assert!(app.history.file("clip2").is_some_and(|file| file.cached));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

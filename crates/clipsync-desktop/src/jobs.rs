@@ -84,6 +84,11 @@ pub enum JobEvent {
     Uploaded(UploadDone),
     Downloaded(DownloadDone),
     Failed(String),
+    /// 下载失败要带上是哪条：UI 靠它解除「正在下载」占位，不然这条再也点不动。
+    DownloadFailed {
+        id: String,
+        message: String,
+    },
 }
 
 pub fn spawn_uploads(context: JobContext, requests: Vec<UploadRequest>, sender: Sender<JobEvent>) {
@@ -118,6 +123,7 @@ pub fn spawn_uploads(context: JobContext, requests: Vec<UploadRequest>, sender: 
 pub fn spawn_download(context: JobContext, request: DownloadRequest, sender: Sender<JobEvent>) {
     std::thread::spawn(move || {
         let name = request.name.clone();
+        let id = request.id.clone();
         let progress_sender = sender.clone();
         let outcome = perform_download(&context, request, |done, total| {
             let _ = progress_sender.send(JobEvent::Progress {
@@ -129,7 +135,7 @@ pub fn spawn_download(context: JobContext, request: DownloadRequest, sender: Sen
         });
         let event = match outcome {
             Ok(done) => JobEvent::Downloaded(done),
-            Err(message) => JobEvent::Failed(message),
+            Err(message) => JobEvent::DownloadFailed { id, message },
         };
         let _ = sender.send(event);
     });
