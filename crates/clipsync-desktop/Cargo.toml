@@ -62,10 +62,8 @@ objc2-core-graphics = "0.3"
 objc2-core-media = "0.3"
 objc2-quartz-core = "0.3"
 
-# cargo wix 只从这里取两个 guid：upgrade-guid 固定下来，新包才会升级旧安装而不是
-# 并存两份；path-guid 不固定就每次 init 换一个组件 GUID，旧条目留在注册表里没人清。
-# 「程序和功能」的显示名得靠 `cargo wix init --product-name ClipSyncRust`，
-# cargo-wix 不认 Cargo.toml 里的 product-name，写了也只是死数据。
+# wxs 由仓库自己维护（wix/main.wxs），CI 不再 init，否则开始菜单项会被出厂模板抹掉。
+# cargo-wix 从 Cargo.toml 只认这里的 guid：upgrade-guid 固定住，新包才会升级旧安装
+# 而不是并存两份；product-name 它不认，写了也是死数据。
 [package.metadata.wix]
 upgrade-guid = "6FE3AC0A-BB99-4AC7-B6C0-9AC20BCF01FA"
-path-guid = "F2E1918B-3B64-4A1F-9A4A-5A7B0E538CFD"

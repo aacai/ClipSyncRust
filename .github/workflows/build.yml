@@ -189,15 +189,22 @@ jobs:
 
       - name: Build msi
         # 工作区里有两个 package，cargo-wix 不会自己挑，必须 --package 点名；
-        # 它生成的 main.wxs 用 wix\License.rtf 这种相对路径，所以 cwd 必须是包目录，
+        # wix/main.wxs 用的是 wix\License.rtf 这种相对路径，所以 cwd 必须是包目录，
         # 从仓库根跑 light.exe 会报找不到文件。
-        # 产品名只能走 --product-name：cargo-wix 只从命令行取它，Cargo.toml 里写
-        # product-name 会被忽略，「程序和功能」里就成了 clipsync-desktop。
-        # upgrade-guid / path-guid 倒是读 [package.metadata.wix]，本地跑 cargo wix 一致。
+        # main.wxs 现在归仓库管，这里绝不能再 cargo wix init --force：出厂模板没有开始菜单
+        # 快捷方式（Windows 搜索搜不到 app），还往系统 PATH 里塞一条安装目录。
+        # 产品名已经烤在 main.wxs 里了；cargo wix 的 build 根本没有 --product-name，那个只在 init 有。
         run: |
           set -euo pipefail
           cd crates/clipsync-desktop
-          cargo wix init --force --package clipsync-desktop --product-name "$APP_NAME"
+          if ! grep -q "Id='StartMenuShortcut'" wix/main.wxs; then
+            echo "wix/main.wxs 没有开始菜单快捷方式，装完在 Windows 搜索里找不到；别发这种包"
+            exit 1
+          fi
+          if grep -q "Id='PATH'" wix/main.wxs; then
+            echo "wix/main.wxs 又被塞进了系统 PATH 组件（多半是 cargo wix init --force 覆盖过）"
+            exit 1
+          fi
           cargo wix --no-build --nocapture --package clipsync-desktop --target x86_64-pc-windows-msvc
           find "$GITHUB_WORKSPACE/target/wix" -name '*.msi'
 
