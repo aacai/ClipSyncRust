@@ -1,3 +1,6 @@
+// console 子系统会让 Windows 在 GUI 旁边多开一个黑窗口；测试二进制还要读 stdout，所以只关正式产物。
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 mod app;
 mod autostart;
 mod clipboard;
