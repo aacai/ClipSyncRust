@@ -49,7 +49,7 @@ const RECORD_BAR_TOP_GAP: f32 = 8.0;
 /// Time for the app window to actually leave the screen before the grab.
 const CAPTURE_HIDE_DELAY: Duration = Duration::from_millis(140);
 /// 状态卡片上那个内存读数多久取一次：每帧都去问内核没必要。
-const FOOTPRINT_SAMPLE: Duration = Duration::from_secs(5);
+const MEMORY_SAMPLE: Duration = Duration::from_secs(5);
 const THUMB_MAX_SIDE: u32 = 256;
 /// 同时在库里留着的缩略图张数：一屏十几行，留出滚动余量就够，再多就是白占显存。
 const THUMB_CACHE: usize = 48;
@@ -84,8 +84,8 @@ pub struct ClipSyncApp {
     regex: bool,
     case_sensitive: bool,
     last_poll: Instant,
-    footprint: Option<u64>,
-    footprint_at: Instant,
+    memory: Option<u64>,
+    memory_at: Instant,
     cursor: Option<String>,
     picked: BTreeSet<String>,
     pick_mode: bool,
@@ -438,8 +438,8 @@ impl ClipSyncApp {
             regex: false,
             case_sensitive: false,
             last_poll: Instant::now(),
-            footprint: meminfo::footprint(),
-            footprint_at: Instant::now(),
+            memory: meminfo::resident(),
+            memory_at: Instant::now(),
             cursor: None,
             picked: BTreeSet::new(),
             pick_mode: false,
@@ -3287,12 +3287,12 @@ impl ClipSyncApp {
 
     /// 每 5 秒问一次内核，中间的帧直接复用上一次读数。
     /// 不用额外催重绘：空闲时 `POLL_INTERVAL` 本来就会把帧推到 800ms 内。
-    fn service_footprint(&mut self) {
-        if self.footprint_at.elapsed() < FOOTPRINT_SAMPLE {
+    fn service_memory(&mut self) {
+        if self.memory_at.elapsed() < MEMORY_SAMPLE {
             return;
         }
-        self.footprint_at = Instant::now();
-        self.footprint = meminfo::footprint();
+        self.memory_at = Instant::now();
+        self.memory = meminfo::resident();
     }
 
     fn expire_toast(&mut self) {
@@ -3339,7 +3339,7 @@ impl ClipSyncApp {
         self.poll_file_drops(ctx);
         self.poll_clipboard();
         self.poll_translation();
-        self.service_footprint();
+        self.service_memory();
         self.expire_toast();
         let update_busy = matches!(
             self.update,
@@ -3656,7 +3656,7 @@ impl ClipSyncApp {
             }
             ui.add_space(8.0);
             let line = ui.label(
-                RichText::new(status_line(&self.status, self.footprint))
+                RichText::new(status_line(&self.status, self.memory))
                     .size(11.5)
                     .color(theme::p().muted),
             );
@@ -6462,9 +6462,9 @@ fn status_label(status: &Status) -> &'static str {
 }
 
 /// 状态后面挂上这个进程的内存读数；问不到就只显示状态，不留「未知」占位。
-fn status_line(status: &Status, footprint: Option<u64>) -> String {
+fn status_line(status: &Status, memory: Option<u64>) -> String {
     let label = status_label(status);
-    match footprint {
+    match memory {
         Some(bytes) => format!("{label} · {}", meminfo::format(bytes)),
         None => label.to_string(),
     }
