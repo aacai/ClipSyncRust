@@ -60,13 +60,24 @@ pub fn encrypt_file(
     plain: &[u8],
 ) -> Result<EncryptedFile, RoomError> {
     let sha = sha256_hex(plain);
-    let aad = file_aad(topic, name, mime, plain.len() as i64, &sha);
+    encrypt_file_with_sha(room, topic, name, mime, plain, &sha)
+}
+
+pub fn encrypt_file_with_sha(
+    room: &RoomCrypto,
+    topic: &str,
+    name: &str,
+    mime: &str,
+    plain: &[u8],
+    sha256: &str,
+) -> Result<EncryptedFile, RoomError> {
+    let aad = file_aad(topic, name, mime, plain.len() as i64, sha256);
     Ok(EncryptedFile {
         cipher: room.encrypt_bytes(plain, &aad)?,
         name: name.to_string(),
         mime: mime.to_string(),
         size: plain.len() as i64,
-        sha256: sha,
+        sha256: sha256.to_string(),
     })
 }
 

@@ -116,6 +116,11 @@ pub struct History {
     dirty: bool,
 }
 
+pub struct AddOutcome {
+    pub inserted: bool,
+    pub id: String,
+}
+
 impl History {
     pub fn open(path: PathBuf) -> Self {
         let mut items = std::fs::read_to_string(&path)
@@ -132,6 +137,10 @@ impl History {
     }
 
     pub fn add(&mut self, record: Record) -> bool {
+        self.insert(record).inserted
+    }
+
+    pub fn insert(&mut self, record: Record) -> AddOutcome {
         if let Some(existing) = self.items.iter_mut().find(|item| item.id == record.id) {
             existing.ts = record.ts;
             existing.kind = record.kind;
@@ -150,9 +159,13 @@ impl History {
                 existing.file = Some(merged);
             }
             existing.pinned = record.pinned;
+            let id = existing.id.clone();
             self.dirty = true;
             self.sort();
-            return false;
+            return AddOutcome {
+                inserted: false,
+                id,
+            };
         }
         if let Some(existing) = self
             .items
@@ -161,15 +174,32 @@ impl History {
         {
             existing.ts = record.ts;
             existing.order = record.ts;
+            existing.text = record.text;
+            if let Some(incoming) = record.file {
+                let cached = existing
+                    .file
+                    .as_ref()
+                    .map(|current| (current.cached, current.local_path.clone()))
+                    .unwrap_or((false, None));
+                let mut merged = incoming;
+                merged.cached = cached.0;
+                merged.local_path = cached.1;
+                existing.file = Some(merged);
+            }
+            let id = existing.id.clone();
             self.dirty = true;
             self.sort();
-            return false;
+            return AddOutcome {
+                inserted: false,
+                id,
+            };
         }
+        let id = record.id.clone();
         self.items.push(record);
         self.sort();
         self.items.truncate(MAX_ITEMS);
         self.dirty = true;
-        true
+        AddOutcome { inserted: true, id }
     }
 
     pub fn update_text(&mut self, id: &str, text: &str) -> bool {
@@ -847,10 +877,20 @@ mod tests {
     fn the_same_file_with_another_id_is_deduped_by_hash() {
         let mut history = history("file-dup");
         history.add(file_record("a", "photo.png", "sha-a", 100));
-        history.add(file_record("b", "photo.png", "sha-a", 200));
+        history.mark_cached("a", "/cache/a/photo.png");
+        let mut incoming = file_record("b", "photo.png", "sha-a", 200);
+        incoming.file.as_mut().unwrap().link = "https://example.test/b.bin".to_string();
+        let added = history.insert(incoming);
         assert_eq!(history.items.len(), 1);
         assert_eq!(history.items[0].id, "a");
         assert_eq!(history.items[0].ts, 200);
+        assert!(!added.inserted);
+        assert_eq!(added.id, "a");
+        let file = history.file("a").unwrap();
+        assert_eq!(file.link, "https://example.test/b.bin");
+        assert!(file.cached);
+        assert_eq!(file.local_path.as_deref(), Some("/cache/a/photo.png"));
+        assert_eq!(history.file("b"), None);
     }
 
     #[test]

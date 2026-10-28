@@ -20,7 +20,8 @@ use clipsync_core::RoomCrypto;
 use crate::clipboard::{Captured, ClipFile, ClipboardWatcher, POLL_INTERVAL};
 use crate::icons::{self, Icon};
 use crate::jobs::{
-    self, DownloadAfter, DownloadRequest, JobContext, JobEvent, UploadRequest, UploadTarget,
+    self, DownloadAfter, DownloadRequest, JobContext, JobEvent, LiveUploads, UploadRequest,
+    UploadTarget,
 };
 use crate::settings::{
     normalize_nickname, Language, Preferences, Settings, ThemeMode, RETENTION_CHOICES,
@@ -100,6 +101,7 @@ pub struct ClipSyncApp {
     room_crypto: Option<Arc<RoomCrypto>>,
     room_hash: String,
     client: Arc<TransferClient>,
+    live_uploads: Arc<LiveUploads>,
     job_tx: mpsc::Sender<JobEvent>,
     job_rx: mpsc::Receiver<JobEvent>,
     transfer: Option<TransferUi>,
@@ -454,6 +456,7 @@ impl ClipSyncApp {
             room_crypto: None,
             room_hash: String::new(),
             client: Arc::new(TransferClient::new()),
+            live_uploads: Arc::new(LiveUploads::default()),
             job_tx,
             job_rx,
             transfer: None,
@@ -628,10 +631,10 @@ impl ClipSyncApp {
 
     fn on_clip(&mut self, clip: Clip) {
         let incoming = !clip.mine;
-        let known = self.history.items.iter().any(|item| item.id == clip.mid);
-        let inserted = self.history.add(Record::from_clip(&clip));
+        let added = self.history.insert(Record::from_clip(&clip));
+        let id = added.id;
         if let Some(path) = self.pending_cache.remove(&clip.mid) {
-            self.history.mark_cached(&clip.mid, &path);
+            self.history.mark_cached(&id, &path);
         }
         if incoming {
             let sender = if clip.sender_name.trim().is_empty() {
@@ -640,17 +643,17 @@ impl ClipSyncApp {
                 clip.sender_name.as_str()
             };
             if clip.file.is_some() {
-                let has_link = self
-                    .history
-                    .file(&clip.mid)
-                    .is_some_and(|file| !file.link.trim().is_empty());
-                if !known && has_link {
-                    self.request_download(&clip.mid, DownloadAfter::Auto);
+                let file = self.history.file(&id);
+                let ready = file
+                    .as_ref()
+                    .is_some_and(|file| !file.link.trim().is_empty() && !file.cached);
+                if ready {
+                    self.request_download(&id, DownloadAfter::Auto);
                 }
                 return;
             }
             if !self.auto_copy {
-                if inserted {
+                if added.inserted {
                     self.notify(format!("收到 {sender} 的文本，已存进列表"));
                 }
                 return;
@@ -661,7 +664,7 @@ impl ClipSyncApp {
                 return;
             }
             let placed = self.clipboard.write(&clip.text);
-            if inserted {
+            if added.inserted {
                 if placed {
                     self.notify(format!("收到 {sender} 的文本，已进剪贴板"));
                 } else {
@@ -765,7 +768,13 @@ impl ClipSyncApp {
         let name = sanitize_file_name(&done.name);
         match done.after {
             // 收完就替用户放进剪贴板：回窗口 Cmd/Ctrl+V 直接粘走，不用再来列表点复制。
-            DownloadAfter::Auto => self.paste_incoming_file(&name, &done.path),
+            DownloadAfter::Auto => {
+                if self.auto_paste_file {
+                    self.paste_incoming_file(&name, &done.path);
+                } else {
+                    self.notify(format!("已收到文件 {name}"));
+                }
+            }
             DownloadAfter::Cache => self.notify(format!("已下载 {name}")),
             DownloadAfter::Open => {
                 if let Err(error) = crate::paths::open_path(&done.path) {
@@ -952,6 +961,7 @@ impl ClipSyncApp {
             crypto: self.room_crypto.clone()?,
             client: self.client.clone(),
             clip_topic: clip_topic(&self.room_hash),
+            live: self.live_uploads.clone(),
         })
     }
 
@@ -7684,8 +7694,75 @@ mod tests {
             .send(done("clip2", super::DownloadAfter::Auto))
             .unwrap();
         app.drain_jobs();
-        assert!(app.toast.is_none(), "开关关掉就不该碰剪贴板");
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text.contains("已收到文件")),
+            "开关关掉不碰剪贴板，但收到文件还是要有提示"
+        );
         assert!(app.history.file("clip2").is_some_and(|file| file.cached));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_duplicate_file_announcement_uses_the_existing_row() {
+        use clipsync_core::{engine, mqtt::BrokerLinks};
+
+        let _pasteboard = app_lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+
+        let dir = std::env::temp_dir().join(format!("clipsync-dup-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (_show_tx, show_rx) = std::sync::mpsc::channel();
+        let mut app = super::ClipSyncApp::new(
+            engine::spawn(BrokerLinks),
+            super::History::open(dir.join("history.json")),
+            super::Settings::open(dir.join("settings.json"), "dup-file-test"),
+            super::Preferences::open(dir.join("preferences.json")),
+            None,
+            show_rx,
+            None,
+        );
+        let mut existing = file_record("old", "a.png", "a.png");
+        existing.file.as_mut().unwrap().sha256 = "same-sha".to_string();
+        existing.file.as_mut().unwrap().link = "https://example.test/a.bin".to_string();
+        app.history.add(existing);
+
+        app.on_clip(engine::Clip {
+            mid: "new".to_string(),
+            text: "a.png".to_string(),
+            sender_id: "peer".to_string(),
+            sender_name: "Peer".to_string(),
+            ts: 200,
+            mine: false,
+            file: Some(engine::FileAttachment {
+                name: "a.png".to_string(),
+                mime: "image/png".to_string(),
+                size: 3,
+                sha256: "same-sha".to_string(),
+                link: "https://example.test/b.bin".to_string(),
+                expires_at: 999,
+            }),
+        });
+
+        assert_eq!(app.history.items.len(), 1);
+        assert_eq!(
+            app.history.file("old").unwrap().link,
+            "https://example.test/b.bin"
+        );
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text.contains("还没进房间")),
+            "同内容的新 mid 也要走到下载入口，而不是静默丢掉"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

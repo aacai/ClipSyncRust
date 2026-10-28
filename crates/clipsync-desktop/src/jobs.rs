@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use clipsync_core::crypto::sha256_hex;
 use clipsync_core::files::{
-    decrypt_file, encrypt_file, max_mb, sanitize_file_name, upload_file_name,
+    decrypt_file, encrypt_file_with_sha, max_mb, sanitize_file_name, upload_file_name,
     validate_outgoing_file, RejectReason, MAX_FILE_BYTES,
 };
 use clipsync_core::protocol::{now_millis, random_mid};
@@ -15,6 +17,53 @@ pub struct JobContext {
     pub crypto: Arc<RoomCrypto>,
     pub client: Arc<TransferClient>,
     pub clip_topic: String,
+    pub live: Arc<LiveUploads>,
+}
+
+/// 这间房已经挂上托管方的那几份：链接还活着就复用，同一份内容不传第二遍。
+#[derive(Default)]
+pub struct LiveUploads {
+    inner: Mutex<HashMap<String, LiveUpload>>,
+}
+
+#[derive(Clone)]
+struct LiveUpload {
+    link: String,
+    expires_at: i64,
+}
+
+impl LiveUploads {
+    pub fn take(&self, key: &str) -> Option<(String, i64)> {
+        let mut guard = self.inner.lock().ok()?;
+        let entry = guard.get(key)?.clone();
+        if entry.expires_at - LINK_GRACE_MS <= now_millis() {
+            guard.remove(key);
+            return None;
+        }
+        Some((entry.link, entry.expires_at))
+    }
+
+    pub fn put(&self, key: &str, link: &str, expires_at: i64) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        guard.insert(
+            key.to_string(),
+            LiveUpload {
+                link: link.to_string(),
+                expires_at,
+            },
+        );
+        while guard.len() > MAX_LIVE_UPLOADS {
+            let oldest = guard.keys().next().cloned();
+            let Some(key) = oldest else { break };
+            guard.remove(&key);
+        }
+    }
+}
+
+fn live_key(topic: &str, name: &str, mime: &str, size: i64, sha256: &str) -> String {
+    format!("{topic}\n{name}\n{mime}\n{size}\n{sha256}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,17 +200,28 @@ pub fn perform_upload(
     if let Some(reason) = validate_outgoing_file(&safe, size) {
         return Err(reject_message(reason, &safe));
     }
-    let encrypted = encrypt_file(
-        &context.crypto,
-        &context.clip_topic,
-        &safe,
-        &request.mime,
-        &request.bytes,
-    )
-    .map_err(|error| format!("加密失败：{error}"))?;
-    let link = context
-        .client
-        .upload(&upload_file_name(), &encrypted.cipher, on_progress)?;
+    let sha = sha256_hex(&request.bytes);
+    let key = live_key(&context.clip_topic, &safe, &request.mime, size, &sha);
+    let (link, expires_at) = match context.live.take(&key) {
+        Some(hit) => hit,
+        None => {
+            let encrypted = encrypt_file_with_sha(
+                &context.crypto,
+                &context.clip_topic,
+                &safe,
+                &request.mime,
+                &request.bytes,
+                &sha,
+            )
+            .map_err(|error| format!("加密失败：{error}"))?;
+            let uploaded =
+                context
+                    .client
+                    .upload(&upload_file_name(), &encrypted.cipher, on_progress)?;
+            context.live.put(&key, &uploaded.url, uploaded.expires_at);
+            (uploaded.url, uploaded.expires_at)
+        }
+    };
     let (id, ts) = match &request.target {
         UploadTarget::Publish { .. } => (random_mid(), now_millis()),
         UploadTarget::Resend { id, ts } => (id.clone(), *ts),
@@ -180,9 +240,9 @@ pub fn perform_upload(
         name: safe,
         mime: request.mime,
         size,
-        sha256: encrypted.sha256,
-        link: link.url,
-        expires_at: link.expires_at,
+        sha256: sha,
+        link,
+        expires_at,
         local_path,
         target: request.target,
     })
@@ -251,6 +311,9 @@ fn reject_message(reason: RejectReason, name: &str) -> String {
     }
 }
 
+const LINK_GRACE_MS: i64 = 60_000;
+const MAX_LIVE_UPLOADS: usize = 32;
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
@@ -261,8 +324,8 @@ mod tests {
     use clipsync_core::RoomCrypto;
 
     use super::{
-        perform_download, DownloadAfter, DownloadRequest, JobContext, JobEvent, UploadRequest,
-        UploadTarget,
+        perform_download, DownloadAfter, DownloadRequest, JobContext, JobEvent, LiveUploads,
+        UploadRequest, UploadTarget,
     };
     use crate::transfer::TransferClient;
 
@@ -278,6 +341,7 @@ mod tests {
                 "http://127.0.0.1:1/",
             )),
             clip_topic: topic(),
+            live: std::sync::Arc::new(LiveUploads::default()),
         }
     }
 
@@ -286,8 +350,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0u8; 4096];
-            let _ = stream.read(&mut request);
+            drain_request(&mut stream);
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
@@ -296,6 +359,34 @@ mod tests {
             let _ = stream.write_all(&body);
         });
         format!("http://{address}/file.bin")
+    }
+
+    fn drain_request(stream: &mut impl Read) {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let head_end = loop {
+            let read = stream.read(&mut chunk).unwrap_or(0);
+            if read == 0 {
+                return;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(index) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buffer[..head_end]).to_ascii_lowercase();
+        let length = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while buffer.len() < head_end + length {
+            let read = stream.read(&mut chunk).unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        }
     }
 
     #[test]
@@ -379,5 +470,60 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let _ = sender.send(JobEvent::Failed("x".to_string()));
         assert!(matches!(receiver.try_recv(), Ok(JobEvent::Failed(_))));
+    }
+
+    fn upload_request() -> UploadRequest {
+        UploadRequest {
+            name: "photo.png".to_string(),
+            mime: "image/png".to_string(),
+            bytes: b"same bytes".to_vec(),
+            target: UploadTarget::Publish { cache: false },
+            cached: None,
+        }
+    }
+
+    #[test]
+    fn the_same_file_is_uploaded_once_and_the_second_send_reuses_the_link() {
+        let body = br#"{"success":true,"files":[{"url":"https://host.test/a.bin"}]}"#.to_vec();
+        let origin = serve_once(body);
+        let context = JobContext {
+            crypto: std::sync::Arc::new(RoomCrypto::open("TESTROOM", "pw").unwrap()),
+            client: std::sync::Arc::new(TransferClient::with_hosts(&origin, &origin)),
+            clip_topic: topic(),
+            live: std::sync::Arc::new(LiveUploads::default()),
+        };
+
+        let first = super::perform_upload(&context, upload_request(), |_, _| {}).expect("upload");
+        let second = super::perform_upload(&context, upload_request(), |_, _| {}).expect("reuse");
+
+        assert_eq!(first.link, second.link);
+        assert_eq!(first.sha256, second.sha256);
+        assert_ne!(first.id, second.id, "还是一条新的广播，只是字节没再传");
+    }
+
+    #[test]
+    fn another_room_does_not_reuse_the_link() {
+        let live = std::sync::Arc::new(LiveUploads::default());
+        let first_origin =
+            serve_once(br#"{"success":true,"files":[{"url":"https://host.test/a.bin"}]}"#.to_vec());
+        let context = JobContext {
+            crypto: std::sync::Arc::new(RoomCrypto::open("TESTROOM", "pw").unwrap()),
+            client: std::sync::Arc::new(TransferClient::with_hosts(&first_origin, &first_origin)),
+            clip_topic: topic(),
+            live: live.clone(),
+        };
+        super::perform_upload(&context, upload_request(), |_, _| {}).expect("upload");
+
+        let second_origin =
+            serve_once(br#"{"success":true,"files":[{"url":"https://host.test/b.bin"}]}"#.to_vec());
+        let other = JobContext {
+            crypto: context.crypto.clone(),
+            client: std::sync::Arc::new(TransferClient::with_hosts(&second_origin, &second_origin)),
+            clip_topic: clipsync_core::protocol::clip_topic("otherhash"),
+            live: live.clone(),
+        };
+        let done = super::perform_upload(&other, upload_request(), |_, _| {}).expect("upload");
+
+        assert_eq!(done.link, "https://host.test/b.bin");
     }
 }
