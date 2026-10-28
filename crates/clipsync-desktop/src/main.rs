@@ -7,6 +7,7 @@ mod clipboard;
 mod drag_out;
 mod icons;
 mod jobs;
+mod meminfo;
 mod overlay;
 mod paths;
 mod preview;
