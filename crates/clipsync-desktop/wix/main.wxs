@@ -129,7 +129,8 @@
                             Name='ClipSyncRust'
                             Description='ClipSyncRust desktop client'
                             Target='[!exe0]'
-                            WorkingDirectory='Bin'/>
+                            WorkingDirectory='Bin'
+                            Icon='ProductICO'/>
                         <RemoveFolder Id='RemoveApplicationProgramsFolder'
                             Directory='ApplicationProgramsFolder'
                             On='uninstall'/>
@@ -142,6 +143,30 @@
                             KeyPath='yes'/>
                     </Component>
                 </Directory>
+            </Directory>
+
+            <!--
+              Desktop shortcut: the stock cargo-wix template ships neither shortcut, so an
+              installed app is invisible until someone finds the exe in Program Files.
+              Same shape as the Start Menu component — the .lnk holds no state, so a HKCU
+              value is the KeyPath and uninstall drops the file.
+            -->
+            <Directory Id='DesktopFolder' Name='Desktop'>
+                <Component Id='DesktopShortcut' Guid='*'>
+                    <Shortcut Id='DesktopAppShortcut'
+                        Name='ClipSyncRust'
+                        Description='ClipSyncRust desktop client'
+                        Target='[!exe0]'
+                        WorkingDirectory='Bin'
+                        Icon='ProductICO'/>
+                    <RegistryValue
+                        Root='HKCU'
+                        Key='Software\[Manufacturer]\[ProductName]'
+                        Name='desktopShortcut'
+                        Type='integer'
+                        Value='1'
+                        KeyPath='yes'/>
+                </Component>
             </Directory>
         </Directory>
 
@@ -162,6 +187,7 @@
             
             <ComponentRef Id='binary0'/>
             <ComponentRef Id='ApplicationShortcut'/>
+            <ComponentRef Id='DesktopShortcut'/>
         </Feature>
 
         <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
@@ -173,8 +199,9 @@
           The product icon is the graphic that appears in the Add/Remove
           Programs control panel for the application.
         -->
-        <!--<Icon Id='ProductICO' SourceFile='wix\Product.ico'/>-->
-        <!--<Property Id='ARPPRODUCTICON' Value='ProductICO' />-->
+        <!-- 快捷方式的 Icon 只能引用这里登记的 .ico：exe 自己没嵌资源，不指一下就是一张贴纸。 -->
+        <Icon Id='ProductICO' SourceFile='wix\Product.ico'/>
+        <Property Id='ARPPRODUCTICON' Value='ProductICO' />
 
         
         <!--

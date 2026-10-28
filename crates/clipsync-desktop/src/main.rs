@@ -66,8 +66,7 @@ fn main() -> eframe::Result {
             let dark = configure_shell(&ctx.egui_ctx, preferences.theme());
             // Windows 那条原生标题条得跟着主题色走，放在主题定下来之后。
             win_caption::tint(dark);
-            // 托盘要在主题定下来之后装：macOS 之外没有模板图，得自己按明暗挑描边色。
-            let tray = tray::Tray::try_install(dark);
+            let tray = tray::Tray::try_install();
             Ok(Box::new(ClipSyncApp::new(
                 engine,
                 history,
@@ -96,10 +95,7 @@ fn native_options() -> eframe::NativeOptions {
             .with_fullsize_content_view(true)
             .with_titlebar_shown(false)
             .with_title_shown(false)
-            .with_icon(icons::plate(
-                icons::Icon::Clipboard,
-                egui::Color32::from_rgb(0xc0, 0x42, 0x6b),
-            )),
+            .with_icon(icons::app_icon()),
         ..Default::default()
     }
 }

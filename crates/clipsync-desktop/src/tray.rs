@@ -3,12 +3,10 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use eframe::egui::Color32;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::icons;
-use crate::theme;
 
 pub enum TrayCmd {
     Show,
@@ -21,8 +19,11 @@ pub struct Tray {
 }
 
 impl Tray {
-    pub fn try_install(dark: bool) -> Option<Self> {
-        let icon = tray_icon(dark).ok()?;
+    pub fn try_install() -> Option<Self> {
+        // 直接用应用 logo：自己画的剪贴板底板和装完看到的图标不是同一个东西。
+        // macOS 也不当模板图用——logo 是实心的，交给系统只会糊成一块方斑。
+        let data = icons::tray_icon();
+        let icon = Icon::from_rgba(data.rgba, data.width, data.height).ok()?;
         let show_item = MenuItem::new("显示窗口", true, None);
         let quit_item = MenuItem::new("退出", true, None);
         let menu = Menu::new();
@@ -33,16 +34,12 @@ impl Tray {
         let show_id = show_item.id().clone();
         let quit_id = quit_item.id().clone();
 
-        let builder = TrayIconBuilder::new()
+        let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("ClipSyncRust")
-            .with_icon(icon.clone());
-        // `with_icon_templated` 只在 macOS 上存在，其他平台被 cfg 掉了：菜单栏把图标
-        // 当模板看，只认 alpha 并按外观上色；Windows / Linux 没有这套机制。
-        #[cfg(target_os = "macos")]
-        let builder = builder.with_icon_templated(icon);
-
-        let tray = builder.build().ok()?;
+            .with_icon(icon)
+            .build()
+            .ok()?;
 
         let (cmd_tx, cmd_rx) = mpsc::channel();
         spawn_menu_pump(cmd_tx.clone(), show_id, quit_id);
@@ -94,20 +91,4 @@ fn spawn_click_pump(tx: Sender<TrayCmd>) {
             }
         })
         .ok();
-}
-
-/// 托盘用应用自己的剪贴板轮廓，和界面里 `Icon::Clipboard` 同一份 path 数据。
-/// macOS 交模板图给系统上色；其他平台压在品牌色底上，免得单色轮廓在深色任务栏里整颗消失。
-fn tray_icon(dark: bool) -> Result<Icon, tray_icon::BadIcon> {
-    let data = if cfg!(target_os = "macos") {
-        let tint = if dark {
-            Color32::WHITE
-        } else {
-            Color32::from_rgb(0x1a, 0x1a, 0x1a)
-        };
-        icons::raster(icons::Icon::Clipboard, tint)
-    } else {
-        icons::plate(icons::Icon::Clipboard, theme::palette(dark).accent)
-    };
-    Icon::from_rgba(data.rgba, data.width, data.height)
 }

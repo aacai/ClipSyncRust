@@ -107,6 +107,7 @@ jobs:
           rm -rf "$APP"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp "target/$TARGET/release/$BIN" "$APP/Contents/MacOS/$APP_NAME"
+          cp crates/clipsync-desktop/packaging/app.icns "$APP/Contents/Resources/app.icns"
           printf 'APPL????' > "$APP/Contents/PkgInfo"
           cat > "$APP/Contents/Info.plist" << PLIST
           <?xml version="1.0" encoding="UTF-8"?>
@@ -115,6 +116,7 @@ jobs:
           <dict>
             <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
             <key>CFBundleExecutable</key><string>$APP_NAME</string>
+            <key>CFBundleIconFile</key><string>app.icns</string>
             <key>CFBundleIdentifier</key><string>zhiqiu.app.clipsync.rust</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>$APP_NAME</string>
@@ -205,6 +207,12 @@ jobs:
             echo "wix/main.wxs 又被塞进了系统 PATH 组件（多半是 cargo wix init --force 覆盖过）"
             exit 1
           fi
+          # 出厂模板既没有桌面快捷方式也没有产品图标，装完在桌面和「添加或删除程序」里
+          # 都是一张通用贴纸，所以这两条也得钉住。
+          if ! grep -q "Id='DesktopShortcut'" wix/main.wxs || ! grep -q "ARPPRODUCTICON" wix/main.wxs; then
+            echo "wix/main.wxs 少了桌面快捷方式或产品图标（多半是 cargo wix init 把模板盖回来了）"
+            exit 1
+          fi
           cargo wix --no-build --nocapture --package clipsync-desktop --target x86_64-pc-windows-msvc
           find "$GITHUB_WORKSPACE/target/wix" -name '*.msi'
 
@@ -285,8 +293,11 @@ jobs:
           set -euo pipefail
           ROOT="$RUNNER_TEMP/deb"
           rm -rf "$ROOT"
-          mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/bin" "$ROOT/usr/share/applications"
+          mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/bin" "$ROOT/usr/share/applications" "$ROOT/usr/share/icons"
           cp "target/release/$BIN" "$ROOT/usr/bin/clipsync-rust"
+          # .desktop 里的 Icon=clipsync-rust 只是主题查找名，hicolor 下没有这张图，
+          # 桌面环境就退回通用图标。
+          cp -R crates/clipsync-desktop/packaging/hicolor "$ROOT/usr/share/icons/hicolor"
           cat > "$ROOT/usr/share/applications/clipsync-rust.desktop" << DESKTOP
           [Desktop Entry]
           Type=Application

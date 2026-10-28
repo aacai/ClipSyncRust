@@ -34,6 +34,13 @@ sleep 0.3
 cp "$BIN" "$EXE.new"
 mv -f "$EXE.new" "$EXE"
 chmod +x "$EXE"
+
+# Dock 读的是 bundle 里的 icns，光换二进制就还是那张通用贴纸。
+cp "$ROOT/crates/clipsync-desktop/packaging/app.icns" "$APP/Contents/Resources/app.icns"
+/usr/libexec/PlistBuddy -c "Set :CFBundleIconFile app.icns" "$APP/Contents/Info.plist" 2>/dev/null ||
+  /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string app.icns" "$APP/Contents/Info.plist"
+touch "$APP"
+
 codesign --force --sign "$IDENTITY" "$APP"
 codesign --verify --strict "$APP"
 open "$APP"
