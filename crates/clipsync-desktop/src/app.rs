@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -56,6 +56,15 @@ const THUMB_CACHE: usize = 48;
 const THUMB_SCAN: f32 = 640.0;
 const ZOOM_MAX_SIDE: u32 = 2048;
 const REPO_URL: &str = "https://github.com/aacai/ClipSyncRust";
+const REPO_LABEL: &str = "github.com/aacai/ClipSyncRust";
+const APP_NAME: &str = "ClipSync";
+const COPYRIGHT_LINE: &str = "© 2026 zhiqiu";
+const ABOUT_VERSION_PREFIX: &str = "版本";
+const ABOUT_FONT_NOTE: &str = "界面字体 HarmonyOS Sans，华为授权";
+const ABOUT_LICENSE: &str = "查看授权";
+const LICENSE_TITLE: &str = "HarmonyOS Sans 字体授权";
+const LICENSE_BACK: &str = "返回";
+const LICENSE_TEXT: &str = include_str!("../assets/LICENSE-HarmonyOS-Sans.txt");
 
 const HELP_STEPS: [&str; 6] = [
     "打开「房间共享」：顶栏的钥匙图标，或未共享时列表里的「共享」。填一个房间码（可随机换一个），房间密码可选，设了就必须两端一致。",
@@ -105,7 +114,7 @@ pub struct ClipSyncApp {
     job_tx: mpsc::Sender<JobEvent>,
     job_rx: mpsc::Receiver<JobEvent>,
     transfer: Option<TransferUi>,
-    pending_downloads: HashSet<String>,
+    pending_downloads: HashMap<String, Vec<DownloadAfter>>,
     pending_cache: HashMap<String, String>,
     /// 本帧末尾交给系统拖出（访达/资源管理器）。
     pending_drag_out: Option<Vec<PathBuf>>,
@@ -253,6 +262,7 @@ enum Overlay {
     Share,
     Help,
     About,
+    License,
     Safety,
     /// 同屋设备列表（顶栏设备按钮）；与安全码对话框分开。
     Devices,
@@ -460,7 +470,7 @@ impl ClipSyncApp {
             job_tx,
             job_rx,
             transfer: None,
-            pending_downloads: HashSet::new(),
+            pending_downloads: HashMap::new(),
             pending_cache: HashMap::new(),
             pending_drag_out: None,
             thumbnails: HashMap::new(),
@@ -643,12 +653,15 @@ impl ClipSyncApp {
                 clip.sender_name.as_str()
             };
             if clip.file.is_some() {
-                let file = self.history.file(&id);
-                let ready = file
-                    .as_ref()
-                    .is_some_and(|file| !file.link.trim().is_empty() && !file.cached);
-                if ready {
-                    self.request_download(&id, DownloadAfter::Auto);
+                let Some(file) = self.history.file(&id) else {
+                    return;
+                };
+                if file.link.trim().is_empty() {
+                    return;
+                }
+                match live_path(&file) {
+                    Some(path) => self.paste_incoming_file(&sanitize_file_name(&file.name), &path),
+                    None => self.request_download(&id, DownloadAfter::Auto),
                 }
                 return;
             }
@@ -696,8 +709,8 @@ impl ClipSyncApp {
                 }
                 JobEvent::Downloaded(done) => {
                     self.transfer = None;
-                    self.pending_downloads.remove(&done.id);
-                    self.finish_download(done);
+                    let queued = self.pending_downloads.remove(&done.id).unwrap_or_default();
+                    self.finish_download(done, queued);
                 }
                 JobEvent::Failed(message) => {
                     self.transfer = None;
@@ -760,31 +773,41 @@ impl ClipSyncApp {
         }
     }
 
-    fn finish_download(&mut self, done: jobs::DownloadDone) {
+    fn finish_download(&mut self, done: jobs::DownloadDone, queued: Vec<DownloadAfter>) {
         if !self.history.mark_cached(&done.id, &done.path) {
             return;
         }
         self.thumbnails.remove(&done.id);
         let name = sanitize_file_name(&done.name);
-        match done.after {
+        self.apply_after(done.after, &name, &done.path, done.bytes.as_deref());
+        let Some(path) = self
+            .history
+            .file(&done.id)
+            .and_then(|file| live_path(&file))
+        else {
+            return;
+        };
+        for after in queued {
+            self.apply_after(after, &name, &path, None);
+        }
+    }
+
+    fn apply_after(&mut self, after: DownloadAfter, name: &str, path: &str, bytes: Option<&[u8]>) {
+        match after {
             // 收完就替用户放进剪贴板：回窗口 Cmd/Ctrl+V 直接粘走，不用再来列表点复制。
-            DownloadAfter::Auto => {
-                if self.auto_paste_file {
-                    self.paste_incoming_file(&name, &done.path);
-                } else {
-                    self.notify(format!("已收到文件 {name}"));
-                }
-            }
+            DownloadAfter::Auto => self.paste_incoming_file(name, path),
             DownloadAfter::Cache => self.notify(format!("已下载 {name}")),
             DownloadAfter::Open => {
-                if let Err(error) = crate::paths::open_path(&done.path) {
+                if let Err(error) = crate::paths::open_path(path) {
                     self.notify_error(format!("打开失败：{error}"));
                 }
             }
-            DownloadAfter::Save => self.save_downloaded(&name, &done.path),
+            DownloadAfter::Save => self.save_downloaded(name, path),
             DownloadAfter::CopyImage => {
-                let bytes = done.bytes.as_deref().unwrap_or_default();
-                match self.clipboard.write_image(bytes) {
+                let owned = bytes
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_else(|| std::fs::read(path).unwrap_or_default());
+                match self.clipboard.write_image(&owned) {
                     Ok(()) => self.notify("已把图片放进剪贴板，可直接粘贴"),
                     Err(error) => self.notify_error(format!("写入剪贴板失败：{error}")),
                 }
@@ -796,6 +819,7 @@ impl ClipSyncApp {
     /// 轮询到自家写入时不再二次广播。
     fn paste_incoming_file(&mut self, name: &str, path: &str) {
         if !self.auto_paste_file {
+            self.notify(format!("已收到文件 {name}"));
             return;
         }
         if self.clipboard.write_files(&[PathBuf::from(path)]) {
@@ -2329,7 +2353,7 @@ impl ClipSyncApp {
             self.copy_to_clipboard(&record.text, "已复制");
             return;
         };
-        if let Some(path) = file.local_path.filter(|_| file.cached) {
+        if let Some(path) = live_path(&file) {
             if self.clipboard.write_files(&[PathBuf::from(path)]) {
                 self.notify("已把文件放进剪贴板，可直接粘贴");
             } else {
@@ -2351,12 +2375,8 @@ impl ClipSyncApp {
             return;
         };
         if is_image(&file.mime) {
-            if file.cached {
-                self.copy_record(id);
-            } else {
-                self.request_download(id, DownloadAfter::CopyImage);
-            }
-        } else if file.cached {
+            self.copy_record(id);
+        } else if live_path(&file).is_some() {
             self.open_record(id);
         } else {
             self.request_download(id, DownloadAfter::Cache);
@@ -2367,7 +2387,7 @@ impl ClipSyncApp {
         let Some(file) = self.history.file(id) else {
             return;
         };
-        match file.local_path.filter(|_| file.cached) {
+        match live_path(&file) {
             Some(path) => {
                 if let Err(error) = crate::paths::open_path(&path) {
                     self.notify_error(format!("打开失败：{error}"));
@@ -2385,11 +2405,18 @@ impl ClipSyncApp {
         let Some(file) = self.history.file(id) else {
             return;
         };
-        if self.pending_downloads.contains(id) {
-            // 任务还在飞就再点一次：得给句话，不然看着就是按钮坏了
-            if after != DownloadAfter::Auto {
-                self.notify(format!("{} 正在下载", sanitize_file_name(&file.name)));
+        if let Some(queued) = self.pending_downloads.get_mut(id) {
+            if after != DownloadAfter::Auto
+                && after != DownloadAfter::Cache
+                && !queued.contains(&after)
+            {
+                queued.push(after);
             }
+            self.notify(format!(
+                "{} 正在下载{}",
+                sanitize_file_name(&file.name),
+                after_hint(after)
+            ));
             return;
         }
         let link = file.link.clone();
@@ -2404,7 +2431,7 @@ impl ClipSyncApp {
             self.notify_error("还没进房间，暂时无法下载");
             return;
         };
-        self.pending_downloads.insert(id.to_string());
+        self.pending_downloads.insert(id.to_string(), Vec::new());
         jobs::spawn_download(
             context,
             DownloadRequest {
@@ -2432,7 +2459,7 @@ impl ClipSyncApp {
             }
             return;
         };
-        if let Some(path) = file.local_path.filter(|_| file.cached) {
+        if let Some(path) = live_path(&file) {
             self.save_downloaded(&sanitize_file_name(&file.name), &path);
         } else {
             self.request_download(id, DownloadAfter::Save);
@@ -4186,7 +4213,9 @@ impl ClipSyncApp {
         let width = match &overlay {
             Overlay::Help => 470.0,
             Overlay::Detail { .. } => 500.0,
+            Overlay::About => 340.0,
             Overlay::Safety => 440.0,
+            Overlay::License => 560.0,
             Overlay::Devices => 400.0,
             Overlay::Transform { .. } => 460.0,
             Overlay::Translate { .. } => 520.0,
@@ -4301,37 +4330,45 @@ impl ClipSyncApp {
                         });
                     }
                     Overlay::About => {
-                        dialog_header(ui, Icon::Info, "关于 ClipSyncRust");
-                        ui.add_space(12.0);
-                        let room = if self.joined {
-                            self.room_code.clone()
-                        } else {
-                            "未共享".to_string()
-                        };
-                        about_row(ui, "版本", env!("CARGO_PKG_VERSION"), false);
-                        about_row(ui, "所属系统", paths::device_os(), false);
-                        about_row(ui, "设备号", &paths::install_id(), true);
-                        about_row(ui, "本地记录", &format!("{} 条", self.history.items.len()), false);
-                        about_row(ui, "房间", &room, self.joined);
-                        about_row(ui, "文件托管", "uguu.se，拒收时退回 x0.at", false);
-                        about_row(ui, "界面字体", "HarmonyOS Sans（华为授权）", false);
-                        ui.add_space(6.0);
-                        field_label(ui, "缓存目录");
-                        ui.add_space(2.0);
-                        ui.label(
-                            RichText::new(paths::cache_dir().display().to_string())
-                                .monospace()
-                                .size(11.0)
-                                .color(theme::p().muted),
-                        );
+                        about_hero(ui);
+                        ui.add_space(18.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                RichText::new(COPYRIGHT_LINE)
+                                    .size(11.0)
+                                    .color(theme::p().muted),
+                            );
+                            ui.add_space(10.0);
+                            ui.hyperlink_to(REPO_LABEL, REPO_URL);
+                            ui.add_space(14.0);
+                            ui.label(
+                                RichText::new(ABOUT_FONT_NOTE)
+                                    .size(10.5)
+                                    .color(theme::p().faint),
+                            );
+                            ui.add_space(2.0);
+                            if about_link(ui, ABOUT_LICENSE).clicked() {
+                                action = DialogAction::Open(Overlay::License);
+                            }
+                        });
+                    }
+                    Overlay::License => {
+                        dialog_header(ui, Icon::Note, LICENSE_TITLE);
                         ui.add_space(10.0);
-                        hint(ui, "房间码连同密码在本机派生密钥，托管方只会收到密文。");
-                        ui.add_space(6.0);
-                        ui.hyperlink_to("github.com/aacai/ClipSyncRust", REPO_URL);
+                        egui::ScrollArea::vertical()
+                            .max_height(340.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(LICENSE_TEXT)
+                                        .size(10.5)
+                                        .color(theme::p().muted),
+                                );
+                            });
                         ui.add_space(12.0);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if secondary_button(ui, "知道了").clicked() {
-                                close = true;
+                            if secondary_button(ui, LICENSE_BACK).clicked() {
+                                action = DialogAction::Open(Overlay::About);
                             }
                         });
                     }
@@ -6394,25 +6431,49 @@ fn bullet(ui: &mut Ui, text: &str) {
     ui.add_space(6.0);
 }
 
-/// 关于面板里的一行：左边项目名，右边取值。
-fn about_row(ui: &mut Ui, title: &str, value: &str, monospace: bool) {
-    let font = if monospace {
-        FontId::monospace(11.5)
-    } else {
-        FontId::proportional(11.5)
-    };
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(title).size(11.5).color(theme::p().faint));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(
-                RichText::new(value)
-                    .size(11.5)
-                    .color(theme::p().text)
-                    .font(font),
-            );
-        });
+/// 关于卡片顶部：安装包里的应用图标、名字和版本号。
+fn about_hero(ui: &mut Ui) {
+    let palette = theme::p();
+    let logo = icons::app_icon();
+    let texture = ui.ctx().load_texture_cached(
+        "clipsync-app-logo",
+        Id::unique("app-logo"),
+        egui::ColorImage::from_rgba_unmultiplied(
+            [logo.width as usize, logo.height as usize],
+            &logo.rgba,
+        ),
+        egui::TextureOptions::LINEAR,
+    );
+    ui.vertical_centered(|ui| {
+        ui.add(egui::Image::new(&texture).fit_to_exact_size(Vec2::splat(72.0)));
+        ui.add_space(13.0);
+        ui.label(
+            RichText::new(APP_NAME)
+                .size(20.0)
+                .strong()
+                .color(palette.text),
+        );
+        ui.add_space(3.0);
+        ui.label(
+            RichText::new(format!(
+                "{ABOUT_VERSION_PREFIX} {}",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .size(11.5)
+            .color(palette.muted),
+        );
     });
-    ui.add_space(7.0);
+}
+
+fn about_link(ui: &mut Ui, label: &str) -> egui::Response {
+    let palette = theme::p();
+    ui.add(
+        egui::Button::new(RichText::new(label).size(10.5).color(palette.accent))
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::NONE)
+            .corner_radius(CornerRadius::same(6))
+            .min_size(Vec2::new(0.0, 18.0)),
+    )
 }
 
 fn accent_button(ui: &mut Ui, label: &str) -> egui::Response {
@@ -6615,6 +6676,25 @@ fn language_label(language: Language) -> &'static str {
 /// 工具栏上「共 N 条记录」的那个 N：走的是和列表同一套搜索，搜着就只数命中的。
 fn visible_count(history: &History, query: &str, regex: bool, case_sensitive: bool) -> usize {
     history.search(query, regex, case_sensitive).len()
+}
+
+fn live_path(file: &FileInfo) -> Option<String> {
+    if !file.cached {
+        return None;
+    }
+    file.local_path
+        .clone()
+        .filter(|path| std::fs::metadata(path).is_ok())
+}
+
+fn after_hint(after: DownloadAfter) -> String {
+    match after {
+        DownloadAfter::Save => "，完成就存到下载目录",
+        DownloadAfter::Open => "，完成就打开",
+        DownloadAfter::CopyImage => "，完成就放进剪贴板",
+        DownloadAfter::Auto | DownloadAfter::Cache => "",
+    }
+    .to_string()
 }
 
 const SETTINGS_ROW_HEIGHT: f32 = 48.0;
@@ -7597,7 +7677,8 @@ mod tests {
         );
         app.history.add(file_record("clip1", "a.png", "图一"));
 
-        app.pending_downloads.insert("clip1".to_string());
+        app.pending_downloads
+            .insert("clip1".to_string(), Vec::new());
         app.job_tx
             .send(super::JobEvent::DownloadFailed {
                 id: "clip1".to_string(),
@@ -7618,7 +7699,8 @@ mod tests {
             .is_some_and(|toast| toast.text.contains("还没有上传链接")));
 
         // 任务真的在飞时重复点，也要有话，不能装作按钮坏了
-        app.pending_downloads.insert("clip1".to_string());
+        app.pending_downloads
+            .insert("clip1".to_string(), Vec::new());
         app.request_download("clip1", super::DownloadAfter::Cache);
         assert!(app
             .toast
@@ -7763,6 +7845,252 @@ mod tests {
                 .is_some_and(|toast| toast.text.contains("还没进房间")),
             "同内容的新 mid 也要走到下载入口，而不是静默丢掉"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn join_room(app: &mut super::ClipSyncApp) {
+        app.room_crypto = Some(super::Arc::new(
+            super::RoomCrypto::open("AUTOROOM", "").unwrap(),
+        ));
+        app.room_hash = super::room_hash("AUTOROOM");
+    }
+
+    fn incoming_png(mid: &str, sha: &str, link: &str) -> clipsync_core::engine::Clip {
+        clipsync_core::engine::Clip {
+            mid: mid.to_string(),
+            text: "a.png".to_string(),
+            sender_id: "peer".to_string(),
+            sender_name: "Peer".to_string(),
+            ts: 100,
+            mine: false,
+            file: Some(clipsync_core::engine::FileAttachment {
+                name: "a.png".to_string(),
+                mime: "image/png".to_string(),
+                size: 3,
+                sha256: sha.to_string(),
+                link: link.to_string(),
+                expires_at: 999,
+            }),
+        }
+    }
+
+    #[test]
+    fn an_incoming_file_kicks_off_its_own_download() {
+        use clipsync_core::{engine, mqtt::BrokerLinks};
+
+        let _pasteboard = app_lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+
+        let dir = std::env::temp_dir().join(format!("clipsync-auto-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (_show_tx, show_rx) = std::sync::mpsc::channel();
+        let mut app = super::ClipSyncApp::new(
+            engine::spawn(BrokerLinks),
+            super::History::open(dir.join("history.json")),
+            super::Settings::open(dir.join("settings.json"), "auto-test"),
+            super::Preferences::open(dir.join("preferences.json")),
+            None,
+            show_rx,
+            None,
+        );
+        join_room(&mut app);
+
+        app.on_clip(incoming_png("m1", "sha-1", "http://127.0.0.1:1/a.bin"));
+
+        let id = app.history.items[0].id.clone();
+        assert!(
+            app.pending_downloads.contains_key(&id),
+            "收到文件要自己起下载，不能等用户点一次"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_already_on_disk_is_pasted_straight_from_the_cache() {
+        use clipsync_core::{engine, mqtt::BrokerLinks};
+
+        let _pasteboard = app_lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+
+        let dir = std::env::temp_dir().join(format!("clipsync-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stored = dir.join("a.png");
+        std::fs::write(&stored, b"png bytes").unwrap();
+
+        let (_show_tx, show_rx) = std::sync::mpsc::channel();
+        let mut app = super::ClipSyncApp::new(
+            engine::spawn(BrokerLinks),
+            super::History::open(dir.join("history.json")),
+            super::Settings::open(dir.join("settings.json"), "live-test"),
+            super::Preferences::open(dir.join("preferences.json")),
+            None,
+            show_rx,
+            None,
+        );
+        join_room(&mut app);
+        app.auto_paste_file = true;
+        let mut existing = file_record("old", "a.png", "a.png");
+        let meta = existing.file.as_mut().unwrap();
+        meta.sha256 = "same-sha".to_string();
+        meta.link = "http://127.0.0.1:1/a.bin".to_string();
+        meta.cached = true;
+        meta.local_path = Some(stored.to_string_lossy().into_owned());
+        app.history.add(existing);
+
+        app.on_clip(incoming_png("new", "same-sha", "http://127.0.0.1:1/b.bin"));
+
+        assert!(
+            app.pending_downloads.is_empty(),
+            "本机已经有这份内容，不该再下一遍"
+        );
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text.contains("剪贴板")),
+            "同内容再发一次也要立刻进剪贴板，不能一声不响"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_cache_entry_downloads_the_file_again() {
+        use clipsync_core::{engine, mqtt::BrokerLinks};
+
+        let _pasteboard = app_lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+
+        let dir = std::env::temp_dir().join(format!("clipsync-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stored = dir.join("a.png");
+        std::fs::write(&stored, b"png bytes").unwrap();
+
+        let (_show_tx, show_rx) = std::sync::mpsc::channel();
+        let mut app = super::ClipSyncApp::new(
+            engine::spawn(BrokerLinks),
+            super::History::open(dir.join("history.json")),
+            super::Settings::open(dir.join("settings.json"), "stale-test"),
+            super::Preferences::open(dir.join("preferences.json")),
+            None,
+            show_rx,
+            None,
+        );
+        join_room(&mut app);
+        let mut existing = file_record("old", "a.png", "a.png");
+        let meta = existing.file.as_mut().unwrap();
+        meta.sha256 = "same-sha".to_string();
+        meta.link = "http://127.0.0.1:1/a.bin".to_string();
+        meta.cached = true;
+        meta.local_path = Some(stored.to_string_lossy().into_owned());
+        app.history.add(existing);
+        std::fs::remove_file(&stored).unwrap();
+
+        app.on_clip(incoming_png("new", "same-sha", "http://127.0.0.1:1/b.bin"));
+
+        assert!(
+            app.pending_downloads.contains_key("old"),
+            "缓存文件已经没了的条目要当没下过，重新下载"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_save_click_during_the_auto_download_lands_in_downloads() {
+        use clipsync_core::{engine, mqtt::BrokerLinks};
+
+        let _pasteboard = app_lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+
+        let dir = std::env::temp_dir().join(format!("clipsync-queue-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = format!("clipsync-queue-{}.png", std::process::id());
+        let stored = dir.join(&name);
+        std::fs::write(&stored, b"png bytes").unwrap();
+
+        let (_show_tx, show_rx) = std::sync::mpsc::channel();
+        let mut app = super::ClipSyncApp::new(
+            engine::spawn(BrokerLinks),
+            super::History::open(dir.join("history.json")),
+            super::Settings::open(dir.join("settings.json"), "queue-test"),
+            super::Preferences::open(dir.join("preferences.json")),
+            None,
+            show_rx,
+            None,
+        );
+        join_room(&mut app);
+        app.auto_paste_file = false;
+        let mut record = file_record("clip1", &name, "图一");
+        let meta = record.file.as_mut().unwrap();
+        meta.sha256 = "sha-1".to_string();
+        meta.link = "http://127.0.0.1:1/a.bin".to_string();
+        app.history.add(record);
+
+        app.pending_downloads
+            .insert("clip1".to_string(), Vec::new());
+
+        app.toast = None;
+        app.save_record("clip1");
+        assert!(
+            app.pending_downloads
+                .get("clip1")
+                .is_some_and(|queued| queued.contains(&super::DownloadAfter::Save)),
+            "下载在飞时点的「存到下载目录」要排队，不能被一句提示吞掉"
+        );
+        app.save_record("clip1");
+        assert_eq!(
+            app.pending_downloads
+                .get("clip1")
+                .map(|queued| queued.len())
+                .unwrap_or_default(),
+            1,
+            "同一种后续动作重复点只算一次，不然下载目录里多一份"
+        );
+
+        app.job_tx
+            .send(super::JobEvent::Downloaded(super::jobs::DownloadDone {
+                id: "clip1".to_string(),
+                name: name.clone(),
+                path: stored.to_string_lossy().into_owned(),
+                bytes: None,
+                after: super::DownloadAfter::Auto,
+            }))
+            .unwrap();
+        app.drain_jobs();
+
+        let written = app
+            .toast
+            .as_ref()
+            .and_then(|toast| toast.text.strip_prefix("已存到下载目录："))
+            .unwrap_or_default()
+            .to_string();
+        assert!(!written.is_empty(), "一次点击就该把文件落到下载目录");
+        let landing = super::paths::downloads_dir().join(&written);
+        assert_eq!(std::fs::read(&landing).unwrap(), b"png bytes");
+        let _ = std::fs::remove_file(&landing);
+        assert!(app.pending_downloads.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
