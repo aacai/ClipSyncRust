@@ -14,6 +14,7 @@ mod preview;
 mod record;
 mod screenshot;
 mod settings;
+mod startup;
 mod store;
 mod text_tools;
 mod theme;
@@ -37,16 +38,26 @@ use store::History;
 const SINGLE_INSTANCE_PORT: u16 = 48124;
 
 fn main() -> eframe::Result {
+    startup::begin();
+    startup::install_panic_hook();
+
     let listener = match TcpListener::bind(("127.0.0.1", SINGLE_INSTANCE_PORT)) {
-        Ok(listener) => listener,
-        Err(_) => {
-            // 已有实例：敲一下回环端口，请它把窗口抬起来
-            notify_existing_instance();
-            return Ok(());
+        Ok(listener) => Some(listener),
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::AddrInUse && notify_existing_instance() {
+                startup::note("已有实例在运行，这次启动只负责唤醒它");
+                return Ok(());
+            }
+            startup::note(&format!(
+                "单实例端口 {SINGLE_INSTANCE_PORT} 不可用（{error}），这次照常启动"
+            ));
+            None
         }
     };
     let (show_tx, show_rx) = mpsc::channel();
-    start_instance_server(listener, show_tx);
+    if let Some(listener) = listener {
+        start_instance_server(listener, show_tx);
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -60,7 +71,7 @@ fn main() -> eframe::Result {
     let settings = Settings::open(paths::app_dir().join("settings.json"), &paths::install_id());
     let preferences = Preferences::open(paths::app_dir().join("preferences.json"));
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "ClipSyncRust",
         native_options(),
         Box::new(move |ctx| {
@@ -68,7 +79,7 @@ fn main() -> eframe::Result {
             // Windows 那条原生标题条得跟着主题色走，放在主题定下来之后。
             win_caption::tint(dark);
             let tray = tray::Tray::try_install();
-            Ok(Box::new(ClipSyncApp::new(
+            let app = ClipSyncApp::new(
                 engine,
                 history,
                 settings,
@@ -76,9 +87,17 @@ fn main() -> eframe::Result {
                 screenshot::Hotkeys::new(&ctx.egui_ctx),
                 show_rx,
                 tray,
-            )))
+            );
+            startup::mark_running();
+            Ok(Box::new(app))
         }),
-    )
+    );
+    if let Err(error) = &result {
+        startup::fail(&format!(
+            "窗口创建失败：{error}\n多半是显卡驱动或 OpenGL 不可用"
+        ));
+    }
+    result
 }
 
 fn configure_shell(ctx: &egui::Context, mode: ThemeMode) -> bool {
@@ -115,9 +134,10 @@ fn start_instance_server(listener: TcpListener, show_tx: mpsc::Sender<()>) {
         .ok();
 }
 
-fn notify_existing_instance() {
-    if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", SINGLE_INSTANCE_PORT)) {
-        let _ = stream.write_all(&[1]);
+fn notify_existing_instance() -> bool {
+    match TcpStream::connect(("127.0.0.1", SINGLE_INSTANCE_PORT)) {
+        Ok(mut stream) => stream.write_all(&[1]).is_ok(),
+        Err(_) => false,
     }
 }
 
