@@ -2,6 +2,7 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
 mod app;
+mod app_menu;
 mod autostart;
 mod clipboard;
 mod drag_out;

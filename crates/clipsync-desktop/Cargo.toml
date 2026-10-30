@@ -44,6 +44,8 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSData", "NSGeometry", "NSString", "NSURL"] }
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
+    "NSMenu",
+    "NSMenuItem",
     "NSScreen",
     "NSWindow",
     "NSView",

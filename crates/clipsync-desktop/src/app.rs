@@ -156,6 +156,8 @@ pub struct ClipSyncApp {
     record_rechecked: bool,
     /// 第二实例连上本机回环端口时发来的「请显示窗口」。
     show_rx: mpsc::Receiver<()>,
+    /// macOS 应用菜单那条「关于」接好了没有；菜单是 winit 晚一步建的，没改到就下一帧再试。
+    about_menu_hooked: bool,
     tray: Option<Tray>,
     /// 设置页「退出」：允许真正关进程，普通点关闭只是藏窗。
     force_quit: bool,
@@ -501,6 +503,7 @@ impl ClipSyncApp {
             record_excluded: false,
             record_rechecked: false,
             show_rx,
+            about_menu_hooked: false,
             tray,
             force_quit: false,
             window_visible: true,
@@ -607,6 +610,16 @@ impl ClipSyncApp {
             }
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.hide_window(ctx);
+        }
+    }
+
+    fn drain_about_menu(&mut self, ctx: &egui::Context) {
+        if !self.about_menu_hooked {
+            self.about_menu_hooked = crate::app_menu::install();
+        }
+        if crate::app_menu::take_request() {
+            self.reveal_window(ctx);
+            self.open(Overlay::About);
         }
     }
 
@@ -3355,6 +3368,7 @@ impl ClipSyncApp {
             theme::apply(ctx, self.theme_mode);
         }
         self.drain_shell_signals(ctx);
+        self.drain_about_menu(ctx);
         self.drain_events();
         self.drain_jobs();
         self.drain_updates();
