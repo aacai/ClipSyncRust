@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::io::Cursor;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
@@ -131,6 +131,7 @@ pub struct ClipboardWatcher {
     own_files: Option<String>,
     last_image: Option<String>,
     own_image: Option<String>,
+    last_change: Option<isize>,
 }
 
 impl ClipboardWatcher {
@@ -146,21 +147,26 @@ impl ClipboardWatcher {
             own_files: None,
             last_image,
             own_image: None,
+            last_change: pasteboard_change_count(),
         }
     }
 
     /// Files first: Finder also puts a text path on the pasteboard, and treating that
     /// as text would sync the path instead of the file.
     pub fn poll(&mut self, watch_files: bool, watch_images: bool) -> Option<Captured> {
+        if unchanged_since_last_poll(&mut self.last_change) {
+            return None;
+        }
+        let own_files = self.own_files.take();
+        let own_image = self.own_image.take();
         let clipboard = self.clipboard.as_mut()?;
 
         if watch_files {
             let files = read_files(clipboard);
             if !files.is_empty() {
                 let signature = signature_of(&files);
-                if Some(&signature) == self.last_files.as_ref()
-                    || Some(&signature) == self.own_files.as_ref()
-                {
+                if is_repeat_capture(&self.last_files, &own_files, &signature) {
+                    self.last_files = Some(signature);
                     return None;
                 }
                 self.last_files = Some(signature);
@@ -176,9 +182,8 @@ impl ClipboardWatcher {
 
         if watch_images {
             let image = read_image(clipboard)?;
-            if Some(&image.hash) == self.last_image.as_ref()
-                || Some(&image.hash) == self.own_image.as_ref()
-            {
+            if is_repeat_capture(&self.last_image, &own_image, &image.hash) {
+                self.last_image = Some(image.hash.clone());
                 return None;
             }
             self.last_image = Some(image.hash.clone());
@@ -205,6 +210,7 @@ impl ClipboardWatcher {
         self.last_image = image_fingerprint(clipboard);
         self.own_files = None;
         self.own_image = None;
+        self.last_change = pasteboard_change_count();
     }
 
     pub fn write(&mut self, text: &str) -> bool {
@@ -247,7 +253,11 @@ impl ClipboardWatcher {
             return false;
         }
         let files = read_files(clipboard);
-        self.own_files = Some(signature_of(&files));
+        self.own_files = Some(if files.is_empty() {
+            signature_from_paths(paths)
+        } else {
+            signature_of(&files)
+        });
         true
     }
 
@@ -255,13 +265,10 @@ impl ClipboardWatcher {
         let decoded = image::load_from_memory(png).map_err(|error| error.to_string())?;
         let rgba = decoded.to_rgba8();
         let (width, height) = rgba.dimensions();
-        let bytes = rgba.into_raw();
-        let hash = image_hash(&bytes, width, height);
+        let hash = image_hash(rgba.as_raw(), width, height);
         #[cfg(target_os = "macos")]
         {
-            // Cursor / Electron 认 public.png；arboard 只写 NSImage→TIFF，粘贴会报不支持格式。
-            // PNG + TIFF 都放上，两边都能吃。
-            write_macos_image(png, &bytes, width as usize, height as usize)?;
+            write_macos_image(png)?;
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -270,7 +277,7 @@ impl ClipboardWatcher {
                 .set_image(ImageData {
                     width: width as usize,
                     height: height as usize,
-                    bytes: bytes.into(),
+                    bytes: rgba.into_raw().into(),
                 })
                 .map_err(|error| error.to_string())?;
         }
@@ -279,24 +286,66 @@ impl ClipboardWatcher {
     }
 }
 
-/// macOS：写入 `public.png`。arboard 只放 NSImage/TIFF，Cursor 等 Electron 会报不支持格式。
 #[cfg(target_os = "macos")]
-fn write_macos_image(
-    png: &[u8],
-    _rgba: &[u8],
-    _width: usize,
-    _height: usize,
-) -> Result<(), String> {
-    use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG};
+fn write_macos_image(png: &[u8]) -> Result<(), String> {
+    use objc2::AnyThread;
+    use objc2_app_kit::{NSImage, NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeTIFF};
     use objc2_foundation::NSData;
 
     let pasteboard = NSPasteboard::generalPasteboard();
     pasteboard.clearContents();
+    let png_type = unsafe { NSPasteboardTypePNG };
+    let tiff_type = unsafe { NSPasteboardTypeTIFF };
     let png_data = NSData::with_bytes(png);
-    if !unsafe { pasteboard.setData_forType(Some(&png_data), NSPasteboardTypePNG) } {
+    let tiff = NSImage::initWithData(NSImage::alloc(), &png_data)
+        .and_then(|image| image.TIFFRepresentation());
+    if !pasteboard.setData_forType(Some(&png_data), png_type) {
         return Err("写入 PNG 到剪贴板失败".into());
     }
+    if let Some(tiff) = tiff {
+        pasteboard.setData_forType(Some(&tiff), tiff_type);
+    }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn pasteboard_change_count() -> Option<isize> {
+    use objc2_app_kit::NSPasteboard;
+
+    Some(NSPasteboard::generalPasteboard().changeCount())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pasteboard_change_count() -> Option<isize> {
+    None
+}
+
+fn unchanged_since_last_poll(last_change: &mut Option<isize>) -> bool {
+    let Some(change) = pasteboard_change_count() else {
+        return false;
+    };
+    if *last_change == Some(change) {
+        return true;
+    }
+    *last_change = Some(change);
+    false
+}
+
+fn is_repeat_capture(last: &Option<String>, own: &Option<String>, value: &str) -> bool {
+    own.as_deref() == Some(value) || last.as_deref() == Some(value)
+}
+
+fn clip_file(path: &Path) -> Option<ClipFile> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() == 0 {
+        return None;
+    }
+    let name = path.file_name()?.to_string_lossy().to_string();
+    Some(ClipFile {
+        path: path.to_path_buf(),
+        name,
+        size: meta.len() as i64,
+    })
 }
 
 fn read_files(clipboard: &mut Clipboard) -> Vec<ClipFile> {
@@ -305,24 +354,22 @@ fn read_files(clipboard: &mut Clipboard) -> Vec<ClipFile> {
     };
     paths
         .into_iter()
-        .filter_map(|path| {
-            let meta = std::fs::metadata(&path).ok()?;
-            if !meta.is_file() || meta.len() == 0 {
-                return None;
-            }
-            let name = path.file_name()?.to_string_lossy().to_string();
-            Some(ClipFile {
-                path,
-                name,
-                size: meta.len() as i64,
-            })
-        })
+        .filter_map(|path| clip_file(&path))
         .collect()
 }
 
 fn file_signature(clipboard: &mut Clipboard) -> Option<String> {
     let files = read_files(clipboard);
     (!files.is_empty()).then(|| signature_of(&files))
+}
+
+fn signature_from_paths(paths: &[PathBuf]) -> String {
+    signature_of(
+        &paths
+            .iter()
+            .filter_map(|path| clip_file(path))
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn signature_of(files: &[ClipFile]) -> String {
@@ -334,15 +381,36 @@ fn signature_of(files: &[ClipFile]) -> String {
 }
 
 fn read_image(clipboard: &mut Clipboard) -> Option<ClipImage> {
+    #[cfg(target_os = "macos")]
+    if let Some(image) = read_macos_png().and_then(|png| clip_image_from_encoded(&png)) {
+        return Some(image);
+    }
     let image = clipboard.get_image().ok()?;
-    let width = image.width;
-    let height = image.height;
+    let rgba = image.bytes.into_owned();
+    clip_image_from_rgba(image.width as u32, image.height as u32, rgba)
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_png() -> Option<Vec<u8>> {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG};
+
+    let pasteboard = NSPasteboard::generalPasteboard();
+    let data = pasteboard.dataForType(unsafe { NSPasteboardTypePNG })?;
+    Some(unsafe { data.as_bytes_unchecked() }.to_vec())
+}
+
+fn clip_image_from_encoded(bytes: &[u8]) -> Option<ClipImage> {
+    let decoded = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (width, height) = decoded.dimensions();
+    clip_image_from_rgba(width, height, decoded.into_raw())
+}
+
+fn clip_image_from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Option<ClipImage> {
     if width == 0 || height == 0 {
         return None;
     }
-    let rgba = image.bytes.into_owned();
-    let hash = image_hash(&rgba, width as u32, height as u32);
-    let dynamic = image::RgbaImage::from_raw(width as u32, height as u32, rgba.clone())?;
+    let hash = image_hash(&rgba, width, height);
+    let dynamic = image::RgbaImage::from_raw(width, height, rgba)?;
     let mut png = Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(dynamic)
         .write_to(&mut png, image::ImageFormat::Png)
@@ -372,9 +440,20 @@ pub fn image_hash(rgba: &[u8], width: u32, height: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{image_hash, signature_of, ClipFile, CopyFilter, ECHO_WINDOW};
+    use super::{
+        clip_image_from_rgba, image_hash, is_repeat_capture, signature_from_paths, signature_of,
+        ClipFile, CopyFilter, ECHO_WINDOW,
+    };
     use std::path::PathBuf;
     use std::time::Instant;
+
+    fn test_png(width: u32, height: u32, pixel: image::Rgba<u8>) -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(width, height, pixel))
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
 
     #[test]
     fn startup_baseline_is_not_a_copy() {
@@ -484,5 +563,115 @@ mod tests {
             Some(text)
         );
         assert!(watcher.write(&original));
+    }
+
+    #[test]
+    fn reencoding_an_image_keeps_its_pixels() {
+        let rgba = vec![1u8, 2, 3, 255, 4, 5, 6, 128];
+        let image = clip_image_from_rgba(2, 1, rgba.clone()).expect("image");
+        assert_eq!(image.hash, image_hash(&rgba, 2, 1));
+        let decoded = image::load_from_memory(&image.png).expect("png").to_rgba8();
+        assert_eq!(decoded.as_raw(), &rgba);
+    }
+
+    #[test]
+    fn the_same_content_is_never_captured_twice() {
+        let last = Some("a.png:10".to_string());
+        let own = Some("b.png:20".to_string());
+        assert!(is_repeat_capture(&last, &own, "a.png:10"));
+        assert!(is_repeat_capture(&last, &own, "b.png:20"));
+        assert!(!is_repeat_capture(&last, &own, "c.png:30"));
+        assert!(!is_repeat_capture(&None, &None, "c.png:30"));
+    }
+
+    #[test]
+    fn written_paths_keep_their_own_signature() {
+        let dir = std::env::temp_dir().join(format!("clipsync-sig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.pdf");
+        std::fs::write(&path, b"12345").unwrap();
+        assert_eq!(signature_from_paths(std::slice::from_ref(&path)), "note.pdf:5");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn put_png_on_pasteboard(png: &[u8]) {
+        use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG};
+        use objc2_foundation::NSData;
+
+        let pasteboard = NSPasteboard::generalPasteboard();
+        pasteboard.clearContents();
+        let png_type = unsafe { NSPasteboardTypePNG };
+        assert!(pasteboard.setData_forType(Some(&NSData::with_bytes(png)), png_type));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_png_only_pasteboard_is_captured() {
+        use super::{Captured, ClipboardWatcher};
+
+        let png = test_png(4, 3, image::Rgba([12, 34, 56, 255]));
+        let mut watcher = ClipboardWatcher::new();
+        put_png_on_pasteboard(&png);
+        let Some(Captured::Image(image)) = watcher.poll(false, true) else {
+            panic!("只放了 public.png 的剪贴板必须被读成图片");
+        };
+        let decoded = image::load_from_memory(&image.png).expect("png").to_rgba8();
+        assert_eq!(decoded.dimensions(), (4, 3));
+        assert_eq!(decoded.as_raw(), &[12, 34, 56, 255].repeat(12));
+        assert!(watcher.poll(false, true).is_none(), "没换内容就别重复读");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn copying_the_same_image_again_is_not_announced_again() {
+        use super::{Captured, ClipboardWatcher};
+
+        let png = test_png(2, 2, image::Rgba([1, 2, 3, 255]));
+        let mut watcher = ClipboardWatcher::new();
+        put_png_on_pasteboard(&png);
+        assert!(matches!(
+            watcher.poll(false, true),
+            Some(Captured::Image(_))
+        ));
+        put_png_on_pasteboard(&png);
+        assert!(
+            watcher.poll(false, true).is_none(),
+            "同一张图再复制一次，不能重放"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn copying_out_then_copying_the_same_image_again_stays_quiet() {
+        use super::ClipboardWatcher;
+
+        let png = test_png(2, 2, image::Rgba([7, 8, 9, 255]));
+        let mut watcher = ClipboardWatcher::new();
+        watcher.write_image(&png).expect("write image");
+        assert!(watcher.poll(false, true).is_none(), "自家写进去的别再广播");
+        put_png_on_pasteboard(&png);
+        assert!(
+            watcher.poll(false, true).is_none(),
+            "刚写过的同一张图再被复制，也不能重放"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn writing_an_image_offers_png_and_tiff() {
+        use super::ClipboardWatcher;
+        use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeTIFF};
+
+        let png = test_png(3, 2, image::Rgba([9, 200, 60, 255]));
+        let mut watcher = ClipboardWatcher::new();
+        watcher.write_image(&png).expect("write image");
+        let pasteboard = NSPasteboard::generalPasteboard();
+        let png_type = unsafe { NSPasteboardTypePNG };
+        let tiff_type = unsafe { NSPasteboardTypeTIFF };
+        assert!(pasteboard.dataForType(png_type).is_some());
+        assert!(pasteboard.dataForType(tiff_type).is_some());
+        assert!(watcher.poll(false, true).is_none(), "自家写进去的别再广播");
     }
 }
