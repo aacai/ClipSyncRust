@@ -54,6 +54,8 @@ const THUMB_MAX_SIDE: u32 = 256;
 const THUMB_CACHE: usize = 48;
 /// 视口上下各多准备这么高的行，快速滚动时不至于先看到空位。
 const THUMB_SCAN: f32 = 640.0;
+const PREVIEW_W: f32 = 220.0;
+const PREVIEW_H: f32 = 140.0;
 const ZOOM_MAX_SIDE: u32 = 2048;
 const REPO_URL: &str = "https://github.com/aacai/ClipSyncRust";
 const REPO_LABEL: &str = "github.com/aacai/ClipSyncRust";
@@ -384,8 +386,6 @@ struct RowView<'a> {
     online: bool,
     can_up: bool,
     can_down: bool,
-    /// 该行是否给缩略图留位置（由记录决定）。
-    slot: bool,
     thumb: Option<TextureHandle>,
 }
 
@@ -3566,7 +3566,6 @@ impl ClipSyncApp {
                                         online,
                                         can_up: info.is_some_and(|info| info.position > info.from),
                                         can_down: info.is_some_and(|info| info.position < info.to),
-                                        slot: ClipSyncApp::has_thumb_slot(record),
                                         thumb,
                                     };
                                     let scroll =
@@ -5585,7 +5584,6 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
         online,
         can_up,
         can_down,
-        slot,
         thumb,
     } = view;
     let font = FontId::proportional(14.0);
@@ -5593,6 +5591,7 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
     let number_w = 26.0;
     let file = record.file.as_ref();
     let is_file = record.kind == KIND_FILE && file.is_some();
+    let preview = is_file && file.is_some_and(|file| is_image(&file.mime));
     let cached = file.is_some_and(|file| file.cached && file.local_path.is_some());
     let copyable = !is_file || cached || file.is_some_and(|file| is_image(&file.mime));
     let quick_actions = if is_file {
@@ -5601,48 +5600,53 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
         4.0
     };
     let action_reserve = 8.0 + quick_actions * 30.0 + (quick_actions - 1.0) * 2.0 + 8.0;
-    let thumb_gap = if slot { 54.0 } else { 8.0 };
     let avail = ui.available_width();
     let card_w = (avail - theme::ROW_INSET * 2.0).max(240.0);
-    let text_w = (card_w - left_pad - number_w - thumb_gap - action_reserve - 10.0).max(150.0);
+    let text_w = (card_w - left_pad - number_w - 8.0 - action_reserve - 10.0).max(150.0);
+    let preview_w = (card_w - left_pad - number_w - 10.0 - 140.0).clamp(96.0, PREVIEW_W);
 
     let empty = !is_file && record.text.is_empty();
-    let display = match file {
-        Some(file) => file.name.as_str(),
-        None if empty => "（空文本）",
-        None => record.text.as_str(),
-    };
-    let mut body = egui::text::LayoutJob {
-        wrap: TextWrapping {
-            max_width: text_w,
-            max_rows: 24,
-            overflow_character: Some('…'),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    body.append(
-        display,
-        0.0,
-        TextFormat {
-            font_id: font.clone(),
-            color: if empty {
-                theme::p().faint
-            } else {
-                theme::p().text
+    let galley = (!preview).then(|| {
+        let display = match file {
+            Some(file) => file.name.as_str(),
+            None if empty => "（空文本）",
+            None => record.text.as_str(),
+        };
+        let mut body = egui::text::LayoutJob {
+            wrap: TextWrapping {
+                max_width: text_w,
+                max_rows: 24,
+                overflow_character: Some('…'),
+                ..Default::default()
             },
             ..Default::default()
-        },
-    );
-    let galley = ui.ctx().fonts_mut(|fonts| fonts.layout_job(body));
-    let text_h = galley.size().y.max(20.0);
-    let line_center = first_line_center(&galley);
-    let (top_pad, thumb_top) = if slot {
-        ((9.0 + 16.0 - line_center).max(10.0), 9.0)
+        };
+        body.append(
+            display,
+            0.0,
+            TextFormat {
+                font_id: font.clone(),
+                color: if empty {
+                    theme::p().faint
+                } else {
+                    theme::p().text
+                },
+                ..Default::default()
+            },
+        );
+        ui.ctx().fonts_mut(|fonts| fonts.layout_job(body))
+    });
+    let text_h = galley
+        .as_ref()
+        .map_or(0.0, |galley| galley.size().y.max(20.0));
+    let line_center = galley
+        .as_ref()
+        .map_or(10.0, |galley| first_line_center(galley));
+    let (top_pad, content_h) = if preview {
+        (9.0, PREVIEW_H)
     } else {
-        (10.0, 0.0)
+        (10.0, text_h + 21.0)
     };
-    let content_h = text_h + 21.0;
     let height = top_pad + content_h + 9.0;
     let (outer, _) = ui.allocate_exact_size(Vec2::new(avail, height + 8.0), Sense::hover());
     let card = Rect::from_min_max(
@@ -5737,32 +5741,48 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
     }
 
     let mut zoom_clicked = false;
-    if let Some(texture) = &thumb {
-        let thumb_rect = Rect::from_min_size(
-            Pos2::new(
-                card.left() + left_pad + number_w + 8.0,
-                card.top() + thumb_top,
-            ),
-            Vec2::splat(32.0),
-        );
-        let thumb_response = ui.interact(thumb_rect, id.with("thumb"), Sense::click());
-        // put() 会把父布局的游标推到缩略图下沿，下一行因此被拽上来压在时间戳上；
-        // paint_at 只画不进布局。
-        egui::Image::new(texture)
-            .fit_to_exact_size(Vec2::splat(32.0))
-            .corner_radius(6)
-            .paint_at(ui, thumb_rect);
-        if thumb_response
-            .on_hover_cursor(CursorIcon::PointingHand)
-            .on_hover_text("查看大图")
-            .clicked()
-        {
-            zoom_clicked = true;
+    let preview_rect = Rect::from_min_size(
+        Pos2::new(
+            card.left() + left_pad + number_w + 10.0,
+            card.top() + top_pad,
+        ),
+        Vec2::new(preview_w, PREVIEW_H),
+    );
+    if preview {
+        if let Some(texture) = &thumb {
+            let size = texture.size_vec2();
+            let scale = (preview_w / size.x).min(PREVIEW_H / size.y);
+            egui::Image::new(texture).corner_radius(10).paint_at(
+                ui,
+                Rect::from_center_size(preview_rect.center(), size * scale),
+            );
+            let preview_response = ui.interact(preview_rect, id.with("thumb"), Sense::click());
+            if preview_response
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text("查看大图")
+                .clicked()
+            {
+                zoom_clicked = true;
+            }
+        } else {
+            painter.rect_filled(
+                preview_rect,
+                CornerRadius::same(10),
+                theme::with_alpha(theme::p().card, 170),
+            );
+            icons::paint(
+                &painter,
+                Rect::from_center_size(preview_rect.center(), Vec2::splat(26.0)),
+                Icon::Attach,
+                theme::p().faint,
+            );
         }
     }
 
-    let text_pos = Pos2::new(card.left() + left_pad + number_w + thumb_gap, text_y);
-    painter.galley(text_pos, galley, theme::p().text);
+    let text_pos = Pos2::new(card.left() + left_pad + number_w + 8.0, text_y);
+    if let Some(galley) = galley {
+        painter.galley(text_pos, galley, theme::p().text);
+    }
 
     let mut meta = relative_time(record.ts, now);
     if !record.sender_name.is_empty() {
@@ -5791,13 +5811,25 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
     if record.moved() {
         meta.push_str(" · 已手动排序");
     }
+    let (meta_pos, meta_w) = if preview {
+        let x = preview_rect.right() + 14.0;
+        (
+            Pos2::new(x, card.top() + top_pad + (PREVIEW_H - 14.0) / 2.0),
+            card.right() - x - 12.0,
+        )
+    } else {
+        (
+            Pos2::new(text_pos.x, text_pos.y + text_h + 5.0),
+            card.right() - text_pos.x - 12.0,
+        )
+    };
     paint_line(
         ui,
-        Pos2::new(text_pos.x, text_pos.y + text_h + 5.0),
+        meta_pos,
         &meta,
         FontId::proportional(11.5),
         theme::p().muted,
-        card.right() - text_pos.x - 12.0,
+        meta_w,
     );
 
     let action_size = 30.0;
@@ -7563,6 +7595,86 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn image_rows_trade_the_name_for_a_taller_preview() {
+        let _pasteboard = app_lock();
+        let ctx = egui::Context::default();
+        super::theme::configure(&ctx);
+        super::theme::apply(&ctx, super::ThemeMode::Dark);
+        super::icons::install(&ctx);
+
+        fn image_record() -> super::Record {
+            super::Record {
+                id: "image".to_string(),
+                kind: super::KIND_FILE.to_string(),
+                ts: 1_730_000_000_000,
+                sender_id: String::new(),
+                sender_name: "test".to_string(),
+                text: "image-1234abcd.png".to_string(),
+                file: Some(super::FileInfo {
+                    name: "image-1234abcd.png".to_string(),
+                    mime: "image/png".to_string(),
+                    size: 4096,
+                    sha256: String::new(),
+                    link: String::new(),
+                    expires_at: 0,
+                    cached: false,
+                    local_path: None,
+                }),
+                pinned: false,
+                order: 0,
+                note: String::new(),
+            }
+        }
+
+        fn text_record() -> super::Record {
+            super::Record {
+                id: "text".to_string(),
+                kind: super::KIND_TEXT.to_string(),
+                ts: 1_730_000_000_000,
+                sender_id: String::new(),
+                sender_name: "test".to_string(),
+                text: "hello".to_string(),
+                file: None,
+                pinned: false,
+                order: 0,
+                note: String::new(),
+            }
+        }
+
+        let measure = |record: &super::Record| {
+            let mut height = 0.0;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let mut events = Vec::new();
+                super::clip_row(
+                    ui,
+                    super::RowView {
+                        record,
+                        position: 1,
+                        cursor: false,
+                        picked: false,
+                        pick_mode: false,
+                        online: true,
+                        can_up: false,
+                        can_down: false,
+                        thumb: None,
+                    },
+                    0,
+                    &mut events,
+                    false,
+                );
+                height = ui.min_rect().height();
+            });
+            output.textures_delta.clear();
+            height
+        };
+
+        let image = measure(&image_record());
+        let text = measure(&text_record());
+        assert!(image >= super::PREVIEW_H, "图片行要留够预览的高度：{image}");
+        assert!(text < super::PREVIEW_H, "文本行不该跟着撑高：{text}");
     }
 
     /// 停止回信只带路径：几百 MB 的录像不该为了写一条列表整段读进 RAM。
