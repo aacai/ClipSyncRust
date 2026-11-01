@@ -590,7 +590,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("note.pdf");
         std::fs::write(&path, b"12345").unwrap();
-        assert_eq!(signature_from_paths(std::slice::from_ref(&path)), "note.pdf:5");
+        assert_eq!(
+            signature_from_paths(std::slice::from_ref(&path)),
+            "note.pdf:5"
+        );
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir(&dir).ok();
     }

@@ -50,8 +50,7 @@ const RECORD_BAR_TOP_GAP: f32 = 8.0;
 const CAPTURE_HIDE_DELAY: Duration = Duration::from_millis(140);
 const MEMORY_SAMPLE: Duration = Duration::from_secs(5);
 const THUMB_MAX_SIDE: u32 = 256;
-/// 同时在库里留着的缩略图张数：一屏十几行，留出滚动余量就够，再多就是白占显存。
-const THUMB_CACHE: usize = 48;
+const THUMB_SCRAP: usize = 16;
 /// 视口上下各多准备这么高的行，快速滚动时不至于先看到空位。
 const THUMB_SCAN: f32 = 640.0;
 const PREVIEW_W: f32 = 220.0;
@@ -67,15 +66,6 @@ const ABOUT_LICENSE: &str = "查看授权";
 const LICENSE_TITLE: &str = "HarmonyOS Sans 字体授权";
 const LICENSE_BACK: &str = "返回";
 const LICENSE_TEXT: &str = include_str!("../assets/LICENSE-HarmonyOS-Sans.txt");
-
-const HELP_STEPS: [&str; 6] = [
-    "打开「房间共享」：顶栏的钥匙图标，或未共享时列表里的「共享」。填一个房间码（可随机换一个），房间密码可选，设了就必须两端一致。",
-    "另一台设备装同一个 App，或直接开网页，填完全一样的房间码和密码，点「进入房间」。",
-    "核对两端顶栏的安全码：逐位相同才说明用的是同一把钥匙。不同就是房间码或密码打错了，这种连得上却永远收不到对方的内容。",
-    "进房后任意一端复制文本，另一端立刻收到；点条目就写回本机剪贴板，文件走工具栏的发送文件。",
-    "网页端例外：浏览器不允许后台读剪贴板，网页上复制完要手动点「发送剪贴板」。",
-    "掉线期间的复制不会补发，两台都显示「已连接」时再传。",
-];
 
 pub struct ClipSyncApp {
     engine: EngineHandle,
@@ -121,7 +111,7 @@ pub struct ClipSyncApp {
     /// 本帧末尾交给系统拖出（访达/资源管理器）。
     pending_drag_out: Option<Vec<PathBuf>>,
     thumbnails: HashMap<String, ThumbEntry>,
-    thumb_tick: u64,
+    thumb_frame: u64,
     zoom: Option<String>,
     zoom_texture: Option<(String, TextureHandle)>,
     zoom_failed: Option<String>,
@@ -258,13 +248,12 @@ struct ThumbEntry {
     path: String,
     texture: Option<TextureHandle>,
     attempted: bool,
-    used: u64,
+    frame: u64,
 }
 
 #[derive(Clone)]
 enum Overlay {
     Share,
-    Help,
     About,
     License,
     Safety,
@@ -476,7 +465,7 @@ impl ClipSyncApp {
             pending_cache: HashMap::new(),
             pending_drag_out: None,
             thumbnails: HashMap::new(),
-            thumb_tick: 0,
+            thumb_frame: 0,
             zoom: None,
             zoom_texture: None,
             zoom_failed: None,
@@ -2662,16 +2651,13 @@ impl ClipSyncApp {
         Some((record.id.clone(), file.local_path.clone()?))
     }
 
-    /// 缩略图按需解码：一次全屏解码就是几十 MB，500 条历史全部预解码能把峰值顶到 200MB。
-    /// 缓存只留最近的 THUMB_CACHE 张，划过去的旧图腾地方。
     fn load_thumb(
         &mut self,
         ctx: &egui::Context,
         id: String,
         path: String,
     ) -> Option<TextureHandle> {
-        self.thumb_tick += 1;
-        let used = self.thumb_tick;
+        let frame = self.thumb_frame;
         let known = self
             .thumbnails
             .get(&id)
@@ -2680,7 +2666,7 @@ impl ClipSyncApp {
         if let Some((attempted, texture)) = known {
             if attempted {
                 if let Some(entry) = self.thumbnails.get_mut(&id) {
-                    entry.used = used;
+                    entry.frame = frame;
                 }
                 return texture;
             }
@@ -2691,28 +2677,34 @@ impl ClipSyncApp {
                     path: path.clone(),
                     texture: None,
                     attempted: false,
-                    used,
+                    frame,
                 },
             );
-        }
-        if self.thumbnails.len() > THUMB_CACHE {
-            let laziest = self
-                .thumbnails
-                .iter()
-                .filter(|(held, _)| *held != &id)
-                .min_by_key(|(_, entry)| entry.used)
-                .map(|(held, _)| held.clone());
-            if let Some(laziest) = laziest {
-                self.thumbnails.remove(&laziest);
-            }
         }
         let texture = load_texture(ctx, &path, THUMB_MAX_SIDE, format!("thumb-{id}"));
         if let Some(entry) = self.thumbnails.get_mut(&id) {
             entry.attempted = true;
-            entry.used = used;
+            entry.frame = frame;
             entry.texture = texture.clone();
         }
         texture
+    }
+
+    fn reclaim_thumbnails(&mut self, frame: u64) {
+        let mut offscreen: Vec<(u64, String)> = self
+            .thumbnails
+            .iter()
+            .filter(|(_, entry)| entry.frame != frame)
+            .map(|(id, entry)| (entry.frame, id.clone()))
+            .collect();
+        if offscreen.len() <= THUMB_SCRAP {
+            return;
+        }
+        offscreen.sort();
+        let drop = offscreen.len() - THUMB_SCRAP;
+        for (_, id) in offscreen.into_iter().take(drop) {
+            self.thumbnails.remove(&id);
+        }
     }
 
     fn open_zoom(&mut self, id: &str) {
@@ -3543,6 +3535,7 @@ impl ClipSyncApp {
                                 let online = matches!(self.status, Status::Online { .. });
                                 ui.spacing_mut().item_spacing.y = 0.0;
                                 let area = ui.clip_rect();
+                                self.thumb_frame += 1;
                                 for (position, index) in visible.iter().enumerate() {
                                     let row_top = ui.cursor().top();
                                     // 视口附近才解码，远处的行等滚过来再补。
@@ -3572,6 +3565,8 @@ impl ClipSyncApp {
                                         self.nav_scroll.as_deref() == Some(record.id.as_str());
                                     clip_row(ui, view, now, &mut events, scroll);
                                 }
+                                let frame = self.thumb_frame;
+                                self.reclaim_thumbnails(frame);
                             }
                             ui.add_space(96.0);
                         });
@@ -3725,9 +3720,6 @@ impl ClipSyncApp {
                 }
                 if icons::icon_button(ui, Icon::Settings, true, "设置").clicked() {
                     self.open_settings();
-                }
-                if icons::icon_button(ui, Icon::Help, true, "使用说明").clicked() {
-                    self.open(Overlay::Help);
                 }
                 if !self.joined
                     && icons::icon_button(ui, Icon::Key, true, "进入或切换房间").clicked()
@@ -4224,7 +4216,6 @@ impl ClipSyncApp {
         let mut action = DialogAction::None;
         let mut close = false;
         let width = match &overlay {
-            Overlay::Help => 470.0,
             Overlay::Detail { .. } => 500.0,
             Overlay::About => 340.0,
             Overlay::Safety => 440.0,
@@ -4302,44 +4293,6 @@ impl ClipSyncApp {
                                     close = true;
                                 }
                             });
-                        });
-                    }
-                    Overlay::Help => {
-                        dialog_header(ui, Icon::Help, "怎么用");
-                        ui.add_space(12.0);
-                        // 对齐 Compose HelpDialog：序号顶对齐、固定列宽，正文 wrap，避免圆点垂直居中把字顶歪。
-                        egui::ScrollArea::vertical()
-                            .max_height(360.0)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.spacing_mut().item_spacing.y = 12.0;
-                                for (index, step) in HELP_STEPS.iter().enumerate() {
-                                    ui.horizontal_top(|ui| {
-                                        ui.add_sized(
-                                            [16.0, 16.0],
-                                            egui::Label::new(
-                                                RichText::new((index + 1).to_string())
-                                                    .monospace()
-                                                    .size(12.0)
-                                                    .color(theme::p().accent),
-                                            ),
-                                        );
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(*step)
-                                                    .size(12.5)
-                                                    .color(theme::p().text),
-                                            )
-                                            .wrap(),
-                                        );
-                                    });
-                                }
-                            });
-                        ui.add_space(12.0);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if secondary_button(ui, "知道了").clicked() {
-                                close = true;
-                            }
                         });
                     }
                     Overlay::About => {
@@ -5604,6 +5557,17 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
     let card_w = (avail - theme::ROW_INSET * 2.0).max(240.0);
     let text_w = (card_w - left_pad - number_w - 8.0 - action_reserve - 10.0).max(150.0);
     let preview_w = (card_w - left_pad - number_w - 10.0 - 140.0).clamp(96.0, PREVIEW_W);
+    let preview_size = if preview {
+        thumb
+            .as_ref()
+            .map_or(Vec2::new(preview_w, PREVIEW_H), |texture| {
+                let size = texture.size_vec2();
+                let scale = (preview_w / size.x).min(PREVIEW_H / size.y);
+                size * scale
+            })
+    } else {
+        Vec2::ZERO
+    };
 
     let empty = !is_file && record.text.is_empty();
     let galley = (!preview).then(|| {
@@ -5643,7 +5607,7 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
         .as_ref()
         .map_or(10.0, |galley| first_line_center(galley));
     let (top_pad, content_h) = if preview {
-        (9.0, PREVIEW_H)
+        (9.0, preview_size.y)
     } else {
         (10.0, text_h + 21.0)
     };
@@ -5660,7 +5624,11 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
     // click_and_drag：点按仍激活；拖动手势开始则拖出到访达。
     let card_response = ui.interact(card, id.with("card"), Sense::click_and_drag());
     let text_y = card.top() + top_pad;
-    let line_y = text_y + line_center;
+    let line_y = if preview {
+        card.top() + top_pad + content_h / 2.0
+    } else {
+        text_y + line_center
+    };
     if scroll_to {
         ui.scroll_to_rect(card, Some(Align::Center));
     }
@@ -5746,16 +5714,13 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
             card.left() + left_pad + number_w + 10.0,
             card.top() + top_pad,
         ),
-        Vec2::new(preview_w, PREVIEW_H),
+        preview_size,
     );
     if preview {
         if let Some(texture) = &thumb {
-            let size = texture.size_vec2();
-            let scale = (preview_w / size.x).min(PREVIEW_H / size.y);
-            egui::Image::new(texture).corner_radius(10).paint_at(
-                ui,
-                Rect::from_center_size(preview_rect.center(), size * scale),
-            );
+            egui::Image::new(texture)
+                .corner_radius(10)
+                .paint_at(ui, preview_rect);
             let preview_response = ui.interact(preview_rect, id.with("thumb"), Sense::click());
             if preview_response
                 .on_hover_cursor(CursorIcon::PointingHand)
@@ -5814,7 +5779,7 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
     let (meta_pos, meta_w) = if preview {
         let x = preview_rect.right() + 14.0;
         (
-            Pos2::new(x, card.top() + top_pad + (PREVIEW_H - 14.0) / 2.0),
+            Pos2::new(x, preview_rect.center().y - 7.0),
             card.right() - x - 12.0,
         )
     } else {
@@ -7565,7 +7530,6 @@ mod tests {
             loaded < 70,
             "只解码视口附近的行，不该把 70 张全部解码（实际 {loaded}）"
         );
-        assert!(loaded <= super::THUMB_CACHE, "缓存越过了上限 {loaded}");
         assert!(!app.thumbnails.contains_key("id69"), "屏幕外的旧行不该解码");
 
         // 位置留给缩略图的槽位由记录决定，纹理晚一帧也不会让行高跳动。
@@ -7577,7 +7541,6 @@ mod tests {
             .count();
         assert_eq!(with_file, 70, "每条都该给缩略图留位置");
 
-        // 挨张点名：缓存只留最近用的 THUMB_CACHE 张，最早的要给新行腾地方。
         let keys: Vec<(String, String)> = app
             .history
             .items
@@ -7586,13 +7549,21 @@ mod tests {
             .collect();
         assert_eq!(keys.len(), 70);
         for (id, path) in &keys {
+            app.thumb_frame += 1;
             app.load_thumb(&ctx, id.clone(), path.clone());
+            let frame = app.thumb_frame;
+            app.reclaim_thumbnails(frame);
         }
-        assert_eq!(app.thumbnails.len(), super::THUMB_CACHE);
-        for (index, _) in keys.iter().take(70 - super::THUMB_CACHE) {
+        assert_eq!(
+            app.thumbnails.len(),
+            super::THUMB_SCRAP + 1,
+            "滚过去的行只该留回收池那么大"
+        );
+        for index in 0..(70 - super::THUMB_SCRAP - 1) {
             let id = format!("id{index}");
             assert!(!app.thumbnails.contains_key(&id), "{id} 早该被踢掉");
         }
+        assert!(app.thumbnails.contains_key("id69"), "当前看的行该留着");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7644,7 +7615,7 @@ mod tests {
             }
         }
 
-        let measure = |record: &super::Record| {
+        let measure = |record: &super::Record, thumb: Option<egui::TextureHandle>| {
             let mut height = 0.0;
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
                 let mut events = Vec::new();
@@ -7659,7 +7630,7 @@ mod tests {
                         online: true,
                         can_up: false,
                         can_down: false,
-                        thumb: None,
+                        thumb: thumb.clone(),
                     },
                     0,
                     &mut events,
@@ -7671,10 +7642,26 @@ mod tests {
             height
         };
 
-        let image = measure(&image_record());
-        let text = measure(&text_record());
+        let image = measure(&image_record(), None);
+        let text = measure(&text_record(), None);
         assert!(image >= super::PREVIEW_H, "图片行要留够预览的高度：{image}");
         assert!(text < super::PREVIEW_H, "文本行不该跟着撑高：{text}");
+
+        let swatch = |width: usize, height: usize| {
+            egui::ColorImage::new([width, height], vec![egui::Color32::WHITE; width * height])
+        };
+        let wide = ctx.load_texture("wide", swatch(256, 64), egui::TextureOptions::NEAREST);
+        let portrait = ctx.load_texture("portrait", swatch(64, 256), egui::TextureOptions::NEAREST);
+        let wide_row = measure(&image_record(), Some(wide));
+        let portrait_row = measure(&image_record(), Some(portrait));
+        assert!(
+            wide_row < image,
+            "横图按宽高比收高度，别再占满一整格：{wide_row} vs {image}"
+        );
+        assert!(
+            (portrait_row - image).abs() < 0.5,
+            "竖图封顶在预览高度：{portrait_row} vs {image}"
+        );
     }
 
     /// 停止回信只带路径：几百 MB 的录像不该为了写一条列表整段读进 RAM。
