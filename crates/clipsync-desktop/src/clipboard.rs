@@ -11,6 +11,16 @@ use clipsync_core::files::MAX_FILE_BYTES;
 
 pub const POLL_INTERVAL: Duration = Duration::from_millis(800);
 
+#[cfg(test)]
+pub(crate) static PASTEBOARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn pasteboard_lock() -> std::sync::MutexGuard<'static, ()> {
+    PASTEBOARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 const WRITE_ATTEMPTS: usize = 6;
 const WRITE_RETRY: Duration = Duration::from_millis(25);
 
@@ -549,6 +559,7 @@ mod tests {
     #[test]
     fn writing_text_reports_true_only_when_the_pasteboard_has_it() {
         use super::ClipboardWatcher;
+        let _pasteboard = super::pasteboard_lock();
         let mut watcher = ClipboardWatcher::new();
         let Some(clipboard) = watcher.clipboard.as_mut() else {
             return;
@@ -614,6 +625,7 @@ mod tests {
     fn a_png_only_pasteboard_is_captured() {
         use super::{Captured, ClipboardWatcher};
 
+        let _pasteboard = super::pasteboard_lock();
         let png = test_png(4, 3, image::Rgba([12, 34, 56, 255]));
         let mut watcher = ClipboardWatcher::new();
         put_png_on_pasteboard(&png);
@@ -631,6 +643,7 @@ mod tests {
     fn copying_the_same_image_again_is_not_announced_again() {
         use super::{Captured, ClipboardWatcher};
 
+        let _pasteboard = super::pasteboard_lock();
         let png = test_png(2, 2, image::Rgba([1, 2, 3, 255]));
         let mut watcher = ClipboardWatcher::new();
         put_png_on_pasteboard(&png);
@@ -650,6 +663,7 @@ mod tests {
     fn copying_out_then_copying_the_same_image_again_stays_quiet() {
         use super::ClipboardWatcher;
 
+        let _pasteboard = super::pasteboard_lock();
         let png = test_png(2, 2, image::Rgba([7, 8, 9, 255]));
         let mut watcher = ClipboardWatcher::new();
         watcher.write_image(&png).expect("write image");
@@ -667,6 +681,7 @@ mod tests {
         use super::ClipboardWatcher;
         use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeTIFF};
 
+        let _pasteboard = super::pasteboard_lock();
         let png = test_png(3, 2, image::Rgba([9, 200, 60, 255]));
         let mut watcher = ClipboardWatcher::new();
         watcher.write_image(&png).expect("write image");

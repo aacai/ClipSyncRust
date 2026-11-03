@@ -7372,17 +7372,7 @@ mod tests {
         human_left, random_room_code, relative_time, sanitize_room, selection_payload, status_line,
         Status,
     };
-    use std::sync::Mutex;
-
-    /// `ClipSyncApp::new` 抓一次真剪贴板，而 NSPasteboard 的类型缓存不容两个线程同时动：
-    /// 并发构造直接 SIGSEGV 在 `objc_msgSend`。真程序只有一条 UI 线程，所以只有测试需要这把锁。
-    static PASTEBOARD: Mutex<()> = Mutex::new(());
-
-    fn app_lock() -> std::sync::MutexGuard<'static, ()> {
-        PASTEBOARD
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+    use crate::clipboard::pasteboard_lock;
 
     #[test]
     fn relative_time_speaks_chinese() {
@@ -7535,7 +7525,7 @@ mod tests {
     fn list_viewport_clips_at_the_glass_header_top() {
         use clipsync_core::{engine, mqtt::BrokerLinks};
 
-        let _pasteboard = app_lock();
+        let _pasteboard = pasteboard_lock();
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -7633,7 +7623,7 @@ mod tests {
     fn thumbnails_only_load_the_rows_near_the_viewport() {
         use clipsync_core::{engine, mqtt::BrokerLinks};
 
-        let _pasteboard = app_lock();
+        let _pasteboard = pasteboard_lock();
 
         fn png() -> Vec<u8> {
             let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
@@ -7753,7 +7743,7 @@ mod tests {
 
     #[test]
     fn image_rows_trade_the_name_for_a_taller_preview() {
-        let _pasteboard = app_lock();
+        let _pasteboard = pasteboard_lock();
         let ctx = egui::Context::default();
         super::theme::configure(&ctx);
         super::theme::apply(&ctx, super::ThemeMode::Dark);
@@ -7859,7 +7849,7 @@ mod tests {
             out
         }
 
-        let _pasteboard = app_lock();
+        let _pasteboard = pasteboard_lock();
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -7950,7 +7940,7 @@ mod tests {
     fn a_failed_download_frees_the_row_for_another_try() {
         use clipsync_core::{engine, mqtt::BrokerLinks};
 
-        let _pasteboard = app_lock();
+        let _pasteboard = pasteboard_lock();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -8012,7 +8002,7 @@ mod tests {
     fn an_incoming_file_is_offered_for_paste_when_the_switch_is_on() {
         use clipsync_core::{engine, mqtt::BrokerLinks};
 
-        let _pasteboard = app_lock();
+        let _pasteboard = pasteboard_lock();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -8087,7 +8077,7 @@ mod tests {
     fn a_duplicate_file_announcement_uses_the_existing_row() {
         use clipsync_core::{engine, mqtt::BrokerLinks};
 
-        let _pasteboard = app_lock();
+        let _pasteboard = pasteboard_lock();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -8175,7 +8165,7 @@ mod tests {
     fn an_incoming_file_kicks_off_its_own_download() {
         use clipsync_core::{engine, mqtt::BrokerLinks};
 
-        let _pasteboard = app_lock();
+        let _pasteboard = pasteboard_lock();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -8212,7 +8202,7 @@ mod tests {
     fn a_file_already_on_disk_is_pasted_straight_from_the_cache() {
         use clipsync_core::{engine, mqtt::BrokerLinks};
 
-        let _pasteboard = app_lock();
+        let _pasteboard = pasteboard_lock();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -8265,7 +8255,7 @@ mod tests {
     fn a_stale_cache_entry_downloads_the_file_again() {
         use clipsync_core::{engine, mqtt::BrokerLinks};
 
-        let _pasteboard = app_lock();
+        let _pasteboard = pasteboard_lock();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -8312,7 +8302,7 @@ mod tests {
     fn one_save_click_during_the_auto_download_lands_in_downloads() {
         use clipsync_core::{engine, mqtt::BrokerLinks};
 
-        let _pasteboard = app_lock();
+        let _pasteboard = pasteboard_lock();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
