@@ -13,7 +13,9 @@ use eframe::egui::{
 };
 
 use clipsync_core::engine::{Clip, Config, EngineHandle, Event, FileUpload, Peer, Status};
-use clipsync_core::files::{human_size, is_image, sanitize_file_name, MAX_FILE_BYTES};
+use clipsync_core::files::{
+    human_size, is_image, mime_for_name, sanitize_file_name, MAX_FILE_BYTES,
+};
 use clipsync_core::protocol::{clip_topic, room_hash};
 use clipsync_core::RoomCrypto;
 
@@ -24,7 +26,8 @@ use crate::jobs::{
     UploadTarget,
 };
 use crate::settings::{
-    normalize_nickname, Language, Preferences, Settings, ThemeMode, RETENTION_CHOICES,
+    normalize_nickname, Language, Preferences, Settings, ThemeMode, MAX_BACKGROUND_DIM,
+    RETENTION_CHOICES,
 };
 use crate::store::{FileInfo, History, Record, KIND_FILE, KIND_TEXT};
 use crate::text_tools::{self, TextOp};
@@ -56,6 +59,8 @@ const THUMB_SCAN: f32 = 640.0;
 const PREVIEW_W: f32 = 220.0;
 const PREVIEW_H: f32 = 140.0;
 const ZOOM_MAX_SIDE: u32 = 2048;
+const BACKGROUND_ID: &str = "background";
+const BACKGROUND_REJECTED: &str = "那张图读不出来，换一张试试";
 const REPO_URL: &str = "https://github.com/aacai/ClipSyncRust";
 const REPO_LABEL: &str = "github.com/aacai/ClipSyncRust";
 const APP_NAME: &str = "ClipSync";
@@ -94,6 +99,7 @@ pub struct ClipSyncApp {
     screen: Screen,
     theme_mode: ThemeMode,
     language: Language,
+    background_sync: Option<(String, f32)>,
     focus_dialog: bool,
     focus_search: bool,
     toast: Option<Toast>,
@@ -196,10 +202,13 @@ enum SettingsChoice {
     RecordMicDevice,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq)]
 enum SettingsAction {
     Theme,
     Language,
+    Background,
+    ClearBackground,
+    BackgroundDim(f32),
     Retention,
     Hotkey,
     Nickname,
@@ -449,6 +458,7 @@ impl ClipSyncApp {
             screen: Screen::Main,
             theme_mode,
             language,
+            background_sync: None,
             focus_dialog: false,
             focus_search: false,
             toast: None,
@@ -1949,6 +1959,28 @@ impl ClipSyncApp {
                                 ) {
                                     action = Some(SettingsAction::Language);
                                 }
+                                let has_background = self.preferences.background_path().is_some();
+                                let dim = self.preferences.background_dim();
+                                settings_divider(ui);
+                                if settings_nav_row(
+                                    ui,
+                                    "背景图",
+                                    if has_background { "已选择" } else { "未设置" },
+                                ) {
+                                    action = Some(SettingsAction::Background);
+                                }
+                                if has_background {
+                                    settings_divider(ui);
+                                    if let Some(next) =
+                                        settings_slider_row(ui, "压暗", dim, MAX_BACKGROUND_DIM)
+                                    {
+                                        action = Some(SettingsAction::BackgroundDim(next));
+                                    }
+                                    settings_divider(ui);
+                                    if settings_action_row(ui, "移除背景图") {
+                                        action = Some(SettingsAction::ClearBackground);
+                                    }
+                                }
                             });
                             ui.add_space(14.0);
 
@@ -2290,6 +2322,18 @@ impl ClipSyncApp {
         match action {
             SettingsAction::Theme => self.open(Overlay::Choice(SettingsChoice::Theme)),
             SettingsAction::Language => self.open(Overlay::Choice(SettingsChoice::Language)),
+            SettingsAction::Background => {
+                self.pick_background();
+                ctx.request_repaint();
+            }
+            SettingsAction::ClearBackground => {
+                self.clear_background();
+                ctx.request_repaint();
+            }
+            SettingsAction::BackgroundDim(dim) => {
+                self.preferences.set_background_dim(dim);
+                ctx.request_repaint();
+            }
             SettingsAction::Retention => self.open(Overlay::Choice(SettingsChoice::Retention)),
             SettingsAction::Hotkey => self.open(Overlay::Hotkey {
                 record: false,
@@ -2507,6 +2551,72 @@ impl ClipSyncApp {
             return;
         };
         self.ingest_paths(paths);
+    }
+
+    fn pick_background(&mut self) {
+        let Some(picked) = rfd::FileDialog::new().pick_file() else {
+            return;
+        };
+        let name = picked
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !is_image(mime_for_name(&name)) {
+            self.notify_error("只能选图片当背景");
+            return;
+        }
+        let size = std::fs::metadata(&picked)
+            .map(|meta| meta.len() as i64)
+            .unwrap_or(0);
+        if size <= 0 || size > MAX_FILE_BYTES {
+            self.notify_error("图片太大，换一张小点的");
+            return;
+        }
+        let Ok(bytes) = std::fs::read(&picked) else {
+            self.notify_error(BACKGROUND_REJECTED);
+            return;
+        };
+        let Ok(stored) = paths::write_cache(BACKGROUND_ID, &name, &bytes) else {
+            self.notify_error(BACKGROUND_REJECTED);
+            return;
+        };
+        let previous = self.preferences.background_path().map(str::to_string);
+        self.preferences.set_background(Some(stored));
+        if let Some(previous) = previous {
+            paths::delete_cache(Some(&previous));
+        }
+        self.notify("背景图已换好");
+    }
+
+    fn clear_background(&mut self) {
+        let previous = self.preferences.background_path().map(str::to_string);
+        self.preferences.set_background(None);
+        if let Some(previous) = previous {
+            paths::delete_cache(Some(&previous));
+        }
+    }
+
+    fn sync_background(&mut self) {
+        let key = self
+            .preferences
+            .background_path()
+            .unwrap_or_default()
+            .to_string();
+        let dim = self.preferences.background_dim();
+        if self
+            .background_sync
+            .as_ref()
+            .is_some_and(|(loaded, loaded_dim)| *loaded == key && *loaded_dim == dim)
+        {
+            return;
+        }
+        let image = if key.is_empty() {
+            None
+        } else {
+            load_color_image(&key, theme::BACKGROUND_MAX_SIDE)
+        };
+        self.background_sync = Some((key, dim));
+        theme::set_background(dim, image);
     }
 
     /// 选择器与窗口拖入共用：未进房明确报错；目录跳过；普通文件走现有上传。
@@ -3025,6 +3135,7 @@ impl ClipSyncApp {
             .items
             .iter()
             .find(|record| record.id == id)
+            .filter(|record| record.is_text())
             .map(|record| record.text.clone())
         else {
             return;
@@ -3489,6 +3600,7 @@ impl ClipSyncApp {
     fn draw(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         self.shortcuts(&ctx);
+        self.sync_background();
         theme::paint_background(&ctx, ctx.content_rect());
         self.paint_window_chrome(ui);
         if self.screen == Screen::Settings {
@@ -5121,7 +5233,7 @@ impl ClipSyncApp {
                                 });
                             ui.add_space(14.0);
                             ui.horizontal(|ui| {
-                                if secondary_button(ui, "复制").clicked() {
+                                if record.copyable() && secondary_button(ui, "复制").clicked() {
                                     action = DialogAction::CopyRecord(id.clone());
                                 }
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -5544,9 +5656,10 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
     let number_w = 26.0;
     let file = record.file.as_ref();
     let is_file = record.kind == KIND_FILE && file.is_some();
+    let is_text = record.is_text();
     let preview = is_file && file.is_some_and(|file| is_image(&file.mime));
     let cached = file.is_some_and(|file| file.cached && file.local_path.is_some());
-    let copyable = !is_file || cached || file.is_some_and(|file| is_image(&file.mime));
+    let copyable = record.copyable();
     let quick_actions = if is_file {
         3.0 + if copyable { 1.0 } else { 0.0 }
     } else {
@@ -5841,16 +5954,16 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
         .frame(menu_frame())
         .show(|ui| {
             ui.set_width(216.0);
-            if menu_item(ui, Icon::Edit, "编辑内容", !is_file, false) {
+            if is_text && menu_item(ui, Icon::Edit, "编辑内容", true, false) {
                 menu_choice = Some(MenuAction::Edit);
             }
             if menu_item(ui, Icon::Note, "写备注", true, false) {
                 menu_choice = Some(MenuAction::Note);
             }
-            if menu_item(ui, Icon::Edit, "文本处理", !is_file, false) {
+            if is_text && menu_item(ui, Icon::Edit, "文本处理", true, false) {
                 menu_choice = Some(MenuAction::Transform);
             }
-            if menu_item(ui, Icon::Translate, "中英互译", !is_file, false) {
+            if is_text && menu_item(ui, Icon::Translate, "中英互译", true, false) {
                 menu_choice = Some(MenuAction::Translate);
             }
             if menu_item(ui, Icon::Duplicate, "生成副本", true, false) {
@@ -6931,6 +7044,68 @@ fn settings_switch_row(ui: &mut Ui, title: &str, summary: &str, checked: bool) -
     response.clicked()
 }
 
+fn settings_slider_row(ui: &mut Ui, title: &str, value: f32, max: f32) -> Option<f32> {
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), SETTINGS_ROW_HEIGHT),
+        Sense::hover(),
+    );
+    let center = rect.center().y;
+    let title_line = row_line(
+        ui,
+        title,
+        FontId::proportional(15.0),
+        theme::p().text,
+        120.0,
+    );
+    paint_line_at(
+        ui,
+        rect.left() + SETTINGS_PAD,
+        baseline_at(&title_line, center),
+        title_line,
+    );
+    let rail = Rect::from_min_max(
+        Pos2::new(rect.left() + SETTINGS_PAD + 96.0, center - 2.0),
+        Pos2::new(rect.right() - SETTINGS_PAD - 52.0, center + 2.0),
+    );
+    let ratio = if max > 0.0 {
+        (value / max).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let knob = Pos2::new(rail.left() + rail.width() * ratio, center);
+    ui.painter().rect_filled(rail, 2.0, theme::p().switch_off);
+    ui.painter()
+        .rect_filled(Rect::from_min_max(rail.min, knob), 2.0, theme::p().accent);
+    ui.painter()
+        .circle_filled(knob, 7.0, theme::p().accent_text);
+    let percent = row_line(
+        ui,
+        &format!("{}%", (ratio * 100.0).round() as i32),
+        FontId::proportional(12.0),
+        theme::p().muted,
+        46.0,
+    );
+    paint_line_at(
+        ui,
+        rail.right() + 8.0,
+        baseline_at(&percent, center),
+        percent,
+    );
+    let response = ui.interact(
+        rail.expand(10.0),
+        Id::unique(("settings-slider", title)),
+        Sense::click_and_drag(),
+    );
+    if response.hovered() {
+        ui.output_mut(|o| o.cursor_icon = CursorIcon::PointingHand);
+    }
+    if !(response.dragged() || response.clicked()) {
+        return None;
+    }
+    let point = response.interact_pointer_pos()?;
+    Some(((point.x - rail.left()) / rail.width().max(1.0)).clamp(0.0, 1.0) * max)
+}
+
 fn settings_update_row(ui: &mut Ui, state: &UpdateState) -> Option<SettingsAction> {
     let (rect, _) = settings_row(ui, SETTINGS_ROW_HEIGHT, false);
     let center = rect.center().y;
@@ -7143,18 +7318,26 @@ fn selection_payload(items: &[Record], picked: &BTreeSet<String>) -> Option<Stri
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
+fn load_color_image(path: &str, max_side: u32) -> Option<Arc<egui::ColorImage>> {
+    let bytes = std::fs::read(path).ok()?;
+    let image = image::load_from_memory(&bytes)
+        .ok()?
+        .thumbnail(max_side, max_side);
+    let rgba = image.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    Some(Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+        size,
+        rgba.as_raw(),
+    )))
+}
+
 fn load_texture(
     ctx: &egui::Context,
     path: &str,
     max_side: u32,
     name: String,
 ) -> Option<TextureHandle> {
-    let bytes = std::fs::read(path).ok()?;
-    let image = image::load_from_memory(&bytes).ok()?;
-    let image = image.thumbnail(max_side, max_side);
-    let rgba = image.to_rgba8();
-    let size = [rgba.width() as usize, rgba.height() as usize];
-    let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+    let color = load_color_image(path, max_side)?;
     Some(ctx.load_texture(name, color, TextureOptions::LINEAR))
 }
 

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use clipsync_core::engine::Clip;
+use clipsync_core::files::is_image;
 
 pub const MAX_ITEMS: usize = 500;
 pub const MAX_UNDO: usize = 20;
@@ -93,6 +94,17 @@ impl Record {
 
     pub fn moved(&self) -> bool {
         self.order != 0 && self.order != self.ts
+    }
+
+    pub fn is_text(&self) -> bool {
+        self.kind != KIND_FILE
+    }
+
+    pub fn copyable(&self) -> bool {
+        let Some(file) = self.file.as_ref() else {
+            return self.is_text();
+        };
+        self.is_text() || file.local_path.is_some() || is_image(&file.mime)
     }
 }
 
@@ -659,6 +671,37 @@ mod tests {
         let mut history = History::open(path.clone());
         history.path = path;
         history
+    }
+
+    #[test]
+    fn only_text_records_are_offered_text_actions() {
+        assert!(record("a", "text").is_text());
+
+        let image = file_record("i", "a.png", "aa", 1);
+        assert!(!image.is_text());
+
+        let mut document = file_record("d", "a.pdf", "bb", 2);
+        document.file.as_mut().unwrap().mime = "application/pdf".to_string();
+        assert!(!document.is_text());
+    }
+
+    #[test]
+    fn only_records_with_something_to_put_on_the_clipboard_are_copyable() {
+        assert!(record("a", "text").copyable());
+
+        let pending = file_record("i", "a.png", "aa", 1);
+        assert!(pending.copyable(), "图片可以边下载边复制");
+
+        let mut document = file_record("d", "a.pdf", "bb", 2);
+        document.file.as_mut().unwrap().mime = "application/pdf".to_string();
+        assert!(!document.copyable(), "没下下来的文件复制不了");
+
+        document.file.as_mut().unwrap().local_path = Some("/tmp/a.pdf".to_string());
+        assert!(document.copyable());
+
+        let mut ghost = record("g", "orphan");
+        ghost.kind = super::KIND_FILE.to_string();
+        assert!(!ghost.copyable(), "条目里没有文件信息就没有可复制的东西");
     }
 
     #[test]

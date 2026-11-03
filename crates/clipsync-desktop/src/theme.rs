@@ -341,9 +341,89 @@ pub fn paint_background(ctx: &egui::Context, rect: Rect) {
     let palette = p();
     let painter = ctx.layer_painter(egui::LayerId::background());
     painter.rect_filled(rect, 0.0, palette.bg);
+    let current = background();
+    if let Some(state) = current.as_deref() {
+        let texture = ctx.load_texture_cached(
+            "clipsync-background",
+            Id::unique("clip-background"),
+            Arc::clone(&state.image),
+            egui::TextureOptions::LINEAR,
+        );
+        painter.image(
+            texture.id(),
+            rect,
+            cover_uv(rect, state.image.size),
+            Color32::WHITE,
+        );
+        if state.dim > 0.0 {
+            painter.rect_filled(rect, 0.0, Color32::from_black_alpha(dim_alpha(state.dim)));
+        }
+        return;
+    }
     for (center, radius, color) in aura_blobs(&palette) {
         paint_soft_ball(&painter, center, radius, color, palette.dark);
     }
+}
+
+/// 用户挑的背景图。铺法是 cover：短边铺满，长边多出来的部分居中裁掉。
+struct Background {
+    dim: f32,
+    image: Arc<egui::ColorImage>,
+}
+
+static BACKGROUND: Mutex<Option<Arc<Background>>> = Mutex::new(None);
+
+pub const BACKGROUND_MAX_SIDE: u32 = 1024;
+
+pub fn set_background(dim: f32, image: Option<Arc<egui::ColorImage>>) {
+    let state = image.map(|image| Arc::new(Background { dim, image }));
+    *BACKGROUND
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = state.clone();
+    *FROST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+fn background() -> Option<Arc<Background>> {
+    BACKGROUND
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn cover_uv(rect: Rect, size: [usize; 2]) -> Rect {
+    let image = egui::vec2(size[0].max(1) as f32, size[1].max(1) as f32);
+    let scale = (rect.width() / image.x)
+        .max(rect.height() / image.y)
+        .max(f32::EPSILON);
+    let visible = (rect.size() / scale).min(image);
+    Rect::from_min_size(((image - visible) * 0.5 / image).to_pos2(), visible / image)
+}
+
+fn dim_alpha(dim: f32) -> u8 {
+    (dim.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+fn sample_at(at: Pos2, content: Rect, state: Option<&Background>) -> Option<Color32> {
+    let state = state?;
+    let size = state.image.size;
+    if size[0] == 0 || size[1] == 0 || !content.is_positive() {
+        return None;
+    }
+    let uv = cover_uv(content, size);
+    let ratio = (at - content.min) / content.size();
+    let column = ((uv.min.x + ratio.x * uv.width()).clamp(0.0, 1.0) * size[0] as f32)
+        .min(size[0] as f32 - 1.0) as usize;
+    let row = ((uv.min.y + ratio.y * uv.height()).clamp(0.0, 1.0) * size[1] as f32)
+        .min(size[1] as f32 - 1.0) as usize;
+    let pixel = state.image.pixels[row * size[0] + column];
+    let fade = 1.0 - state.dim;
+    Some(Color32::from_rgb(
+        (pixel.r() as f32 * fade) as u8,
+        (pixel.g() as f32 * fade) as u8,
+        (pixel.b() as f32 * fade) as u8,
+    ))
 }
 
 fn aura_blobs(palette: &Palette) -> [(Pos2, f32, Color32); 3] {
@@ -502,6 +582,8 @@ fn frost_image(content: Rect, texel: f32, dark: bool) -> Arc<egui::ColorImage> {
 
 fn bake_frost(content: Rect, texel: f32, dark: bool) -> Arc<egui::ColorImage> {
     let palette = palette(dark);
+    let background = background();
+    let backdrop = background.as_deref();
     let size = [
         (content.width() / texel).ceil().max(1.0) as usize,
         (content.height() / texel).ceil().max(1.0) as usize,
@@ -513,7 +595,9 @@ fn bake_frost(content: Rect, texel: f32, dark: bool) -> Arc<egui::ColorImage> {
                 content.left() + (column as f32 + 0.5) * texel,
                 content.top() + (row as f32 + 0.5) * texel,
             );
-            field.extend_from_slice(&backdrop_color(at, &palette).to_array().map(f32::from));
+            let color =
+                sample_at(at, content, backdrop).unwrap_or_else(|| backdrop_color(at, &palette));
+            field.extend_from_slice(&color.to_array().map(f32::from));
         }
     }
     let radius = (FROST_BLUR / texel).round().max(1.0) as usize;
@@ -754,6 +838,77 @@ mod tests {
             assert!(
                 at(column) >= at(column - 1) - 0.001,
                 "the slope must be monotonic at {column}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_photo_crops_to_cover_and_darkens_its_frost() {
+        let content = Rect::from_min_size(Pos2::new(10.0, 20.0), egui::vec2(400.0, 100.0));
+        let red = Color32::from_rgb(200, 100, 50);
+        let wide = Arc::new(egui::ColorImage::new([8, 1], vec![red; 8]));
+        let uv = cover_uv(content, wide.size);
+        assert_eq!(uv.height(), 1.0, "a too-wide photo keeps its full height");
+        assert_eq!(uv.width(), 0.5, "the sides it cannot show are cropped away");
+        assert_eq!(uv.min.x, 0.25, "the crop is centred");
+
+        let halves = Arc::new(egui::ColorImage::new(
+            [4, 1],
+            vec![
+                Color32::from_rgb(200, 0, 0),
+                Color32::from_rgb(200, 0, 0),
+                Color32::from_rgb(0, 0, 200),
+                Color32::from_rgb(0, 0, 200),
+            ],
+        ));
+        let state = Background {
+            dim: 0.5,
+            image: Arc::clone(&halves),
+        };
+        assert_eq!(
+            sample_at(content.left_center(), content, Some(&state)),
+            Some(Color32::from_rgb(100, 0, 0))
+        );
+        let at = |ratio_x: f32| {
+            sample_at(
+                Pos2::new(
+                    content.left() + content.width() * ratio_x,
+                    content.center().y,
+                ),
+                content,
+                Some(&state),
+            )
+        };
+        assert_eq!(at(0.45), Some(Color32::from_rgb(100, 0, 0)));
+        assert_eq!(
+            at(0.55),
+            Some(Color32::from_rgb(0, 0, 100)),
+            "the dimmed photo must reach the frost, not the gradient"
+        );
+        assert_eq!(at(1.0), Some(Color32::from_rgb(0, 0, 100)));
+        assert_eq!(
+            sample_at(content.center(), content, None),
+            None,
+            "no photo means the gradient bakes"
+        );
+    }
+
+    #[test]
+    fn a_photo_tints_the_frost_instead_of_the_gradient() {
+        let content = Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 100.0));
+        let photo = Arc::new(egui::ColorImage::new(
+            [4, 2],
+            vec![Color32::from_rgb(200, 100, 50); 8],
+        ));
+        set_background(0.5, Some(photo));
+        let baked = bake_frost(content, FROST_TEXEL, true);
+        set_background(0.0, None);
+        assert_eq!(baked.size, [50, 25], "one texel per 4 points");
+        for pixel in &baked.pixels {
+            assert_eq!(
+                *pixel,
+                Color32::from_rgb(100, 50, 25),
+                "the glass must frost the dimmed photo"
             );
         }
     }

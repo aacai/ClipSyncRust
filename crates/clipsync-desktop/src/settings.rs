@@ -12,6 +12,8 @@ const AAD: &[u8] = b"clipsync.settings";
 const MAX_NICKNAME: usize = 24;
 pub const RETENTION_CHOICES: [u32; 4] = [7, 30, 90, 365];
 const DEFAULT_RETENTION_DAYS: u32 = 30;
+pub const MAX_BACKGROUND_DIM: f32 = 0.9;
+const DEFAULT_BACKGROUND_DIM: f32 = 0.45;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThemeMode {
@@ -51,6 +53,14 @@ pub fn normalize_nickname(raw: &str) -> String {
         .collect()
 }
 
+fn dim_of(raw: f32) -> f32 {
+    if raw.is_finite() {
+        raw.clamp(0.0, MAX_BACKGROUND_DIM)
+    } else {
+        DEFAULT_BACKGROUND_DIM
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct StoredPreferences {
@@ -83,6 +93,8 @@ struct StoredPreferences {
     record_long_edge: i32,
     record_fps: u32,
     last_room_code: Option<String>,
+    background: Option<String>,
+    background_dim: f32,
 }
 
 fn de_theme<'de, D>(deserializer: D) -> Result<ThemeMode, D::Error>
@@ -134,6 +146,8 @@ impl Default for StoredPreferences {
             record_long_edge: 0,
             record_fps: 30,
             last_room_code: None,
+            background: None,
+            background_dim: DEFAULT_BACKGROUND_DIM,
         }
     }
 }
@@ -249,6 +263,29 @@ impl Preferences {
             .last_room_code
             .as_deref()
             .filter(|code| !code.is_empty())
+    }
+
+    pub fn background_path(&self) -> Option<&str> {
+        self.stored
+            .background
+            .as_deref()
+            .filter(|path| !path.is_empty())
+    }
+
+    pub fn background_dim(&self) -> f32 {
+        dim_of(self.stored.background_dim)
+    }
+
+    pub fn set_background(&mut self, path: Option<String>) {
+        self.stored.background = path
+            .map(|path| path.trim().to_string())
+            .filter(|path| !path.is_empty());
+        self.save();
+    }
+
+    pub fn set_background_dim(&mut self, dim: f32) {
+        self.stored.background_dim = dim_of(dim);
+        self.save();
     }
 
     pub fn edit(&mut self, change: impl FnOnce(&mut Preferences)) {
@@ -576,6 +613,8 @@ mod tests {
         assert_eq!(loaded.screenshot_hotkey(), "Alt+A");
         assert_eq!(loaded.nickname(), "");
         assert_eq!(loaded.last_room_code(), None);
+        assert_eq!(loaded.background_path(), None);
+        assert_eq!(loaded.background_dim(), 0.45);
         cleanup(&path);
     }
 
@@ -659,5 +698,55 @@ mod tests {
             "abcdefghijklmnopqrstuvwx"
         );
         assert_eq!(super::normalize_nickname("   "), "");
+    }
+
+    #[test]
+    fn a_picked_background_survives_a_restart() {
+        let path = prefs("background");
+        cleanup(&path);
+        {
+            let mut loaded = super::Preferences::open(path.clone());
+            loaded.set_background(Some("/tmp/wall.png".to_string()));
+            loaded.set_background_dim(0.7);
+            assert_eq!(loaded.background_dim(), 0.7);
+            loaded.set_background_dim(5.0);
+            assert_eq!(loaded.background_dim(), super::MAX_BACKGROUND_DIM);
+            loaded.set_background_dim(-1.0);
+            assert_eq!(loaded.background_dim(), 0.0);
+        }
+        let loaded = super::Preferences::open(path.clone());
+        assert_eq!(loaded.background_path(), Some("/tmp/wall.png"));
+        assert_eq!(loaded.background_dim(), 0.0);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn clearing_the_background_forgets_the_path() {
+        let path = prefs("background-clear");
+        cleanup(&path);
+        let mut loaded = super::Preferences::open(path.clone());
+        loaded.set_background(Some("/tmp/wall.png".to_string()));
+        loaded.set_background(Some("   ".to_string()));
+        assert_eq!(loaded.background_path(), None);
+        loaded.set_background(Some("/tmp/wall.png".to_string()));
+        loaded.set_background(None);
+        assert_eq!(loaded.background_path(), None);
+        drop(loaded);
+        assert_eq!(
+            super::Preferences::open(path.clone()).background_path(),
+            None
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_stored_dim_out_of_band_is_clamped_on_read() {
+        let path = prefs("background-stored");
+        cleanup(&path);
+        std::fs::write(&path, r#"{"background":"","background_dim":5}"#).unwrap();
+        let loaded = super::Preferences::open(path.clone());
+        assert_eq!(loaded.background_path(), None);
+        assert_eq!(loaded.background_dim(), super::MAX_BACKGROUND_DIM);
+        cleanup(&path);
     }
 }
