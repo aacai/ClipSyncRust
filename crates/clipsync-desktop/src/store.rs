@@ -414,6 +414,16 @@ impl History {
         self.remove(&ids)
     }
 
+    pub fn remove_since(&mut self, after: i64) -> usize {
+        let ids: Vec<String> = self
+            .items
+            .iter()
+            .filter(|item| !item.pinned && item.ts >= after)
+            .map(|item| item.id.clone())
+            .collect();
+        self.remove(&ids)
+    }
+
     pub fn remove_expired(&mut self, before: i64) -> usize {
         let doomed: Vec<String> = self
             .items

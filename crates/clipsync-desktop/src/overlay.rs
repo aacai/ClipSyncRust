@@ -59,11 +59,12 @@ const SHOT_BAR_WIDTH: f32 = SHOT_BAR_PAD * 2.0
     + SHOT_GAP * 12.0;
 
 /// 录屏工具条：选择格式、画质、系统声音、麦克风，然后开始/退出。
+const RECORD_AUDIO: bool = record::AUDIO_SUPPORTED;
 const RECORD_BAR_HEIGHT: f32 = 54.0;
 const RECORD_BAR_PAD: f32 = 12.0;
 const RECORD_BAR_GAP: f32 = 8.0;
 const RECORD_BUTTON_HEIGHT: f32 = 34.0;
-const RECORD_BAR_WIDTH: f32 = 657.0;
+const RECORD_BAR_WIDTH: f32 = if RECORD_AUDIO { 657.0 } else { 399.0 };
 const RECORD_MENU_GAP: f32 = 6.0;
 const MENU_ITEM_HEIGHT: f32 = 34.0;
 const MENU_QUALITY_ITEM: f32 = 46.0;
@@ -820,11 +821,11 @@ impl Session {
             self.menu = (self.menu != Some(MenuKind::Quality)).then_some(MenuKind::Quality);
             return;
         }
-        if layout.system.contains(position) {
+        if RECORD_AUDIO && layout.system.contains(position) {
             self.menu = (self.menu != Some(MenuKind::System)).then_some(MenuKind::System);
             return;
         }
-        if layout.mic.contains(position) {
+        if RECORD_AUDIO && layout.mic.contains(position) {
             // 每次打开都重新枚举：用户可能刚插上耳机。
             self.devices = record::inputs();
             self.menu = (self.menu != Some(MenuKind::Mic)).then_some(MenuKind::Mic);
@@ -1143,18 +1144,20 @@ impl Session {
             Color32::WHITE,
         );
         for divider in [layout.divider1, layout.divider2, layout.divider3] {
-            ui.painter().rect_filled(
-                Self::to_surface(divider, surface, logical),
-                0.0,
-                Color32::from_white_alpha(50),
-            );
+            if divider.is_positive() {
+                ui.painter().rect_filled(
+                    Self::to_surface(divider, surface, logical),
+                    0.0,
+                    Color32::from_white_alpha(50),
+                );
+            }
         }
-        for (rect, value) in [
-            (
-                layout.quality,
-                format!("{} ▾", self.options.quality.label()),
-            ),
-            (
+        let mut entries = vec![(
+            layout.quality,
+            format!("{} ▾", self.options.quality.label()),
+        )];
+        if RECORD_AUDIO {
+            entries.push((
                 layout.system,
                 format!(
                     "{} ▾",
@@ -1168,15 +1171,16 @@ impl Session {
                         layout.system.width() - 20.0,
                     )
                 ),
-            ),
-            (
+            ));
+            entries.push((
                 layout.mic,
                 format!(
                     "{} ▾",
                     fit_label(ui, &self.mic_label(), layout.mic.width() - 20.0)
                 ),
-            ),
-        ] {
+            ));
+        }
+        for (rect, value) in entries {
             if hover.is_some_and(|p| rect.contains(p)) {
                 ui.painter().rect_filled(
                     Self::to_surface(rect, surface, logical),
@@ -1585,20 +1589,26 @@ fn record_bar_layout(bar: Rect) -> RecordBarLayout {
         Vec2::new(76.0, RECORD_BUTTON_HEIGHT),
     );
     x += 76.0;
-    let divider2 = Rect::from_min_size(Pos2::new(x + 6.0, mid - 11.0), Vec2::new(1.0, 22.0));
-    x += 13.0;
-    let system = Rect::from_min_size(
-        Pos2::new(x, button_top),
-        Vec2::new(112.0, RECORD_BUTTON_HEIGHT),
-    );
-    x += 112.0;
-    let divider3 = Rect::from_min_size(Pos2::new(x + 6.0, mid - 11.0), Vec2::new(1.0, 22.0));
-    x += 13.0;
-    let mic = Rect::from_min_size(
-        Pos2::new(x, button_top),
-        Vec2::new(120.0, RECORD_BUTTON_HEIGHT),
-    );
-    x += 120.0 + RECORD_BAR_GAP;
+    let mut divider2 = Rect::ZERO;
+    let mut system = Rect::ZERO;
+    let mut divider3 = Rect::ZERO;
+    let mut mic = Rect::ZERO;
+    if RECORD_AUDIO {
+        divider2 = Rect::from_min_size(Pos2::new(x + 6.0, mid - 11.0), Vec2::new(1.0, 22.0));
+        x += 13.0;
+        system = Rect::from_min_size(
+            Pos2::new(x, button_top),
+            Vec2::new(112.0, RECORD_BUTTON_HEIGHT),
+        );
+        x += 112.0;
+        divider3 = Rect::from_min_size(Pos2::new(x + 6.0, mid - 11.0), Vec2::new(1.0, 22.0));
+        x += 13.0;
+        mic = Rect::from_min_size(
+            Pos2::new(x, button_top),
+            Vec2::new(120.0, RECORD_BUTTON_HEIGHT),
+        );
+        x += 120.0 + RECORD_BAR_GAP;
+    }
     let start = Rect::from_min_size(
         Pos2::new(x, button_top),
         Vec2::new(84.0, RECORD_BUTTON_HEIGHT),

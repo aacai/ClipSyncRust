@@ -107,7 +107,7 @@ fn local_window_rect(bounds: &[f64], origin: Pos2, screen: Rect) -> Option<Rect>
     (visible.width() >= 40.0 && visible.height() >= 40.0).then_some(visible)
 }
 
-fn primary_monitor() -> Result<xcap::Monitor, String> {
+pub(crate) fn primary_monitor() -> Result<xcap::Monitor, String> {
     let monitors = xcap::Monitor::all().map_err(|error| error.to_string())?;
     let index = monitors
         .iter()
@@ -354,6 +354,16 @@ pub fn request_access() -> bool {
     }
     unsafe { CGRequestScreenCaptureAccess() }
 }
+
+#[cfg(target_os = "macos")]
+pub fn open_permission_settings() {
+    let _ = std::process::Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+        .spawn();
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn open_permission_settings() {}
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]

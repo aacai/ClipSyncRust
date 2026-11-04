@@ -359,6 +359,13 @@ enum MenuAction {
     Delete,
 }
 
+enum ToolAction {
+    Screenshot,
+    Record,
+    DeleteRecent { window_ms: i64, label: &'static str },
+    ClearAll,
+}
+
 enum AppEvent {
     Activate(String),
     TogglePick(String),
@@ -1261,8 +1268,9 @@ impl ClipSyncApp {
             return;
         }
         if !screenshot::request_access() {
+            screenshot::open_permission_settings();
             self.notify_error(
-                "缺少屏幕录制权限：系统设置 → 隐私与安全性 → 屏幕与系统音频录制，勾上 ClipSyncRust；勾完要退出重开一次才生效",
+                "缺少屏幕录制权限，已打开系统设置：勾上 ClipSyncRust 后要退出重开一次才生效",
             );
             return;
         }
@@ -1419,8 +1427,9 @@ impl ClipSyncApp {
             return;
         }
         if !screenshot::request_access() {
+            screenshot::open_permission_settings();
             self.notify_error(
-                "缺少屏幕录制权限：系统设置 → 隐私与安全性 → 屏幕与系统音频录制，勾上 ClipSyncRust；勾完要退出重开一次才生效",
+                "缺少屏幕录制权限，已打开系统设置：勾上 ClipSyncRust 后要退出重开一次才生效",
             );
             return;
         }
@@ -1987,8 +1996,9 @@ impl ClipSyncApp {
                             // 录屏/截屏放最前面：窗口不高，放到底下要滚很久，用户会以为没有这些设置。
                             let record_hotkey = self.preferences.record_hotkey().to_string();
                             let region = self.preferences.record_region();
-                            let mic = self.preferences.record_mic();
-                            let system_audio = self.preferences.record_system_audio();
+                            let mic = record::AUDIO_SUPPORTED && self.preferences.record_mic();
+                            let system_audio =
+                                record::AUDIO_SUPPORTED && self.preferences.record_system_audio();
                             let long_edge = self.preferences.record_long_edge();
                             let fps = self.preferences.record_fps();
                             let mic_device = self.record_mic_label();
@@ -2024,32 +2034,35 @@ impl ClipSyncApp {
                                     action = Some(SettingsAction::RecordFps);
                                 }
                                 settings_divider(ui);
-                                if settings_switch_row(
-                                    ui,
-                                    "录麦克风",
-                                    "说话声混进录像。关掉就只有画面和系统声（若系统声也开着）",
-                                    mic,
-                                ) {
-                                    action = Some(SettingsAction::RecordMic(!mic));
-                                }
-                                if mic {
-                                    settings_divider(ui);
-                                    if settings_nav_row(ui, "麦克风设备", &mic_device) {
-                                        action = Some(SettingsAction::RecordMicDevice);
-                                    }
-                                    settings_footnote(
+                                if record::AUDIO_SUPPORTED {
+                                    if settings_switch_row(
                                         ui,
-                                        "用哪个输入设备。选「系统默认」就跟着系统当前输入走",
-                                    );
-                                }
-                                settings_divider(ui);
-                                if settings_switch_row(
-                                    ui,
-                                    "录系统声音",
-                                    "电脑正在播放的声音。和麦克风可以同时开",
-                                    system_audio,
-                                ) {
-                                    action = Some(SettingsAction::RecordSystem(!system_audio));
+                                        "录麦克风",
+                                        "说话声混进录像。关掉就只有画面和系统声（若系统声也开着）",
+                                        mic,
+                                    ) {
+                                        action = Some(SettingsAction::RecordMic(!mic));
+                                    }
+                                    if mic {
+                                        settings_divider(ui);
+                                        if settings_nav_row(ui, "麦克风设备", &mic_device) {
+                                            action = Some(SettingsAction::RecordMicDevice);
+                                        }
+                                        settings_footnote(
+                                            ui,
+                                            "用哪个输入设备。选「系统默认」就跟着系统当前输入走",
+                                        );
+                                    }
+                                    settings_divider(ui);
+                                    if settings_switch_row(
+                                        ui,
+                                        "录系统声音",
+                                        "电脑正在播放的声音。和麦克风可以同时开",
+                                        system_audio,
+                                    ) {
+                                        action =
+                                            Some(SettingsAction::RecordSystem(!system_audio));
+                                    }
                                 }
                             });
                             ui.add_space(14.0);
@@ -2874,6 +2887,16 @@ impl ClipSyncApp {
         self.notify_undo(format!("已删除 {count} 条"));
     }
 
+    fn delete_recent(&mut self, window_ms: i64, label: &str) {
+        let count = self.history.remove_since(now_millis() - window_ms);
+        if count == 0 {
+            return;
+        }
+        self.picked.clear();
+        self.cursor = None;
+        self.notify_undo(format!("已删除最近 {label} 的 {count} 条"));
+    }
+
     fn toggle_pick_mode(&mut self) {
         if self.pick_mode {
             self.pick_mode = false;
@@ -3512,6 +3535,7 @@ impl ClipSyncApp {
             || !self.pending_downloads.is_empty()
             || update_busy
             || drop_hover
+            || !self.window_visible
         {
             Duration::from_millis(120)
         } else {
@@ -3954,6 +3978,67 @@ impl ClipSyncApp {
                 .clicked()
             {
                 self.ask_delete();
+            }
+            let tools = icons::icon_button(ui, Icon::More, true, "工具");
+            let mut tool: Option<ToolAction> = None;
+            egui::Popup::menu(&tools)
+                .width(210.0)
+                .frame(menu_frame())
+                .show(|ui| {
+                    ui.set_width(210.0);
+                    if menu_item(ui, Icon::Edit, "立即截屏", true, false) {
+                        tool = Some(ToolAction::Screenshot);
+                    }
+                    let recording = self.record_phase == RecordPhase::Recording;
+                    let busy = matches!(
+                        self.record_phase,
+                        RecordPhase::Preparing | RecordPhase::Stopping
+                    );
+                    let record_label = if recording {
+                        "停止录屏"
+                    } else {
+                        "开始录屏"
+                    };
+                    if menu_item(ui, Icon::Plus, record_label, !busy, false) {
+                        tool = Some(ToolAction::Record);
+                    }
+                    menu_separator(ui);
+                    if menu_item(ui, Icon::Trash, "删除最近 1 小时", can_delete, false) {
+                        tool = Some(ToolAction::DeleteRecent {
+                            window_ms: 3_600_000,
+                            label: "1 小时",
+                        });
+                    }
+                    if menu_item(ui, Icon::Trash, "删除最近 1 天", can_delete, false) {
+                        tool = Some(ToolAction::DeleteRecent {
+                            window_ms: 86_400_000,
+                            label: "1 天",
+                        });
+                    }
+                    if menu_item(ui, Icon::Trash, "删除最近 7 天", can_delete, false) {
+                        tool = Some(ToolAction::DeleteRecent {
+                            window_ms: 604_800_000,
+                            label: "7 天",
+                        });
+                    }
+                    if menu_item(ui, Icon::Trash, "删除全部记录", can_delete, true) {
+                        tool = Some(ToolAction::ClearAll);
+                    }
+                });
+            if let Some(action) = tool {
+                let ctx = ui.ctx().clone();
+                match action {
+                    ToolAction::Screenshot => self.start_capture(&ctx),
+                    ToolAction::Record => self.toggle_recording(&ctx),
+                    ToolAction::DeleteRecent { window_ms, label } => {
+                        self.delete_recent(window_ms, label)
+                    }
+                    ToolAction::ClearAll => {
+                        if !self.history.items.is_empty() {
+                            self.open(Overlay::ClearAll);
+                        }
+                    }
+                }
             }
             // 条数跟着当前搜索走：搜着的是命中数，清空搜索就是全部。
             let total = self.visible_count();
@@ -7295,8 +7380,8 @@ fn now_millis() -> i64 {
 fn record_options(preferences: &Preferences) -> overlay::RecordOptions {
     overlay::RecordOptions {
         quality: overlay::RecordQuality::of(preferences.record_long_edge()),
-        system_audio: preferences.record_system_audio(),
-        mic: preferences.record_mic(),
+        system_audio: record::AUDIO_SUPPORTED && preferences.record_system_audio(),
+        mic: record::AUDIO_SUPPORTED && preferences.record_mic(),
         mic_device: preferences.record_mic_device().to_string(),
     }
 }

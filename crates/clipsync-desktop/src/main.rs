@@ -13,6 +13,8 @@ mod overlay;
 mod paths;
 mod preview;
 mod record;
+#[cfg(not(target_os = "macos"))]
+mod record_portable;
 mod screenshot;
 mod settings;
 mod startup;

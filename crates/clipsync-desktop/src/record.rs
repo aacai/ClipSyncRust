@@ -1,4 +1,4 @@
-//! macOS 录屏：链接 `native/record.m` 里的 ScreenCaptureKit。其它平台直接拒绝。
+//! 录屏。macOS 走 `native/record.m` 里的 ScreenCaptureKit，其它平台走 `record_portable`。
 
 use std::ffi::{CStr, CString};
 use std::io::{Read, Seek, SeekFrom};
@@ -32,6 +32,8 @@ pub struct MicInput {
     pub id: String,
     pub name: String,
 }
+
+pub const AUDIO_SUPPORTED: bool = cfg!(target_os = "macos");
 
 /// 开录参数：坐标是主屏左上角为原点的点，`w`/`h` 小于等于 1 时录整个主屏。
 #[derive(Clone, Debug)]
@@ -186,19 +188,16 @@ pub fn start(
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (
+        let _ = (mic, system_audio, mic_device);
+        crate::record_portable::start(crate::record_portable::PortableSpec {
             x,
             y,
             w,
             h,
-            mic,
-            system_audio,
             fps,
             long_edge,
-            mic_device,
-            path,
-        );
-        Err("这个平台不能录屏".to_string())
+            path: path.to_path_buf(),
+        })
     }
 }
 
@@ -248,7 +247,7 @@ pub fn stop() -> Result<(), String> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Ok(())
+        crate::record_portable::stop()
     }
 }
 
