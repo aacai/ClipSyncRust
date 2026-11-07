@@ -19,7 +19,7 @@ pub struct Tray {
 }
 
 impl Tray {
-    pub fn try_install() -> Option<Self> {
+    pub fn try_install(ctx: egui::Context) -> Option<Self> {
         // 直接用应用 logo：自己画的剪贴板底板和装完看到的图标不是同一个东西。
         // macOS 也不当模板图用——logo 是实心的，交给系统只会糊成一块方斑。
         let data = icons::tray_icon();
@@ -44,8 +44,8 @@ impl Tray {
             .ok()?;
 
         let (cmd_tx, cmd_rx) = mpsc::channel();
-        spawn_menu_pump(cmd_tx.clone(), show_id, quit_id);
-        spawn_click_pump(cmd_tx);
+        spawn_menu_pump(cmd_tx.clone(), show_id, quit_id, ctx.clone());
+        spawn_click_pump(cmd_tx, ctx);
 
         Some(Self {
             _icon: tray,
@@ -62,6 +62,7 @@ fn spawn_menu_pump(
     tx: Sender<TrayCmd>,
     show_id: tray_icon::menu::MenuId,
     quit_id: tray_icon::menu::MenuId,
+    ctx: egui::Context,
 ) {
     thread::Builder::new()
         .name("clipsync-tray-menu".into())
@@ -72,12 +73,13 @@ fn spawn_menu_pump(
                 } else if event.id == quit_id {
                     let _ = tx.send(TrayCmd::Quit);
                 }
+                ctx.request_repaint();
             }
         })
         .ok();
 }
 
-fn spawn_click_pump(tx: Sender<TrayCmd>) {
+fn spawn_click_pump(tx: Sender<TrayCmd>, ctx: egui::Context) {
     thread::Builder::new()
         .name("clipsync-tray-click".into())
         .spawn(move || {
@@ -90,6 +92,7 @@ fn spawn_click_pump(tx: Sender<TrayCmd>) {
                 {
                     let _ = tx.send(TrayCmd::Show);
                 }
+                ctx.request_repaint();
             }
         })
         .ok();

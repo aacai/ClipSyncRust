@@ -11,7 +11,7 @@
     {
       "label": "desktop: run",
       "type": "shell",
-      "command": "cargo build -p clipsync-desktop && bash scripts/install-tmp-app.sh",
+      "command": "cargo build -p clipsync-desktop && bash scripts/install-app.sh",
       "group": "none",
       "presentation": {
         "reveal": "always",
@@ -24,7 +24,7 @@
     {
       "label": "desktop: build",
       "type": "shell",
-      "command": "cargo build -p clipsync-desktop && bash scripts/install-tmp-app.sh",
+      "command": "cargo build -p clipsync-desktop && bash scripts/install-app.sh",
       "group": {
         "kind": "build",
         "isDefault": true

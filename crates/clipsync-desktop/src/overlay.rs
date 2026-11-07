@@ -1549,6 +1549,19 @@ pub fn set_main_window_hidden(hidden: bool) {
 #[cfg(not(target_os = "macos"))]
 pub fn set_main_window_hidden(_hidden: bool) {}
 
+/// 把应用拉到前台。窗口是自己藏起来的，不激活的话，抬起来也不会盖到别的窗口上面。
+#[cfg(target_os = "macos")]
+pub fn activate_app() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    app.activate();
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn activate_app() {}
+
 /// 录屏工具条固定在屏幕顶部居中，菜单栏下面，避免点击被系统吃掉。
 fn record_bar_at(frame: Rect, top_inset: f32) -> Rect {
     let x = ((frame.width() - RECORD_BAR_WIDTH) / 2.0).max(0.0);

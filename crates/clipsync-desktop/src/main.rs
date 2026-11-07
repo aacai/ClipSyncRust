@@ -81,7 +81,7 @@ fn main() -> eframe::Result {
             let dark = configure_shell(&ctx.egui_ctx, preferences.theme());
             // Windows 那条原生标题条得跟着主题色走，放在主题定下来之后。
             win_caption::tint(dark);
-            let tray = tray::Tray::try_install();
+            let tray = tray::Tray::try_install(ctx.egui_ctx.clone());
             let app = ClipSyncApp::new(
                 engine,
                 history,

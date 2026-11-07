@@ -268,7 +268,8 @@ enum Overlay {
     Safety,
     /// 同屋设备列表（顶栏设备按钮）；与安全码对话框分开。
     Devices,
-    ClearAll,
+    /// 垃圾桶按钮打开的框：按时间范围挑要删哪些。
+    DeleteHistory,
     LeaveRoom,
     Choice(SettingsChoice),
     Nickname {
@@ -317,7 +318,8 @@ enum DialogAction {
     Open(Overlay),
     Join,
     Leave,
-    ClearAll,
+    DeleteAll,
+    DeleteRecent { window_ms: i64, label: &'static str },
     NewEntry(String),
     SaveEdit(String, String),
     SaveNote(String, String),
@@ -362,8 +364,6 @@ enum MenuAction {
 enum ToolAction {
     Screenshot,
     Record,
-    DeleteRecent { window_ms: i64, label: &'static str },
-    ClearAll,
 }
 
 enum AppEvent {
@@ -567,6 +567,7 @@ impl ClipSyncApp {
 
     fn reveal_window(&mut self, ctx: &egui::Context) {
         self.window_visible = true;
+        crate::overlay::activate_app();
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
         ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
@@ -2894,7 +2895,7 @@ impl ClipSyncApp {
         }
         self.picked.clear();
         self.cursor = None;
-        self.notify_undo(format!("已删除最近 {label} 的 {count} 条"));
+        self.notify_undo(format!("已删除{label} 的 {count} 条"));
     }
 
     fn toggle_pick_mode(&mut self) {
@@ -3053,7 +3054,7 @@ impl ClipSyncApp {
         if self.pick_mode {
             self.delete_selection();
         } else if !self.history.items.is_empty() {
-            self.open(Overlay::ClearAll);
+            self.open(Overlay::DeleteHistory);
         }
     }
 
@@ -3550,6 +3551,7 @@ impl ClipSyncApp {
             && self.overlay.is_none()
             && self.shot.is_none()
             && !self.shot_visible
+            && !crate::drag_out::drag_active()
     }
 
     fn file_drop_hovering(&self, ctx: &egui::Context) -> bool {
@@ -4002,42 +4004,12 @@ impl ClipSyncApp {
                     if menu_item(ui, Icon::Plus, record_label, !busy, false) {
                         tool = Some(ToolAction::Record);
                     }
-                    menu_separator(ui);
-                    if menu_item(ui, Icon::Trash, "删除最近 1 小时", can_delete, false) {
-                        tool = Some(ToolAction::DeleteRecent {
-                            window_ms: 3_600_000,
-                            label: "1 小时",
-                        });
-                    }
-                    if menu_item(ui, Icon::Trash, "删除最近 1 天", can_delete, false) {
-                        tool = Some(ToolAction::DeleteRecent {
-                            window_ms: 86_400_000,
-                            label: "1 天",
-                        });
-                    }
-                    if menu_item(ui, Icon::Trash, "删除最近 7 天", can_delete, false) {
-                        tool = Some(ToolAction::DeleteRecent {
-                            window_ms: 604_800_000,
-                            label: "7 天",
-                        });
-                    }
-                    if menu_item(ui, Icon::Trash, "删除全部记录", can_delete, true) {
-                        tool = Some(ToolAction::ClearAll);
-                    }
                 });
             if let Some(action) = tool {
                 let ctx = ui.ctx().clone();
                 match action {
                     ToolAction::Screenshot => self.start_capture(&ctx),
                     ToolAction::Record => self.toggle_recording(&ctx),
-                    ToolAction::DeleteRecent { window_ms, label } => {
-                        self.delete_recent(window_ms, label)
-                    }
-                    ToolAction::ClearAll => {
-                        if !self.history.items.is_empty() {
-                            self.open(Overlay::ClearAll);
-                        }
-                    }
                 }
             }
             // 条数跟着当前搜索走：搜着的是命中数，清空搜索就是全部。
@@ -4657,8 +4629,8 @@ impl ClipSyncApp {
                             }
                         });
                     }
-                    Overlay::ClearAll => {
-                        dialog_header(ui, Icon::Trash, "清空全部历史？");
+                    Overlay::DeleteHistory => {
+                        dialog_header(ui, Icon::Trash, "删除历史记录");
                         ui.add_space(12.0);
                         ui.label(
                             RichText::new(
@@ -4667,12 +4639,54 @@ impl ClipSyncApp {
                             .size(12.5)
                             .color(theme::p().muted),
                         );
+                        ui.add_space(14.0);
+                        let now = now_millis();
+                        let ranges: [(&'static str, Option<i64>); 4] = [
+                            ("最近 1 小时", Some(3_600_000)),
+                            ("最近 1 天", Some(86_400_000)),
+                            ("最近 7 天", Some(604_800_000)),
+                            ("全部记录", None),
+                        ];
+                        for (label, window_ms) in ranges {
+                            let count = match window_ms {
+                                Some(ms) => self.history.count_since(now - ms),
+                                None => self.history.items.len(),
+                            };
+                            let (rect, response) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 36.0),
+                                Sense::click(),
+                            );
+                            if response.hovered() {
+                                ui.painter()
+                                    .rect_filled(rect, CornerRadius::same(8), theme::p().hover);
+                            }
+                            ui.painter().text(
+                                Pos2::new(rect.left() + 14.0, rect.center().y),
+                                Align2::LEFT_CENTER,
+                                &format!("删除{label}"),
+                                FontId::proportional(13.5),
+                                theme::p().text,
+                            );
+                            ui.painter().text(
+                                Pos2::new(rect.right() - 14.0, rect.center().y),
+                                Align2::RIGHT_CENTER,
+                                &format!("{count} 条"),
+                                FontId::proportional(12.0),
+                                theme::p().muted,
+                            );
+                            if response.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                action = match window_ms {
+                                    Some(ms) => DialogAction::DeleteRecent {
+                                        window_ms: ms,
+                                        label,
+                                    },
+                                    None => DialogAction::DeleteAll,
+                                };
+                            }
+                        }
                         ui.add_space(18.0);
                         ui.horizontal(|ui| {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if danger_button(ui, "清空").clicked() {
-                                    action = DialogAction::ClearAll;
-                                }
                                 if secondary_button(ui, "取消").clicked() {
                                     close = true;
                                 }
@@ -5494,8 +5508,12 @@ impl ClipSyncApp {
                 self.leave();
                 keep = false;
             }
-            DialogAction::ClearAll => {
+            DialogAction::DeleteAll => {
                 self.clear_all();
+                keep = false;
+            }
+            DialogAction::DeleteRecent { window_ms, label } => {
+                self.delete_recent(window_ms, label);
                 keep = false;
             }
             DialogAction::NewEntry(text) => {
@@ -5834,23 +5852,20 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
     let painter = ui.painter().clone();
     let hovered = card_response.contains_pointer();
     let revealed = hovered || cursor;
-    // 对齐 Compose ClipRow：选中/光标用 primary(accent) 透明叠色；浅色空闲行用实心 surface。
     let accent = theme::p().accent;
     let fill = if picked {
         theme::with_alpha(accent, 41)
     } else if cursor {
         theme::with_alpha(accent, 20)
-    } else if theme::p().dark {
-        theme::with_alpha(theme::p().card, 128)
     } else {
-        theme::p().surface
+        theme::glass_fill()
     };
     let border = if picked {
         theme::with_alpha(accent, 140)
     } else if cursor {
         theme::with_alpha(accent, 82)
     } else {
-        theme::with_alpha(theme::p().border, 115)
+        theme::p().glass_border
     };
     painter.rect(
         card,
