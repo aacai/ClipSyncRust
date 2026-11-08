@@ -80,6 +80,7 @@ pub fn prepare_paths(records: &[&Record]) -> Vec<PathBuf> {
     paths
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn is_raster_image(path: &Path) -> bool {
     matches!(
         path.extension()
@@ -90,6 +91,7 @@ fn is_raster_image(path: &Path) -> bool {
     )
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn preview_image(path: &Path) -> drag::Image {
     if is_raster_image(path) {
         if let Ok(bytes) = std::fs::read(path) {
@@ -99,6 +101,7 @@ fn preview_image(path: &Path) -> drag::Image {
     drag::Image::Raw(generic_file_preview())
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn generic_file_preview() -> Vec<u8> {
     use image::{DynamicImage, Rgba, RgbaImage};
     let s = 64u32;
