@@ -110,8 +110,14 @@
                                 DiskId='1'
                                 Source='$(var.CargoTargetBinDir)\clipsync-desktop.exe'
                                 KeyPath='yes'/>
+                        </Component>
+                        <Component Id='crtVcruntime140' Guid='*'>
                             <File Id='vcruntime140' Name='vcruntime140.dll' DiskId='1' Source='$(var.CargoTargetBinDir)\vcruntime140.dll'/>
+                        </Component>
+                        <Component Id='crtVcruntime140_1' Guid='*'>
                             <File Id='vcruntime140_1' Name='vcruntime140_1.dll' DiskId='1' Source='$(var.CargoTargetBinDir)\vcruntime140_1.dll'/>
+                        </Component>
+                        <Component Id='crtMsvcp140' Guid='*'>
                             <File Id='msvcp140' Name='msvcp140.dll' DiskId='1' Source='$(var.CargoTargetBinDir)\msvcp140.dll'/>
                         </Component>
                     </Directory>
@@ -189,6 +195,9 @@
             <ComponentRef Id='License'/>
             
             <ComponentRef Id='binary0'/>
+            <ComponentRef Id='crtVcruntime140'/>
+            <ComponentRef Id='crtVcruntime140_1'/>
+            <ComponentRef Id='crtMsvcp140'/>
             <ComponentRef Id='ApplicationShortcut'/>
             <ComponentRef Id='DesktopShortcut'/>
         </Feature>
