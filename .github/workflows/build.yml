@@ -191,8 +191,9 @@ jobs:
         run: |
           $dst = "target\x86_64-pc-windows-msvc\release"
           foreach ($d in @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")) {
-            $p = Join-Path $env:SystemRoot $d
+            $p = Join-Path $env:SystemRoot "System32\$d"
             if (Test-Path $p) { Copy-Item $p $dst -Force; Write-Host "copied $d" }
+            else { Write-Host "missing $d" }
           }
 
       - name: Install cargo-wix
