@@ -110,6 +110,9 @@
                                 DiskId='1'
                                 Source='$(var.CargoTargetBinDir)\clipsync-desktop.exe'
                                 KeyPath='yes'/>
+                            <File Id='vcruntime140' Name='vcruntime140.dll' DiskId='1' Source='$(var.CargoTargetBinDir)\vcruntime140.dll'/>
+                            <File Id='vcruntime140_1' Name='vcruntime140_1.dll' DiskId='1' Source='$(var.CargoTargetBinDir)\vcruntime140_1.dll'/>
+                            <File Id='msvcp140' Name='msvcp140.dll' DiskId='1' Source='$(var.CargoTargetBinDir)\msvcp140.dll'/>
                         </Component>
                     </Directory>
                 </Directory>

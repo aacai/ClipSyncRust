@@ -186,6 +186,15 @@ jobs:
       - name: Build
         run: cargo build --release --target x86_64-pc-windows-msvc -p clipsync-desktop
 
+      - name: Copy VC++ CRT DLLs for app-local deploy
+        shell: pwsh
+        run: |
+          $dst = "target\x86_64-pc-windows-msvc\release"
+          foreach ($d in @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")) {
+            $p = Join-Path $env:SystemRoot $d
+            if (Test-Path $p) { Copy-Item $p $dst -Force; Write-Host "copied $d" }
+          }
+
       - name: Install cargo-wix
         run: cargo install cargo-wix --locked
 
@@ -226,7 +235,10 @@ jobs:
           # 所以要进目录再压，否则解压出来是一长串 target/x86_64-.../release/。
           mkdir -p portable
           cp "target/x86_64-pc-windows-msvc/release/$BIN.exe" "portable/$APP_NAME.exe"
-          (cd portable && 7z a -tzip "../$APP_NAME-$VER-x64.zip" "$APP_NAME.exe")
+          for d in vcruntime140.dll vcruntime140_1.dll msvcp140.dll; do
+            cp "target/x86_64-pc-windows-msvc/release/$d" "portable/" 2>/dev/null || true
+          done
+          (cd portable && 7z a -tzip "../$APP_NAME-$VER-x64.zip" .)
           rm -rf portable
           ls -lh "$APP_NAME-$VER"-*
 
