@@ -6,6 +6,7 @@ mod app_menu;
 mod autostart;
 mod clipboard;
 mod drag_out;
+mod gpu;
 mod icons;
 mod jobs;
 mod meminfo;
@@ -41,8 +42,15 @@ use store::History;
 const SINGLE_INSTANCE_PORT: u16 = 48124;
 
 fn main() -> eframe::Result {
+    gpu::disable_error_dialogs();
+    if gpu::guard() {
+        return Ok(());
+    }
     startup::begin();
     startup::install_panic_hook();
+    if gpu::using_fallback() {
+        startup::note("渲染进程曾因 Vulkan 驱动崩溃退出，本次使用 DX12");
+    }
 
     let listener = match TcpListener::bind(("127.0.0.1", SINGLE_INSTANCE_PORT)) {
         Ok(listener) => Some(listener),
@@ -96,8 +104,12 @@ fn main() -> eframe::Result {
         }),
     );
     if let Err(error) = &result {
+        if gpu::can_retry() {
+            startup::note(&format!("窗口创建失败，尝试切换 DX12：{error}"));
+            std::process::exit(gpu::RENDER_FAILED);
+        }
         startup::fail(&format!(
-            "窗口创建失败：{error}\n多半是显卡驱动或 OpenGL 不可用"
+            "窗口创建失败 / Failed to create window：{error}\n请升级显卡驱动 / Update the graphics driver"
         ));
     }
     result

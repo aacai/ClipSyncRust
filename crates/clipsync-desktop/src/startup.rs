@@ -58,7 +58,7 @@ fn append(message: &str) {
 
 fn show(message: &str) {
     let text = format!(
-        "ClipSyncRust 启动失败\n\n{}\n\n日志：{}",
+        "ClipSyncRust 启动失败 / Startup failed\n\n{}\n\n日志 / Log：{}",
         short(message),
         log().display()
     );
