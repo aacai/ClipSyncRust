@@ -360,9 +360,26 @@ pub fn paint_background(ctx: &egui::Context, rect: Rect) {
         }
         return;
     }
-    for (center, radius, color) in aura_blobs(&palette) {
-        paint_soft_ball(&painter, center, radius, color, palette.dark);
+    // 光晕改成缓存纹理：鼠标每动 egui 都会整窗重绘，每帧现场拼 soft-ball Mesh
+    // 会让近透明玻璃列表整窗闪。尺寸/主题没变就复用上一张。
+    if !rect.is_finite() || rect.area() <= 0.0 {
+        return;
     }
+    let limit = ctx.input(|input| input.max_texture_side);
+    let texel = frost_texel(rect, limit);
+    let image = aura_image(rect, texel, palette.dark);
+    let texture = ctx.load_texture_cached(
+        "clipsync-aura",
+        Id::unique("clip-aura"),
+        image,
+        egui::TextureOptions::LINEAR,
+    );
+    painter.image(
+        texture.id(),
+        rect,
+        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+        Color32::WHITE,
+    );
 }
 
 /// 用户挑的背景图。铺法是 cover：短边铺满，长边多出来的部分居中裁掉。
@@ -450,34 +467,6 @@ fn aura_falloff(distance: f32, radius: f32) -> f32 {
     }
 }
 
-fn paint_soft_ball(painter: &egui::Painter, center: Pos2, radius: f32, color: Color32, dark: bool) {
-    let mut mesh = egui::Mesh::default();
-    let core = aura_core(color, dark);
-    let segments = 64;
-    mesh.colored_vertex(center, core);
-    let plateau = radius * AURA_PLATEAU;
-    for step in 0..=segments {
-        let angle = step as f32 / segments as f32 * std::f32::consts::TAU;
-        mesh.colored_vertex(
-            center + egui::vec2(angle.cos(), angle.sin()) * plateau,
-            core,
-        );
-    }
-    for step in 0..=segments {
-        let angle = step as f32 / segments as f32 * std::f32::consts::TAU;
-        let point = center + egui::vec2(angle.cos(), angle.sin()) * radius;
-        mesh.colored_vertex(point, Color32::TRANSPARENT);
-    }
-    for step in 0..segments {
-        let inner = step as u32 + 1;
-        let middle = inner + segments as u32 + 1;
-        mesh.add_triangle(0, inner, inner + 1);
-        mesh.add_triangle(inner, middle, middle + 1);
-        mesh.add_triangle(inner, middle + 1, inner + 1);
-    }
-    painter.add(egui::Shape::mesh(mesh));
-}
-
 /// The backdrop exactly as [`paint_background`] renders it, sampled at one point.
 fn backdrop_color(at: Pos2, palette: &Palette) -> Color32 {
     let mut acc = palette.bg.to_array().map(|channel| channel as f32);
@@ -519,6 +508,44 @@ impl FrostBake {
 }
 
 static FROST: Mutex<Option<FrostBake>> = Mutex::new(None);
+static AURA: Mutex<Option<FrostBake>> = Mutex::new(None);
+
+fn aura_image(content: Rect, texel: f32, dark: bool) -> Arc<egui::ColorImage> {
+    let mut bake = AURA
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if bake
+        .as_ref()
+        .is_none_or(|baked| !baked.fits(content, texel, dark))
+    {
+        bake.replace(FrostBake {
+            content,
+            texel,
+            dark,
+            image: bake_aura(content, texel, dark),
+        });
+    }
+    Arc::clone(&bake.as_ref().expect("baked").image)
+}
+
+fn bake_aura(content: Rect, texel: f32, dark: bool) -> Arc<egui::ColorImage> {
+    let colors = palette(dark);
+    let size = [
+        (content.width() / texel).ceil().max(1.0) as usize,
+        (content.height() / texel).ceil().max(1.0) as usize,
+    ];
+    let mut pixels = Vec::with_capacity(size[0] * size[1]);
+    for row in 0..size[1] {
+        for column in 0..size[0] {
+            let at = Pos2::new(
+                content.left() + (column as f32 + 0.5) * texel,
+                content.top() + (row as f32 + 0.5) * texel,
+            );
+            pixels.push(backdrop_color(at, &colors));
+        }
+    }
+    Arc::new(egui::ColorImage::new(size, pixels))
+}
 
 /// Draw the blurred backdrop a glass panel sits on, in the given layer.
 ///

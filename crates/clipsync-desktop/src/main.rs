@@ -5,6 +5,7 @@ mod app;
 mod app_menu;
 mod autostart;
 mod clipboard;
+mod dock;
 mod drag_out;
 mod gpu;
 mod icons;
@@ -89,6 +90,8 @@ fn main() -> eframe::Result {
             let dark = configure_shell(&ctx.egui_ctx, preferences.theme());
             // Windows 那条原生标题条得跟着主题色走，放在主题定下来之后。
             win_caption::tint(dark);
+            // Dock 点击：给 winit 的 ApplicationDelegate 补 reopen，窗口藏着时能抬起来。
+            dock::install(ctx.egui_ctx.clone());
             let tray = tray::Tray::try_install(ctx.egui_ctx.clone());
             let app = ClipSyncApp::new(
                 engine,

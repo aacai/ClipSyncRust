@@ -595,6 +595,9 @@ impl ClipSyncApp {
         while self.show_rx.try_recv().is_ok() {
             show = true;
         }
+        if crate::dock::take_reopen() {
+            show = true;
+        }
         if let Some(tray) = self.tray.as_ref() {
             while let Some(cmd) = tray.poll() {
                 match cmd {
@@ -3903,25 +3906,15 @@ impl ClipSyncApp {
         let Status::Online { safety } = &self.status else {
             return;
         };
-        let mut text = format!("安全码 {safety}");
-        if !self.peers.is_empty() {
-            let names = self
-                .peers
-                .iter()
-                .map(|peer| peer.name.as_str())
-                .collect::<Vec<_>>()
-                .join(" · ");
-            text.push_str(&format!(
-                " · 同屋 {} 台：{}",
-                self.peers.len(),
-                truncate_chars(&names, 40)
-            ));
-        }
         let row = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             let (shield_rect, _) = ui.allocate_exact_size(Vec2::splat(13.0), Sense::hover());
             icons::paint(ui.painter(), shield_rect, Icon::Shield, theme::p().accent);
-            ui.label(RichText::new(text).size(11.5).color(theme::p().muted));
+            ui.label(
+                RichText::new(format!("安全码 {safety}"))
+                    .size(11.5)
+                    .color(theme::p().muted),
+            );
         });
         let response = ui
             .interact(
