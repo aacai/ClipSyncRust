@@ -3974,30 +3974,46 @@ impl ClipSyncApp {
             {
                 self.ask_delete();
             }
-            let tools = icons::icon_button(ui, Icon::More, true, "工具");
+            let recording = self.record_phase == RecordPhase::Recording;
+            let busy = matches!(
+                self.record_phase,
+                RecordPhase::Preparing | RecordPhase::Stopping
+            );
+            let record_label = if recording {
+                "停止录屏"
+            } else {
+                "开始录屏"
+            };
+            let show_capture_inline = ui.available_width() >= 120.0;
             let mut tool: Option<ToolAction> = None;
-            egui::Popup::menu(&tools)
-                .width(210.0)
-                .frame(menu_frame())
-                .show(|ui| {
-                    ui.set_width(210.0);
-                    if menu_item(ui, Icon::Edit, "立即截屏", true, false) {
-                        tool = Some(ToolAction::Screenshot);
-                    }
-                    let recording = self.record_phase == RecordPhase::Recording;
-                    let busy = matches!(
-                        self.record_phase,
-                        RecordPhase::Preparing | RecordPhase::Stopping
-                    );
-                    let record_label = if recording {
-                        "停止录屏"
-                    } else {
-                        "开始录屏"
-                    };
-                    if menu_item(ui, Icon::Plus, record_label, !busy, false) {
-                        tool = Some(ToolAction::Record);
-                    }
-                });
+            if show_capture_inline {
+                if icons::icon_button(ui, Icon::Crop, true, "立即截屏").clicked() {
+                    tool = Some(ToolAction::Screenshot);
+                }
+                let record_icon = if recording { Icon::Stop } else { Icon::Videocam };
+                let record = if recording {
+                    icons::icon_button_tinted(ui, record_icon, theme::p().accent, !busy, record_label)
+                } else {
+                    icons::icon_button(ui, record_icon, !busy, record_label)
+                };
+                if record.clicked() {
+                    tool = Some(ToolAction::Record);
+                }
+            } else {
+                let tools = icons::icon_button(ui, Icon::More, true, "工具");
+                egui::Popup::menu(&tools)
+                    .width(210.0)
+                    .frame(menu_frame())
+                    .show(|ui| {
+                        ui.set_width(210.0);
+                        if menu_item(ui, Icon::Crop, "立即截屏", true, false) {
+                            tool = Some(ToolAction::Screenshot);
+                        }
+                        if menu_item(ui, Icon::Videocam, record_label, !busy, false) {
+                            tool = Some(ToolAction::Record);
+                        }
+                    });
+            }
             if let Some(action) = tool {
                 let ctx = ui.ctx().clone();
                 match action {

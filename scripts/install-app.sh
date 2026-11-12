@@ -39,9 +39,16 @@ chmod +x "$EXE"
 cp "$ROOT/crates/clipsync-desktop/packaging/app.icns" "$APP/Contents/Resources/app.icns"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile app.icns" "$APP/Contents/Info.plist" 2>/dev/null ||
   /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string app.icns" "$APP/Contents/Info.plist"
+VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VER" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VER" "$APP/Contents/Info.plist"
 touch "$APP"
 
-codesign --force --sign "$IDENTITY" "$APP"
+codesign --force --sign "$IDENTITY" --options runtime "$APP"
 codesign --verify --strict "$APP"
+if codesign -dv "$APP" 2>&1 | grep -Fq 'Signature=adhoc'; then
+  echo "签名仍是 adhoc：屏幕录制授权会跟着 cdhash 丢" >&2
+  exit 1
+fi
 open "$APP"
 echo "installed -> $EXE"

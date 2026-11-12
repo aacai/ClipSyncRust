@@ -336,11 +336,19 @@ fn blend(canvas: &mut image::RgbaImage, x: u32, y: u32, color: [u8; 4], coverage
         .mul_add(255.0, 0.5) as u8;
 }
 
+#[cfg(target_os = "macos")]
+static SCREEN_CAPTURE_OK: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn cs_screen_capture_ok() -> i32;
+}
+
 /// Without the grant macOS hands back wallpaper instead of an error, which users would
 /// report as a broken screenshot rather than a missing permission.
 #[cfg(target_os = "macos")]
 pub fn permission_missing() -> bool {
-    !unsafe { CGPreflightScreenCaptureAccess() }
+    !screen_capture_granted()
 }
 
 /// Preflight alone never prompts and never registers the app in System Settings → Screen
@@ -349,10 +357,26 @@ pub fn permission_missing() -> bool {
 /// still needs a process restart before capture works.
 #[cfg(target_os = "macos")]
 pub fn request_access() -> bool {
-    if unsafe { CGPreflightScreenCaptureAccess() } {
+    if screen_capture_granted() {
         return true;
     }
-    unsafe { CGRequestScreenCaptureAccess() }
+    let ok = unsafe { CGRequestScreenCaptureAccess() } || unsafe { cs_screen_capture_ok() != 0 };
+    if ok {
+        SCREEN_CAPTURE_OK.store(true, Ordering::Relaxed);
+    }
+    ok
+}
+
+#[cfg(target_os = "macos")]
+fn screen_capture_granted() -> bool {
+    if SCREEN_CAPTURE_OK.load(Ordering::Relaxed) {
+        return true;
+    }
+    let ok = unsafe { CGPreflightScreenCaptureAccess() } || unsafe { cs_screen_capture_ok() != 0 };
+    if ok {
+        SCREEN_CAPTURE_OK.store(true, Ordering::Relaxed);
+    }
+    ok
 }
 
 #[cfg(target_os = "macos")]

@@ -4,6 +4,38 @@
 #include <string.h>
 #include <unistd.h>
 
+/// 其它应用窗口标题可见 = 实际已有屏幕录制权限。
+/// CGPreflight 在 adhoc 重签后会和系统设置列表脱节，用标题探针兜底。
+int cs_screen_capture_ok(void) {
+    if (CGPreflightScreenCaptureAccess()) return 1;
+    CFArrayRef list = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+    if (list == NULL) return 0;
+    pid_t self = getpid();
+    CFIndex total = CFArrayGetCount(list);
+    int ok = 0;
+    for (CFIndex i = 0; i < total; i++) {
+        CFDictionaryRef info = CFArrayGetValueAtIndex(list, i);
+        if (info == NULL) continue;
+        int layer = -1;
+        CFNumberRef layerNumber = CFDictionaryGetValue(info, kCGWindowLayer);
+        if (layerNumber == NULL) continue;
+        CFNumberGetValue(layerNumber, kCFNumberIntType, &layer);
+        if (layer != 0) continue;
+        int pid = 0;
+        CFNumberRef pidNumber = CFDictionaryGetValue(info, kCGWindowOwnerPID);
+        if (pidNumber != NULL) CFNumberGetValue(pidNumber, kCFNumberIntType, &pid);
+        if (pid == self) continue;
+        CFStringRef name = CFDictionaryGetValue(info, kCGWindowName);
+        if (name != NULL && CFStringGetLength(name) > 0) {
+            ok = 1;
+            break;
+        }
+    }
+    CFRelease(list);
+    return ok;
+}
+
 /// 普通层（layer 0）窗口的全局 bounds，点为单位、左上原点、顶层在前。
 /// out 每条 4 个 double：x, y, w, h。返回写入的窗口个数。
 int cs_snap_windows(double *out, int max) {
