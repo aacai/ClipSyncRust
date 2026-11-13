@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use clipsync_core::engine::Clip;
 use clipsync_core::files::is_image;
 
-pub const MAX_ITEMS: usize = 500;
+pub const MAX_ITEMS: usize = 10_000;
 pub const MAX_UNDO: usize = 20;
 pub const KIND_TEXT: &str = "text";
 pub const KIND_FILE: &str = "file";

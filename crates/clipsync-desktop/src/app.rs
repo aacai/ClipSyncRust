@@ -357,6 +357,7 @@ enum MenuAction {
     SaveFile,
     Resend,
     Detail,
+    QrCode,
     MoveUp,
     MoveDown,
     MoveTop,
@@ -2216,8 +2217,8 @@ impl ClipSyncApp {
                                     "版本",
                                     env!("CARGO_PKG_VERSION"),
                                     None,
-                                    false,
-                                    None,
+                                    true,
+                                    Some(theme::p().text),
                                     false,
                                 );
                                 settings_divider(ui);
@@ -2329,6 +2330,14 @@ impl ClipSyncApp {
                                     .strong()
                                     .color(theme::p().text),
                             );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(
+                                    RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                        .monospace()
+                                        .size(12.5)
+                                        .color(theme::p().text),
+                                );
+                            });
                         });
                     });
             });
@@ -3413,6 +3422,17 @@ impl ClipSyncApp {
             MenuAction::SaveFile => self.save_record(&id),
             MenuAction::Resend => self.resend_record(&id),
             MenuAction::Detail => self.open(Overlay::Detail { id }),
+            MenuAction::QrCode => match self
+                .history
+                .items
+                .iter()
+                .find(|record| record.id == id)
+                .map(qr_payload_for)
+            {
+                Some(Ok(payload)) => self.open(Overlay::QrCode { payload }),
+                Some(Err(reason)) => self.notify(reason),
+                None => {}
+            },
             MenuAction::MoveUp => {
                 if self.history.move_item(&id, -1) {
                     self.nav_scroll = Some(id);
@@ -5257,113 +5277,95 @@ impl ClipSyncApp {
                             .find(|record| &record.id == id)
                             .cloned();
                         if let Some(record) = record {
-                            if let Some(texture) = Self::thumb_key(&record)
-                                .and_then(|(thumb_id, path)| self.load_thumb(ui.ctx(), thumb_id, path))
-                            {
-                                let image = ui.add(
-                                    egui::Image::new(&texture)
-                                        .max_width(ui.available_width())
-                                        .max_height(196.0)
-                                        .corner_radius(10)
-                                        .sense(Sense::click()),
+                            let qr = qr_payload_for(&record).ok().and_then(|payload| {
+                                qr_color_image(&payload)
+                                    .ok()
+                                    .map(|image| (payload, image))
+                            });
+                            if let Some((payload, image)) = qr {
+                                let side = 240.0_f32;
+                                let texture = ui.ctx().load_texture(
+                                    format!(
+                                        "qr-{}",
+                                        clipsync_core::crypto::sha256_hex(payload.as_bytes())
+                                    ),
+                                    image,
+                                    TextureOptions::NEAREST,
                                 );
-                                if image
-                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text("查看大图")
-                                    .clicked()
-                                {
-                                    self.open_zoom(id);
-                                }
+                                ui.vertical_centered(|ui| {
+                                    Frame::new()
+                                        .fill(Color32::WHITE)
+                                        .inner_margin(Margin::same(4))
+                                        .corner_radius(CornerRadius::same(6))
+                                        .show(ui, |ui| {
+                                            ui.add(
+                                                egui::Image::new(&texture)
+                                                    .fit_to_exact_size(Vec2::splat(side)),
+                                            );
+                                        });
+                                });
                                 ui.add_space(10.0);
-                            }
-                            egui::ScrollArea::vertical()
-                                .max_height(240.0)
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    let body = match &record.file {
-                                        Some(file) => file
-                                            .local_path
-                                            .clone()
-                                            .unwrap_or_else(|| "未下载".to_string()),
-                                        None if record.text.trim().is_empty() => {
-                                            "（空文本）".to_string()
-                                        }
-                                        None => record.text.clone(),
-                                    };
-                                    ui.label(
-                                        RichText::new(body)
-                                            .monospace()
-                                            .size(12.0)
-                                            .color(theme::p().text),
-                                    );
-                                    if !record.note.is_empty() {
-                                        ui.add_space(10.0);
-                                        field_label(ui, "备注");
+                                egui::ScrollArea::vertical()
+                                    .max_height(88.0)
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
                                         ui.label(
-                                            RichText::new(&record.note)
+                                            RichText::new(payload.as_str())
+                                                .monospace()
                                                 .size(11.5)
-                                                .color(theme::p().muted),
+                                                .color(theme::p().text),
                                         );
+                                    });
+                            } else {
+                                if let Some(texture) = Self::thumb_key(&record).and_then(
+                                    |(thumb_id, path)| self.load_thumb(ui.ctx(), thumb_id, path),
+                                ) {
+                                    let image = ui.add(
+                                        egui::Image::new(&texture)
+                                            .max_width(ui.available_width())
+                                            .max_height(196.0)
+                                            .corner_radius(10)
+                                            .sense(Sense::click()),
+                                    );
+                                    if image
+                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                        .on_hover_text("查看大图")
+                                        .clicked()
+                                    {
+                                        self.open_zoom(id);
                                     }
                                     ui.add_space(10.0);
-                                    field_label(ui, "记录信息");
-                                    let mut meta = format!(
-                                        "{} · 来自 {}",
-                                        relative_time(record.ts, now_millis()),
-                                        record.sender_name
-                                    );
-                                    if let Some(file) = &record.file {
-                                        meta.push_str(&format!(
-                                            " · {} · {} · {}",
-                                            file.name,
-                                            file.mime,
-                                            human_size(file.size)
-                                        ));
-                                        let left = file.expires_at - now_millis();
-                                        if left > 0 {
-                                            meta.push_str(&format!(" · {}后过期", human_left(left)));
-                                        }
+                                }
+                                let body = match &record.file {
+                                    Some(file) => file
+                                        .local_path
+                                        .clone()
+                                        .unwrap_or_else(|| "未下载".to_string()),
+                                    None if record.text.trim().is_empty() => {
+                                        "（空文本）".to_string()
                                     }
-                                    if record.pinned {
-                                        meta.push_str(" · 已置顶");
-                                    }
-                                    if record.moved() {
-                                        meta.push_str(" · 已手动排序");
-                                    }
-                                    ui.label(
-                                        RichText::new(meta)
-                                            .size(11.0)
-                                            .color(theme::p().muted),
-                                    );
-                                    ui.add_space(6.0);
-                                    field_label(ui, "记录 ID");
-                                    ui.label(
-                                        RichText::new(&record.id)
-                                            .monospace()
-                                            .size(10.5)
-                                            .color(theme::p().faint),
-                                    );
-                                });
+                                    None => record.text.clone(),
+                                };
+                                egui::ScrollArea::vertical()
+                                    .max_height(260.0)
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.label(
+                                            RichText::new(body)
+                                                .monospace()
+                                                .size(12.5)
+                                                .color(theme::p().text),
+                                        );
+                                    });
+                            }
                             ui.add_space(14.0);
                             ui.horizontal(|ui| {
                                 if record.copyable() && secondary_button(ui, "复制").clicked() {
                                     action = DialogAction::CopyRecord(id.clone());
                                 }
-                                match qr_payload_for(&record) {
-                                    Ok(payload) => {
-                                        if secondary_button(ui, "二维码").clicked() {
-                                            action = DialogAction::Open(Overlay::QrCode { payload });
-                                        }
-                                    }
-                                    Err(reason) => {
-                                        if secondary_button(ui, "二维码").clicked() {
-                                            toast = Some(reason.to_string());
-                                        }
-                                    }
-                                }
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if secondary_button(ui, "取消").clicked() {
+                                    if secondary_button(ui, "关闭").clicked() {
                                         close = true;
                                     }
                                 });
@@ -5387,18 +5389,26 @@ impl ClipSyncApp {
                         ui.add_space(10.0);
                         match qr_color_image(payload) {
                             Ok(image) => {
-                                let side = 220.0_f32;
+                                let side = 240.0_f32;
                                 let texture = ui.ctx().load_texture(
-                                    format!("qr-{}", payload.len()),
+                                    format!(
+                                        "qr-{}",
+                                        clipsync_core::crypto::sha256_hex(payload.as_bytes())
+                                    ),
                                     image,
                                     TextureOptions::NEAREST,
                                 );
                                 ui.vertical_centered(|ui| {
-                                    ui.add(
-                                        egui::Image::new(&texture)
-                                            .fit_to_exact_size(Vec2::splat(side))
-                                            .bg_fill(Color32::WHITE),
-                                    );
+                                    Frame::new()
+                                        .fill(Color32::WHITE)
+                                        .inner_margin(Margin::same(4))
+                                        .corner_radius(CornerRadius::same(6))
+                                        .show(ui, |ui| {
+                                            ui.add(
+                                                egui::Image::new(&texture)
+                                                    .fit_to_exact_size(Vec2::splat(side)),
+                                            );
+                                        });
                                 });
                                 ui.add_space(10.0);
                                 egui::ScrollArea::vertical()
@@ -5409,7 +5419,7 @@ impl ClipSyncApp {
                                             RichText::new(payload.as_str())
                                                 .monospace()
                                                 .size(11.0)
-                                                .color(theme::p().muted),
+                                                .color(theme::p().text),
                                         );
                                     });
                                 ui.add_space(12.0);
@@ -6171,6 +6181,9 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
             if menu_item(ui, Icon::Info, "查看详情", true, false) {
                 menu_choice = Some(MenuAction::Detail);
             }
+            if menu_item(ui, Icon::Crop, "二维码", true, false) {
+                menu_choice = Some(MenuAction::QrCode);
+            }
             menu_separator(ui);
             if menu_item(ui, Icon::ArrowUp, "向上移", can_up, false) {
                 menu_choice = Some(MenuAction::MoveUp);
@@ -6770,8 +6783,10 @@ fn about_hero(ui: &mut Ui) {
                 "{ABOUT_VERSION_PREFIX} {}",
                 env!("CARGO_PKG_VERSION")
             ))
-            .size(11.5)
-            .color(palette.muted),
+            .monospace()
+            .size(14.0)
+            .strong()
+            .color(palette.text),
         );
     });
 }
@@ -7461,10 +7476,10 @@ fn qr_color_image(payload: &str) -> Result<egui::ColorImage, String> {
         return Err("内容过长，无法生成可扫码的二维码".to_string());
     }
     let code = qrcode::QrCode::new(payload.as_bytes()).map_err(|err| err.to_string())?;
-    let quiet = 2usize;
+    let quiet = 1usize;
     let modules = code.width();
     let size = modules + quiet * 2;
-    let scale = (220 / size).max(2);
+    let scale = (240 / size).max(2);
     let px = size * scale;
     let mut pixels = vec![Color32::WHITE; px * px];
     for y in 0..modules {
