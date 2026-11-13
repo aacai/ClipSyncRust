@@ -32,6 +32,7 @@ zeroize = { workspace = true }
 global-hotkey = { workspace = true }
 xcap = { workspace = true }
 ab_glyph = "0.2.32"
+qrcode = { workspace = true }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 openh264 = { version = "0.9", default-features = false, features = ["source"] }

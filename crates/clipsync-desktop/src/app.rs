@@ -300,6 +300,10 @@ enum Overlay {
     Detail {
         id: String,
     },
+    /// 文本出内容码；文件出下载链接码。
+    QrCode {
+        payload: String,
+    },
     MoveTo {
         id: String,
         input: String,
@@ -4393,8 +4397,10 @@ impl ClipSyncApp {
         let focus = std::mem::take(&mut self.focus_dialog);
         let mut action = DialogAction::None;
         let mut close = false;
+        let mut toast: Option<String> = None;
         let width = match &overlay {
             Overlay::Detail { .. } => 500.0,
+            Overlay::QrCode { .. } => 360.0,
             Overlay::About => 340.0,
             Overlay::Safety => 440.0,
             Overlay::License => 560.0,
@@ -5344,6 +5350,18 @@ impl ClipSyncApp {
                                 if record.copyable() && secondary_button(ui, "复制").clicked() {
                                     action = DialogAction::CopyRecord(id.clone());
                                 }
+                                match qr_payload_for(&record) {
+                                    Ok(payload) => {
+                                        if secondary_button(ui, "二维码").clicked() {
+                                            action = DialogAction::Open(Overlay::QrCode { payload });
+                                        }
+                                    }
+                                    Err(reason) => {
+                                        if secondary_button(ui, "二维码").clicked() {
+                                            toast = Some(reason.to_string());
+                                        }
+                                    }
+                                }
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if secondary_button(ui, "取消").clicked() {
                                         close = true;
@@ -5362,6 +5380,63 @@ impl ClipSyncApp {
                                     close = true;
                                 }
                             });
+                        }
+                    }
+                    Overlay::QrCode { payload } => {
+                        dialog_header(ui, Icon::Info, "二维码");
+                        ui.add_space(10.0);
+                        match qr_color_image(payload) {
+                            Ok(image) => {
+                                let side = 220.0_f32;
+                                let texture = ui.ctx().load_texture(
+                                    format!("qr-{}", payload.len()),
+                                    image,
+                                    TextureOptions::NEAREST,
+                                );
+                                ui.vertical_centered(|ui| {
+                                    ui.add(
+                                        egui::Image::new(&texture)
+                                            .fit_to_exact_size(Vec2::splat(side))
+                                            .bg_fill(Color32::WHITE),
+                                    );
+                                });
+                                ui.add_space(10.0);
+                                egui::ScrollArea::vertical()
+                                    .max_height(72.0)
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.label(
+                                            RichText::new(payload.as_str())
+                                                .monospace()
+                                                .size(11.0)
+                                                .color(theme::p().muted),
+                                        );
+                                    });
+                                ui.add_space(12.0);
+                                ui.horizontal(|ui| {
+                                    if secondary_button(ui, "复制").clicked() {
+                                        action = DialogAction::Copy(payload.clone());
+                                    }
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if secondary_button(ui, "关闭").clicked() {
+                                            close = true;
+                                        }
+                                    });
+                                });
+                            }
+                            Err(msg) => {
+                                ui.label(
+                                    RichText::new(msg)
+                                        .size(12.5)
+                                        .color(theme::p().red),
+                                );
+                                ui.add_space(14.0);
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if secondary_button(ui, "关闭").clicked() {
+                                        close = true;
+                                    }
+                                });
+                            }
                         }
                     }
                     Overlay::MoveTo { id, input, error } => {
@@ -5499,6 +5574,9 @@ impl ClipSyncApp {
         );
         if response.should_close() {
             close = true;
+        }
+        if let Some(msg) = toast {
+            self.notify(msg);
         }
 
         let mut keep = !close;
@@ -7359,6 +7437,50 @@ fn truncate_chars(text: &str, max: usize) -> String {
     let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+const QR_MAX_BYTES: usize = 2500;
+
+fn qr_payload_for(record: &Record) -> Result<String, &'static str> {
+    if let Some(file) = record.file.as_ref() {
+        let link = file.link.trim();
+        if link.starts_with("http") {
+            Ok(link.to_string())
+        } else {
+            Err("文件还没有下载链接（可能尚未上传完成）")
+        }
+    } else if record.text.trim().is_empty() {
+        Err("没有可编码的内容")
+    } else {
+        Ok(record.text.clone())
+    }
+}
+
+fn qr_color_image(payload: &str) -> Result<egui::ColorImage, String> {
+    if payload.as_bytes().len() > QR_MAX_BYTES {
+        return Err("内容过长，无法生成可扫码的二维码".to_string());
+    }
+    let code = qrcode::QrCode::new(payload.as_bytes()).map_err(|err| err.to_string())?;
+    let quiet = 2usize;
+    let modules = code.width();
+    let size = modules + quiet * 2;
+    let scale = (220 / size).max(2);
+    let px = size * scale;
+    let mut pixels = vec![Color32::WHITE; px * px];
+    for y in 0..modules {
+        for x in 0..modules {
+            if code[(x, y)] == qrcode::Color::Dark {
+                let ox = (x + quiet) * scale;
+                let oy = (y + quiet) * scale;
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        pixels[(oy + dy) * px + (ox + dx)] = Color32::BLACK;
+                    }
+                }
+            }
+        }
+    }
+    Ok(egui::ColorImage::new([px, px], pixels))
 }
 
 fn search_id() -> Id {
