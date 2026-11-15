@@ -1,0 +1,14 @@
+{
+  "name": "clipsync-workspace",
+  "private": true,
+  "workspaces": ["apps/clipsync"],
+  "engines": {
+    "node": ">=22.12.0",
+    "npm": ">=10"
+  },
+  "scripts": {
+    "dev": "npm run dev -w clipsync",
+    "build": "npm run build -w clipsync",
+    "tauri": "npm run tauri -w clipsync"
+  }
+}

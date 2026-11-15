@@ -1,2 +1,6 @@
 /target
 .DS_Store
+node_modules/
+dist/
+apps/clipsync/src-tauri/target/
+apps/clipsync/src-tauri/gen/schemas/

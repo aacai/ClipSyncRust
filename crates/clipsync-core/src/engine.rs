@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
@@ -22,7 +23,7 @@ pub const KIND_TEXT: &str = "text";
 const MAX_UNKNOWN_KEY: usize = 8;
 const MISMATCH_ID_CHARS: usize = 8;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Config {
     pub room_id: String,
     pub password: String,
@@ -32,7 +33,7 @@ pub struct Config {
     pub device_os: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub enum Status {
     #[default]
     Idle,
@@ -45,7 +46,7 @@ pub enum Status {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Peer {
     pub id: String,
     pub name: String,
@@ -58,7 +59,7 @@ struct Mismatch {
     label: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FileAttachment {
     pub name: String,
     pub mime: String,
@@ -68,7 +69,7 @@ pub struct FileAttachment {
     pub expires_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Clip {
     pub mid: String,
     pub text: String,
@@ -79,7 +80,7 @@ pub struct Clip {
     pub file: Option<FileAttachment>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FileUpload {
     pub mid: String,
     pub ts: i64,
@@ -91,7 +92,7 @@ pub struct FileUpload {
     pub expires_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum Event {
     Status(Status),
     Clip(Clip),
@@ -144,14 +145,30 @@ impl EngineHandle {
     pub fn leave(&self) {
         let _ = self.commands.send(Command::Leave);
     }
+
+    /// 把命令发送端和事件接收端拆开，让事件能被另一个任务持续消费。
+    pub fn split(self) -> (mpsc::UnboundedSender<Command>, mpsc::UnboundedReceiver<Event>) {
+        (self.commands, self.events)
+    }
 }
 
 pub fn spawn<F: LinkFactory>(links: F) -> EngineHandle {
+    spawn_with(links, |fut| {
+        tokio::spawn(fut);
+    })
+}
+
+/// 用宿主提供的调度器启动引擎，避免宿主主线程没有 tokio 运行时上下文时 panic。
+pub fn spawn_with<F: LinkFactory, S>(links: F, spawner: S) -> EngineHandle
+where
+    F: LinkFactory,
+    S: FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) + Send + 'static,
+{
     let (commands, command_rx) = mpsc::unbounded_channel();
     let (events, out) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
+    spawner(Box::pin(async move {
         Engine::new(links, events).run(command_rx).await;
-    });
+    }));
     EngineHandle {
         commands,
         events: out,

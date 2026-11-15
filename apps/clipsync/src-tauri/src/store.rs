@@ -1,0 +1,999 @@
+use std::cmp::Ordering;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use clipsync_core::engine::Clip;
+use clipsync_core::files::is_image;
+
+pub const MAX_ITEMS: usize = 10_000;
+pub const MAX_UNDO: usize = 20;
+pub const KIND_TEXT: &str = "text";
+pub const KIND_FILE: &str = "file";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileInfo {
+    pub name: String,
+    pub mime: String,
+    pub size: i64,
+    pub sha256: String,
+    #[serde(default)]
+    pub link: String,
+    #[serde(default)]
+    pub expires_at: i64,
+    #[serde(default)]
+    pub cached: bool,
+    #[serde(default)]
+    pub local_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Record {
+    pub id: String,
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    pub ts: i64,
+    #[serde(default)]
+    pub sender_id: String,
+    #[serde(default)]
+    pub sender_name: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub file: Option<FileInfo>,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub order: i64,
+    #[serde(default)]
+    pub note: String,
+}
+
+fn default_kind() -> String {
+    KIND_TEXT.to_string()
+}
+
+impl Record {
+    pub fn from_clip(clip: &Clip) -> Self {
+        let file = clip.file.as_ref().map(|file| FileInfo {
+            name: file.name.clone(),
+            mime: file.mime.clone(),
+            size: file.size,
+            sha256: file.sha256.clone(),
+            link: file.link.clone(),
+            expires_at: file.expires_at,
+            cached: false,
+            local_path: None,
+        });
+        Self {
+            id: clip.mid.clone(),
+            kind: if file.is_some() {
+                KIND_FILE.to_string()
+            } else {
+                KIND_TEXT.to_string()
+            },
+            ts: clip.ts,
+            sender_id: clip.sender_id.clone(),
+            sender_name: clip.sender_name.clone(),
+            text: clip.text.clone(),
+            file,
+            pinned: false,
+            order: 0,
+            note: String::new(),
+        }
+    }
+
+    pub fn rank(&self) -> i64 {
+        if self.order != 0 {
+            self.order
+        } else {
+            self.ts
+        }
+    }
+
+    pub fn moved(&self) -> bool {
+        self.order != 0 && self.order != self.ts
+    }
+
+    pub fn is_text(&self) -> bool {
+        self.kind != KIND_FILE
+    }
+
+    pub fn copyable(&self) -> bool {
+        let Some(file) = self.file.as_ref() else {
+            return self.is_text();
+        };
+        self.is_text() || file.local_path.is_some() || is_image(&file.mime)
+    }
+}
+
+fn ordering(a: &Record, b: &Record) -> Ordering {
+    b.pinned
+        .cmp(&a.pinned)
+        .then_with(|| b.rank().cmp(&a.rank()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MoveInfo {
+    pub position: usize,
+    pub from: usize,
+    pub to: usize,
+}
+
+pub struct History {
+    path: PathBuf,
+    pub items: Vec<Record>,
+    trash: Vec<Vec<Record>>,
+    dirty: bool,
+}
+
+pub struct AddOutcome {
+    pub inserted: bool,
+    pub id: String,
+}
+
+impl History {
+    pub fn open(path: PathBuf) -> Self {
+        let mut items = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Vec<Record>>(&raw).ok())
+            .unwrap_or_default();
+        items.sort_by(ordering);
+        Self {
+            path,
+            items,
+            trash: Vec::new(),
+            dirty: false,
+        }
+    }
+
+    pub fn add(&mut self, record: Record) -> bool {
+        self.insert(record).inserted
+    }
+
+    pub fn insert(&mut self, record: Record) -> AddOutcome {
+        if let Some(existing) = self.items.iter_mut().find(|item| item.id == record.id) {
+            existing.ts = record.ts;
+            existing.kind = record.kind;
+            existing.text = record.text;
+            if let Some(incoming) = record.file {
+                let cached = existing
+                    .file
+                    .as_ref()
+                    .filter(|current| current.sha256 == incoming.sha256)
+                    .map(|current| (current.cached, current.local_path.clone()));
+                let mut merged = incoming;
+                if let Some((cached, path)) = cached {
+                    merged.cached = cached;
+                    merged.local_path = path;
+                }
+                existing.file = Some(merged);
+            }
+            existing.pinned = record.pinned;
+            let id = existing.id.clone();
+            self.dirty = true;
+            self.sort();
+            return AddOutcome {
+                inserted: false,
+                id,
+            };
+        }
+        if let Some(existing) = self
+            .items
+            .iter_mut()
+            .find(|item| same_content(item, &record))
+        {
+            existing.ts = record.ts;
+            existing.order = record.ts;
+            existing.text = record.text;
+            if let Some(incoming) = record.file {
+                let cached = existing
+                    .file
+                    .as_ref()
+                    .map(|current| (current.cached, current.local_path.clone()))
+                    .unwrap_or((false, None));
+                let mut merged = incoming;
+                merged.cached = cached.0;
+                merged.local_path = cached.1;
+                existing.file = Some(merged);
+            }
+            let id = existing.id.clone();
+            self.dirty = true;
+            self.sort();
+            return AddOutcome {
+                inserted: false,
+                id,
+            };
+        }
+        let id = record.id.clone();
+        self.items.push(record);
+        self.sort();
+        self.items.truncate(MAX_ITEMS);
+        self.dirty = true;
+        AddOutcome { inserted: true, id }
+    }
+
+    pub fn update_text(&mut self, id: &str, text: &str) -> bool {
+        let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+            return false;
+        };
+        if item.text == text {
+            return false;
+        }
+        item.text = text.to_string();
+        self.dirty = true;
+        true
+    }
+
+    pub fn update_note(&mut self, id: &str, note: &str) -> bool {
+        let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+            return false;
+        };
+        if item.note == note {
+            return false;
+        }
+        item.note = note.to_string();
+        self.dirty = true;
+        true
+    }
+
+    pub fn mark_cached(&mut self, id: &str, path: &str) -> bool {
+        let Some(file) = self
+            .items
+            .iter_mut()
+            .find(|item| item.id == id)
+            .and_then(|item| item.file.as_mut())
+        else {
+            return false;
+        };
+        file.cached = true;
+        file.local_path = Some(path.to_string());
+        self.dirty = true;
+        true
+    }
+
+    pub fn file(&self, id: &str) -> Option<FileInfo> {
+        self.items.iter().find(|item| item.id == id)?.file.clone()
+    }
+
+    pub fn fill_file_meta(&mut self, id: &str, link: &str, sha256: &str, expires_at: i64) -> bool {
+        let Some(file) = self
+            .items
+            .iter_mut()
+            .find(|item| item.id == id)
+            .and_then(|item| item.file.as_mut())
+        else {
+            return false;
+        };
+        file.link = link.to_string();
+        file.sha256 = sha256.to_string();
+        file.expires_at = expires_at;
+        self.dirty = true;
+        true
+    }
+
+    pub fn set_pinned(&mut self, ids: &[String], pinned: bool) -> usize {
+        if ids.is_empty() {
+            return 0;
+        }
+        let mut changed = 0;
+        for item in &mut self.items {
+            if ids.contains(&item.id) && item.pinned != pinned {
+                item.pinned = pinned;
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            self.sort();
+            self.dirty = true;
+        }
+        changed
+    }
+
+    pub fn toggle_pin(&mut self, id: &str) -> bool {
+        let Some(item) = self.items.iter().find(|item| item.id == id) else {
+            return false;
+        };
+        let pinned = !item.pinned;
+        self.set_pinned(&[id.to_string()], pinned) > 0
+    }
+
+    pub fn move_item(&mut self, id: &str, delta: isize) -> bool {
+        let Some(from) = self.items.iter().position(|item| item.id == id) else {
+            return false;
+        };
+        let Some(to) = from.checked_add_signed(delta) else {
+            return false;
+        };
+        if to >= self.items.len() {
+            return false;
+        }
+        let a_rank = self.items[from].rank();
+        let b_rank = self.items[to].rank();
+        self.items[from].order = b_rank;
+        self.items[to].order = a_rank;
+        self.sort();
+        self.dirty = true;
+        true
+    }
+
+    pub fn move_to(&mut self, id: &str, target: usize) -> Option<usize> {
+        let from = self.items.iter().position(|item| item.id == id)?;
+        let (lo, hi) = self.group_bounds(from);
+        let to = target.saturating_sub(1).clamp(lo, hi);
+        if to == from {
+            return None;
+        }
+        let ranks: Vec<i64> = self.items[lo..=hi].iter().map(Record::rank).collect();
+        let mut part: Vec<Record> = self.items[lo..=hi].to_vec();
+        let item = part.remove(from - lo);
+        part.insert(to - lo, item);
+        for (offset, item) in part.iter_mut().enumerate() {
+            item.order = ranks[offset];
+        }
+        self.items.splice(lo..=hi, part);
+        self.sort();
+        self.dirty = true;
+        Some(to + 1)
+    }
+
+    pub fn move_info(&self, id: &str) -> Option<MoveInfo> {
+        let position = self.items.iter().position(|item| item.id == id)?;
+        let (lo, hi) = self.group_bounds(position);
+        Some(MoveInfo {
+            position: position + 1,
+            from: lo + 1,
+            to: hi + 1,
+        })
+    }
+
+    pub fn duplicate(&mut self, id: &str, new_id: String, now: i64) -> bool {
+        let Some(item) = self.items.iter().find(|item| item.id == id).cloned() else {
+            return false;
+        };
+        self.items.push(Record {
+            id: new_id,
+            ts: now,
+            order: now,
+            ..item
+        });
+        self.sort();
+        self.items.truncate(MAX_ITEMS);
+        self.dirty = true;
+        true
+    }
+
+    pub fn remove(&mut self, ids: &[String]) -> usize {
+        if ids.is_empty() {
+            return 0;
+        }
+        let (removed, kept): (Vec<Record>, Vec<Record>) = self
+            .items
+            .drain(..)
+            .partition(|item| ids.contains(&item.id));
+        self.items = kept;
+        if removed.is_empty() {
+            return 0;
+        }
+        let count = removed.len();
+        let mut doomed: Vec<String> = removed
+            .iter()
+            .filter_map(|item| item.file.as_ref()?.local_path.clone())
+            .collect();
+        doomed.sort();
+        doomed.dedup();
+        for path in doomed {
+            let shared = self.items.iter().any(|item| {
+                item.file
+                    .as_ref()
+                    .and_then(|file| file.local_path.as_deref())
+                    == Some(path.as_str())
+            });
+            if !shared {
+                crate::paths::delete_cache(Some(&path));
+            }
+        }
+        let cleared = removed
+            .into_iter()
+            .map(|mut item| {
+                if let Some(file) = item.file.as_mut() {
+                    file.cached = false;
+                    file.local_path = None;
+                }
+                item
+            })
+            .collect();
+        self.push_trash(cleared);
+        self.dirty = true;
+        count
+    }
+
+    pub fn clear(&mut self) -> usize {
+        let ids: Vec<String> = self.items.iter().map(|item| item.id.clone()).collect();
+        self.remove(&ids)
+    }
+
+    pub fn remove_since(&mut self, after: i64) -> usize {
+        let ids: Vec<String> = self
+            .items
+            .iter()
+            .filter(|item| !item.pinned && item.ts >= after)
+            .map(|item| item.id.clone())
+            .collect();
+        self.remove(&ids)
+    }
+
+    pub fn count_since(&self, after: i64) -> usize {
+        self.items
+            .iter()
+            .filter(|item| !item.pinned && item.ts >= after)
+            .count()
+    }
+
+    pub fn remove_expired(&mut self, before: i64) -> usize {
+        let doomed: Vec<String> = self
+            .items
+            .iter()
+            .filter(|item| !item.pinned && item.ts < before)
+            .map(|item| item.id.clone())
+            .collect();
+        if doomed.is_empty() {
+            return 0;
+        }
+        let (removed, kept): (Vec<Record>, Vec<Record>) = self
+            .items
+            .drain(..)
+            .partition(|item| doomed.contains(&item.id));
+        self.items = kept;
+        let mut paths: Vec<String> = removed
+            .iter()
+            .filter_map(|item| item.file.as_ref()?.local_path.clone())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        for path in paths {
+            let shared = self.items.iter().any(|item| {
+                item.file
+                    .as_ref()
+                    .and_then(|file| file.local_path.as_deref())
+                    == Some(path.as_str())
+            });
+            if !shared {
+                crate::paths::delete_cache(Some(&path));
+            }
+        }
+        self.dirty = true;
+        removed.len()
+    }
+
+    pub fn undo(&mut self) -> Option<Vec<Record>> {
+        let batch = self.trash.pop()?;
+        self.items.extend(batch.iter().cloned());
+        self.sort();
+        self.items.truncate(MAX_ITEMS);
+        self.dirty = true;
+        Some(batch)
+    }
+
+    pub fn undo_depth(&self) -> usize {
+        self.trash.len()
+    }
+
+    pub fn search(&self, query: &str, regex: bool, case_sensitive: bool) -> Vec<usize> {
+        let query = query.trim();
+        if query.is_empty() {
+            return (0..self.items.len()).collect();
+        }
+        if regex {
+            let pattern = regex::RegexBuilder::new(query)
+                .case_insensitive(!case_sensitive)
+                .build();
+            let Ok(pattern) = pattern else {
+                return Vec::new();
+            };
+            return self
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| item_matches(item, |text| pattern.is_match(text)))
+                .map(|(index, _)| index)
+                .collect();
+        }
+        if case_sensitive {
+            self.items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| item_matches(item, |text| text.contains(query)))
+                .map(|(index, _)| index)
+                .collect()
+        } else {
+            let needle = query.to_lowercase();
+            self.items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| {
+                    item_matches(item, |text| text.to_lowercase().contains(&needle))
+                })
+                .map(|(index, _)| index)
+                .collect()
+        }
+    }
+
+    pub fn export_json(&self, ids: &[String]) -> String {
+        let selected: Vec<Value> = self
+            .items
+            .iter()
+            .filter(|item| ids.contains(&item.id))
+            .map(|item| {
+                json!({
+                    "id": item.id,
+                    "kind": item.kind,
+                    "ts": item.ts,
+                    "senderId": item.sender_id,
+                    "senderName": item.sender_name,
+                    "text": item.text,
+                    "file": item.file.as_ref().map(|file| json!({
+                        "id": item.id,
+                        "name": file.name,
+                        "mime": file.mime,
+                        "size": file.size,
+                        "sha256": file.sha256,
+                        "link": file.link,
+                        "expiresAt": file.expires_at,
+                        "ts": item.ts,
+                        "senderId": item.sender_id,
+                        "senderName": item.sender_name,
+                        "cached": file.cached,
+                        "localPath": file.local_path,
+                    })),
+                    "pinned": item.pinned,
+                    "order": item.order,
+                    "note": item.note,
+                })
+            })
+            .collect();
+        serde_json::to_string(&selected).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    pub fn flush(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.dirty = false;
+        if let Ok(raw) = serde_json::to_string(&self.items) {
+            let tmp = self.path.with_extension("tmp");
+            if std::fs::write(&tmp, raw).is_ok() {
+                let _ = std::fs::rename(&tmp, &self.path);
+            }
+        }
+    }
+
+    fn sort(&mut self) {
+        self.items.sort_by(ordering);
+    }
+
+    fn group_bounds(&self, index: usize) -> (usize, usize) {
+        let pinned = self.items[index].pinned;
+        let mut lo = index;
+        while lo > 0 && self.items[lo - 1].pinned == pinned {
+            lo -= 1;
+        }
+        let mut hi = index;
+        while hi + 1 < self.items.len() && self.items[hi + 1].pinned == pinned {
+            hi += 1;
+        }
+        (lo, hi)
+    }
+
+    fn push_trash(&mut self, batch: Vec<Record>) {
+        self.trash.push(batch);
+        while self.trash.len() > MAX_UNDO {
+            self.trash.remove(0);
+        }
+    }
+}
+
+fn same_content(a: &Record, b: &Record) -> bool {
+    if a.kind != b.kind {
+        return false;
+    }
+    match a.kind.as_str() {
+        KIND_TEXT => a.text == b.text,
+        KIND_FILE => {
+            let sa = a
+                .file
+                .as_ref()
+                .map(|file| file.sha256.as_str())
+                .unwrap_or("");
+            let sb = b
+                .file
+                .as_ref()
+                .map(|file| file.sha256.as_str())
+                .unwrap_or("");
+            !sa.is_empty() && sa == sb
+        }
+        _ => a.text == b.text && a.file == b.file,
+    }
+}
+
+fn item_matches(item: &Record, matches: impl Fn(&str) -> bool) -> bool {
+    if matches(&item.text) || (!item.note.is_empty() && matches(&item.note)) {
+        return true;
+    }
+    item.file
+        .as_ref()
+        .is_some_and(|file| matches(&file.name) || matches(&file.mime))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{History, Record, KIND_TEXT, MAX_ITEMS};
+
+    fn record_at(id: &str, text: &str, ts: i64) -> Record {
+        Record {
+            id: id.to_string(),
+            kind: KIND_TEXT.to_string(),
+            ts,
+            sender_id: "me".to_string(),
+            sender_name: "Me".to_string(),
+            text: text.to_string(),
+            file: None,
+            pinned: false,
+            order: 0,
+            note: String::new(),
+        }
+    }
+
+    fn record(id: &str, text: &str) -> Record {
+        record_at(id, text, 1)
+    }
+
+    fn file_record(id: &str, name: &str, sha: &str, ts: i64) -> Record {
+        Record {
+            id: id.to_string(),
+            kind: super::KIND_FILE.to_string(),
+            ts,
+            sender_id: "me".to_string(),
+            sender_name: "Me".to_string(),
+            text: name.to_string(),
+            file: Some(super::FileInfo {
+                name: name.to_string(),
+                mime: "image/png".to_string(),
+                size: 42,
+                sha256: sha.to_string(),
+                link: "https://example.test/a.bin".to_string(),
+                expires_at: ts + 1_000,
+                cached: false,
+                local_path: None,
+            }),
+            pinned: false,
+            order: 0,
+            note: String::new(),
+        }
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("clipsync-history-{name}.json"))
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("tmp"));
+    }
+
+    fn history(name: &str) -> History {
+        let path = scratch(name);
+        cleanup(&path);
+        let mut history = History::open(path.clone());
+        history.path = path;
+        history
+    }
+
+    #[test]
+    fn only_text_records_are_offered_text_actions() {
+        assert!(record("a", "text").is_text());
+
+        let image = file_record("i", "a.png", "aa", 1);
+        assert!(!image.is_text());
+
+        let mut document = file_record("d", "a.pdf", "bb", 2);
+        document.file.as_mut().unwrap().mime = "application/pdf".to_string();
+        assert!(!document.is_text());
+    }
+
+    #[test]
+    fn only_records_with_something_to_put_on_the_clipboard_are_copyable() {
+        assert!(record("a", "text").copyable());
+
+        let pending = file_record("i", "a.png", "aa", 1);
+        assert!(pending.copyable(), "图片可以边下载边复制");
+
+        let mut document = file_record("d", "a.pdf", "bb", 2);
+        document.file.as_mut().unwrap().mime = "application/pdf".to_string();
+        assert!(!document.copyable(), "没下下来的文件复制不了");
+
+        document.file.as_mut().unwrap().local_path = Some("/tmp/a.pdf".to_string());
+        assert!(document.copyable());
+
+        let mut ghost = record("g", "orphan");
+        ghost.kind = super::KIND_FILE.to_string();
+        assert!(!ghost.copyable(), "条目里没有文件信息就没有可复制的东西");
+    }
+
+    #[test]
+    fn a_repeat_id_is_rejected() {
+        let mut history = history("dup");
+        assert!(history.add(record("a", "first")));
+        assert!(!history.add(record("a", "different text")));
+        assert_eq!(history.items.len(), 1);
+        assert_eq!(history.items[0].text, "different text");
+    }
+
+    #[test]
+    fn identical_text_moves_to_the_front() {
+        let mut history = history("front");
+        history.add(record_at("a", "hello", 1));
+        history.add(record_at("b", "world", 2));
+        history.add(record_at("c", "hello", 3));
+        let ids: Vec<&str> = history.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+        assert_eq!(history.items[0].ts, 3);
+        assert_eq!(history.items[0].order, 3);
+    }
+
+    #[test]
+    fn the_history_is_capped() {
+        let mut history = history("cap");
+        for index in 0..MAX_ITEMS + 10 {
+            history.add(record_at(
+                &index.to_string(),
+                &format!("clip {index}"),
+                index as i64,
+            ));
+        }
+        assert_eq!(history.items.len(), MAX_ITEMS);
+        assert_eq!(history.items[0].text, format!("clip {}", MAX_ITEMS + 9));
+    }
+
+    #[test]
+    fn flush_survives_a_reopen() {
+        let path = scratch("persist");
+        cleanup(&path);
+        {
+            let mut history = History::open(path.clone());
+            history.add(record("a", "keep me"));
+            history.flush();
+        }
+        let reopened = History::open(path.clone());
+        assert_eq!(reopened.items.len(), 1);
+        assert_eq!(reopened.items[0].text, "keep me");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn an_old_history_file_loads_with_defaults() {
+        let path = scratch("legacy");
+        cleanup(&path);
+        std::fs::write(
+            &path,
+            r#"[{"id":"a","kind":"text","ts":5,"sender_id":"x","sender_name":"X","text":"old","pinned":false}]"#,
+        )
+        .unwrap();
+        let history = History::open(path.clone());
+        assert_eq!(history.items.len(), 1);
+        assert_eq!(history.items[0].order, 0);
+        assert_eq!(history.items[0].note, "");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn loading_sorts_pinned_then_rank() {
+        let path = scratch("sorted-load");
+        cleanup(&path);
+        std::fs::write(
+            &path,
+            r#"[
+                {"id":"new","kind":"text","ts":300,"text":"new","pinned":false},
+                {"id":"pinned","kind":"text","ts":100,"text":"pinned","pinned":true},
+                {"id":"old","kind":"text","ts":200,"text":"old","pinned":false}
+            ]"#,
+        )
+        .unwrap();
+        let history = History::open(path.clone());
+        let ids: Vec<&str> = history.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, vec!["pinned", "new", "old"]);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn pinned_items_sort_first() {
+        let mut history = history("pin");
+        history.add(record_at("a", "one", 100));
+        history.add(record_at("b", "two", 200));
+        history.toggle_pin("a");
+        let ids: Vec<&str> = history.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+        history.toggle_pin("a");
+        let ids: Vec<&str> = history.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "a"]);
+    }
+
+    #[test]
+    fn moving_swaps_ranks_and_stops_at_the_edges() {
+        let mut history = history("move");
+        history.add(record_at("a", "one", 100));
+        history.add(record_at("b", "two", 200));
+        history.add(record_at("c", "three", 300));
+        assert!(history.move_item("c", 1));
+        let ids: Vec<&str> = history.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "c", "a"]);
+        assert!(!history.move_item("b", -1));
+        assert!(!history.move_item("a", 1));
+    }
+
+    #[test]
+    fn move_to_stays_inside_the_pinned_group() {
+        let mut history = history("moveto");
+        history.add(record_at("a", "one", 100));
+        history.add(record_at("b", "two", 200));
+        history.add(record_at("c", "three", 300));
+        history.toggle_pin("c");
+        assert_eq!(history.move_to("c", 3), None);
+        assert_eq!(history.move_to("a", 2), Some(2));
+        let ids: Vec<&str> = history.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, vec!["c", "a", "b"]);
+        let info = history.move_info("b").unwrap();
+        assert_eq!((info.from, info.to), (2, 3));
+    }
+
+    #[test]
+    fn remove_and_undo_round_trip() {
+        let mut history = history("undo");
+        history.add(record_at("a", "one", 100));
+        history.add(record_at("b", "two", 200));
+        assert_eq!(history.remove(&["b".to_string()]), 1);
+        assert_eq!(history.items.len(), 1);
+        assert_eq!(history.undo_depth(), 1);
+        let batch = history.undo().expect("batch");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(history.items.len(), 2);
+        assert_eq!(history.undo_depth(), 0);
+    }
+
+    #[test]
+    fn clear_can_be_undone() {
+        let mut history = history("clear");
+        history.add(record_at("a", "one", 100));
+        history.add(record_at("b", "two", 200));
+        assert_eq!(history.clear(), 2);
+        assert!(history.items.is_empty());
+        history.undo();
+        assert_eq!(history.items.len(), 2);
+    }
+
+    #[test]
+    fn expired_entries_leave_without_an_undo_step_and_keep_pinned_ones() {
+        let mut history = history("expired");
+        history.add(record_at("old", "old", 100));
+        history.add(record_at("keep", "keep", 400));
+        history.add(file_record("file", "photo.png", "sha-a", 100));
+        let path = crate::paths::write_cache("expired", "photo.png", b"png").unwrap();
+        history.mark_cached("file", &path);
+        history.toggle_pin("file");
+        assert_eq!(history.remove_expired(300), 1);
+        let ids: Vec<&str> = history.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, vec!["file", "keep"]);
+        assert_eq!(history.undo_depth(), 0);
+        assert!(std::path::Path::new(&path).exists());
+        assert_eq!(history.remove_expired(300), 0);
+        history.toggle_pin("file");
+        assert_eq!(history.remove_expired(300), 1);
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[test]
+    fn duplicate_keeps_content_and_gets_a_new_id() {
+        let mut history = history("duplicate");
+        history.add(record_at("a", "one", 100));
+        assert!(history.duplicate("a", "copy".to_string(), 500));
+        assert_eq!(history.items.len(), 2);
+        assert_eq!(history.items[0].id, "copy");
+        assert_eq!(history.items[0].text, "one");
+        assert_eq!(history.items[0].rank(), 500);
+    }
+
+    #[test]
+    fn search_handles_case_regex_and_notes() {
+        let mut history = history("search");
+        history.add(record_at("a", "Hello World", 100));
+        history.add(record_at("b", "clip%sync", 200));
+        history.update_note("a", "daily note");
+        assert_eq!(history.search("hello", false, false), vec![1]);
+        assert!(history.search("hello", false, true).is_empty());
+        assert_eq!(history.search("^clip.*sync$", true, true).len(), 1);
+        assert_eq!(history.search("^clip.*sync$", false, true).len(), 0);
+        assert_eq!(history.search("daily", false, false).len(), 1);
+        assert!(history.search("[", true, false).is_empty());
+    }
+
+    #[test]
+    fn file_updates_keep_the_local_cache_when_the_bytes_match() {
+        let mut history = history("file-merge");
+        history.add(file_record("f", "photo.png", "sha-a", 100));
+        let path = crate::paths::write_cache("file-merge", "photo.png", b"png").unwrap();
+        history.mark_cached("f", &path);
+        let incoming = file_record("f", "photo.png", "sha-a", 200);
+        assert!(!history.add(incoming));
+        let file = history.file("f").unwrap();
+        assert!(file.cached);
+        assert_eq!(file.local_path.as_deref(), Some(path.as_str()));
+        assert_eq!(history.items.len(), 1);
+        history.remove(&["f".to_string()]);
+        crate::paths::delete_cache(Some(&path));
+    }
+
+    #[test]
+    fn the_same_file_with_another_id_is_deduped_by_hash() {
+        let mut history = history("file-dup");
+        history.add(file_record("a", "photo.png", "sha-a", 100));
+        history.mark_cached("a", "/cache/a/photo.png");
+        let mut incoming = file_record("b", "photo.png", "sha-a", 200);
+        incoming.file.as_mut().unwrap().link = "https://example.test/b.bin".to_string();
+        let added = history.insert(incoming);
+        assert_eq!(history.items.len(), 1);
+        assert_eq!(history.items[0].id, "a");
+        assert_eq!(history.items[0].ts, 200);
+        assert!(!added.inserted);
+        assert_eq!(added.id, "a");
+        let file = history.file("a").unwrap();
+        assert_eq!(file.link, "https://example.test/b.bin");
+        assert!(file.cached);
+        assert_eq!(file.local_path.as_deref(), Some("/cache/a/photo.png"));
+        assert_eq!(history.file("b"), None);
+    }
+
+    #[test]
+    fn deleting_a_file_drops_the_cache_and_undo_comes_back_uncached() {
+        let mut history = history("file-cache");
+        history.add(file_record("f", "photo.png", "sha-a", 100));
+        let path = crate::paths::write_cache("file-delete", "photo.png", b"png").unwrap();
+        history.mark_cached("f", &path);
+        history.remove(&["f".to_string()]);
+        assert!(!std::path::Path::new(&path).exists());
+        history.undo().expect("batch");
+        let file = history.file("f").unwrap();
+        assert!(!file.cached);
+        assert_eq!(file.local_path, None);
+    }
+
+    #[test]
+    fn a_duplicate_shares_the_cache_until_the_last_reference_is_gone() {
+        let mut history = history("file-shared");
+        history.add(file_record("f", "photo.png", "sha-a", 100));
+        let path = crate::paths::write_cache("file-shared", "photo.png", b"png").unwrap();
+        history.mark_cached("f", &path);
+        history.duplicate("f", "copy".to_string(), 200);
+        history.remove(&["copy".to_string()]);
+        assert!(std::path::Path::new(&path).exists());
+        assert_eq!(
+            history.file("f").unwrap().local_path.as_deref(),
+            Some(path.as_str())
+        );
+        history.remove(&["f".to_string()]);
+        crate::paths::delete_cache(Some(&path));
+    }
+
+    #[test]
+    fn export_uses_the_shared_json_shape() {
+        let mut history = history("export");
+        history.add(record_at("a", "one", 100));
+        history.update_note("a", "keep");
+        let raw = history.export_json(&["a".to_string()]);
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed[0]["senderId"], "me");
+        assert_eq!(parsed[0]["note"], "keep");
+        assert!(parsed[0].get("file").is_some());
+        assert!(parsed[0].get("order").is_some());
+    }
+}

@@ -1,0 +1,60 @@
+[package]
+name = "clipsync-tauri"
+description = "ClipSync Tauri desktop client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "clipsync_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "~2.7.3", features = [] }
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
+cc = "1"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+openh264 = { version = "0.9", default-features = false, features = ["source"] }
+mp4 = "0.14"
+
+[dependencies]
+tauri = { version = "~2.12.4", features = ["tray-icon"] }
+clipsync-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+arboard = { workspace = true }
+base64 = { workspace = true }
+qrcode = { workspace = true }
+xcap = { workspace = true }
+ureq = { workspace = true }
+dirs = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
+image = { workspace = true }
+regex = { workspace = true }
+sys-locale = { workspace = true }
+tokio = { workspace = true }
+
+tauri-plugin-dialog = "2"
+tauri-plugin-global-shortcut = "2"
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+drag = "2.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSData", "NSGeometry", "NSString", "NSURL"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSImage",
+    "NSMenu",
+    "NSMenuItem",
+    "NSScreen",
+    "NSWindow",
+    "NSView",
+    "NSResponder",
+    "NSPasteboard",
+] }

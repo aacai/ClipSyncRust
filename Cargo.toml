@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/clipsync-core", "crates/clipsync-desktop"]
+members = ["crates/clipsync-core", "crates/clipsync-desktop", "apps/clipsync/src-tauri"]
 
 [workspace.package]
 version = "0.0.10"

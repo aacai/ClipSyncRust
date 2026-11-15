@@ -1,0 +1,24 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "主窗口与托盘的能力",
+  "windows": ["main", "record-timer", "picker", "preview"],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:tray:default",
+    "core:menu:default",
+    "core:app:allow-app-hide",
+    "core:app:allow-app-show",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-unminimize",
+    "core:window:allow-set-focus",
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close"
+  ]
+}
