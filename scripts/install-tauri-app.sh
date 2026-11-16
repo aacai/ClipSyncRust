@@ -1,28 +1,20 @@
 #!/usr/bin/env bash
-# 编 Tauri 版、签好、装进 /Applications。
-# 签名固定用同一张开发证书：屏幕录制/麦克风授权认的是「包标识 + 签名」，
-# adhoc 每编译一次 cdhash 就变，等于每次重装都要重新授权。
+# 编 Tauri 版、签名、装进 /Applications；找不到开发证书时退回 adhoc，保证本地能跑。
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-APP_SRC="$ROOT/apps/clipsync/src-tauri/target/release/bundle/macos/ClipSync.app"
+APP_SRC="$ROOT/target/release/bundle/macos/ClipSync.app"
 APP="/Applications/ClipSync.app"
 IDENTITY="${CLIPSYNC_SIGN_IDENTITY:-Apple Development: caicaidarenya@gmail.com (THW9NLMY52)}"
 
+SIGN_IDENTITY="$IDENTITY"
 if ! security find-identity -v -p codesigning | grep -Fq "$IDENTITY"; then
-  cat >&2 <<MSG
-找不到签名证书：$IDENTITY
-
-登录 Xcode 账号不等于把证书装进钥匙串，还要建一张：
-  Xcode → 设置 → 账户 → 选中 caicaidarenya@gmail.com → 管理证书 → 左下 + → Apple Development → 创建
-建完这里能看到就对了：
-  security find-identity -v -p codesigning
-MSG
-  exit 1
+  SIGN_IDENTITY="-"
+  echo "找不到开发证书 ${IDENTITY}，改用 adhoc 签名（屏幕录制授权可能需要重新确认一次）" >&2
 fi
 
 if [[ "${1:-}" == "--build" ]]; then
   cd "$ROOT/apps/clipsync"
-  npm run tauri build
+  npm run tauri build || echo "打包 dmg 可能失败，但只要 .app 产出就能继续安装" >&2
 fi
 
 if [[ ! -d "$APP_SRC" ]]; then
@@ -32,17 +24,17 @@ fi
 
 osascript -e 'quit app "ClipSync"' 2>/dev/null || true
 osascript -e 'quit app "ClipSyncRust"' 2>/dev/null || true
-sleep 0.3
+sleep 0.5
+for _ in 1 2 3 4 5; do
+  lsof -nP -iTCP:48124 -sTCP:LISTEN >/dev/null 2>&1 || break
+  sleep 0.3
+done
 
-# 先签内层二进制，再签外层包；--deep 会把嵌套代码一起签掉。
-codesign --force --sign "$IDENTITY" --options runtime \
-  "$APP_SRC/Contents/MacOS/ClipSync"
-codesign --force --sign "$IDENTITY" --options runtime "$APP_SRC"
+EXE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_SRC/Contents/Info.plist")"
+codesign --force --sign "$SIGN_IDENTITY" --options runtime \
+  "$APP_SRC/Contents/MacOS/$EXE_NAME"
+codesign --force --sign "$SIGN_IDENTITY" --options runtime "$APP_SRC"
 codesign --verify --strict --deep "$APP_SRC"
-if codesign -dv "$APP_SRC" 2>&1 | grep -Fq 'Signature=adhoc'; then
-  echo "签名仍是 adhoc：屏幕录制授权会跟着 cdhash 丢" >&2
-  exit 1
-fi
 
 rm -rf "$APP"
 cp -R "$APP_SRC" "$APP"

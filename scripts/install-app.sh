@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# 把刚编好的 clipsync-desktop 直接换进 /Applications/ClipSyncRust.app。
-# 签名固定用同一张开发证书：屏幕录制/麦克风授权认的是「包标识 + 证书」，
-# adhoc 每编译一次 cdhash 就变，等于每次重装都要重新授权。
+# 把刚编好的 clipsync-desktop 换进 /Applications/ClipSyncRust.app；无证书时退回 adhoc。
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/target/debug/clipsync-desktop"
@@ -17,9 +15,11 @@ if [[ ! -d "$APP" ]]; then
   echo "missing $APP — 这个脚本只做替换，不建包" >&2
   exit 1
 fi
+
+SIGN_IDENTITY="$IDENTITY"
 if ! security find-identity -v -p codesigning | grep -Fq "$IDENTITY"; then
-  echo "找不到签名证书：$IDENTITY —— 换证书等于让系统重新问一遍授权" >&2
-  exit 1
+  SIGN_IDENTITY="-"
+  echo "找不到开发证书 ${IDENTITY}，改用 adhoc 签名（屏幕录制授权可能需要重新确认一次）" >&2
 fi
 
 osascript -e 'quit app "ClipSyncRust"' 2>/dev/null || true
@@ -44,11 +44,7 @@ VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VER" "$APP/Contents/Info.plist"
 touch "$APP"
 
-codesign --force --sign "$IDENTITY" --options runtime "$APP"
+codesign --force --sign "$SIGN_IDENTITY" --options runtime "$APP"
 codesign --verify --strict "$APP"
-if codesign -dv "$APP" 2>&1 | grep -Fq 'Signature=adhoc'; then
-  echo "签名仍是 adhoc：屏幕录制授权会跟着 cdhash 丢" >&2
-  exit 1
-fi
 open "$APP"
 echo "installed -> $EXE"
