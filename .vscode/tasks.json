@@ -11,7 +11,7 @@
     {
       "label": "desktop: run",
       "type": "shell",
-      "command": "cargo build -p clipsync-desktop && bash scripts/install-app.sh",
+      "command": "bash scripts/install-tauri-app.sh --build",
       "group": "none",
       "presentation": {
         "reveal": "always",
@@ -24,11 +24,50 @@
     {
       "label": "desktop: build",
       "type": "shell",
-      "command": "cargo build -p clipsync-desktop && bash scripts/install-app.sh",
+      "command": "bash scripts/install-tauri-app.sh --build",
       "group": {
         "kind": "build",
         "isDefault": true
       },
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared",
+        "clear": true
+      },
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "desktop: dev",
+      "type": "shell",
+      "command": "cd apps/clipsync && npm run tauri dev",
+      "group": "none",
+      "isBackground": true,
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": true,
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "legacy: run",
+      "type": "shell",
+      "command": "cargo build -p clipsync-desktop && bash scripts/install-app.sh",
+      "group": "none",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": true,
+        "clear": true
+      },
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "legacy: build",
+      "type": "shell",
+      "command": "cargo build -p clipsync-desktop && bash scripts/install-app.sh",
+      "group": "none",
       "presentation": {
         "reveal": "silent",
         "panel": "shared",
