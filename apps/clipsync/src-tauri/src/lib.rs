@@ -222,9 +222,11 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building ClipSync")
-        .run(|app, event| {
-            if let tauri::RunEvent::Reopen { .. } = event {
-                tray::show_window(app);
+        .run(|app, event| match event {
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => tray::show_window(app),
+            _ => {
+                let _ = app;
             }
         });
 }

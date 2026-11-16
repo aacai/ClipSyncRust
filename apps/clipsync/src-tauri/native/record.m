@@ -29,6 +29,12 @@ static void set_error(NSString *text) {
     pthread_mutex_unlock(&g_lock);
 }
 
+static BOOL os_at_least(int major, int minor) {
+    NSOperatingSystemVersion version = NSProcessInfo.processInfo.operatingSystemVersion;
+    if (version.majorVersion != major) return version.majorVersion > major;
+    return version.minorVersion >= minor;
+}
+
 static void pump(NSDate *until) {
     [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:until];
 }
@@ -220,7 +226,7 @@ int cs_record_start(double x, double y, double w, double h, int mic, int system_
         config.capturesAudio = system_audio ? YES : NO;
         config.captureMicrophone = mic ? YES : NO;
         // 指定输入设备（macOS 15 起 ScreenCaptureKit 才让挑）；空串沿用系统默认输入。
-        if (@available(macOS 15.0, *)) {
+        if (os_at_least(15, 0)) {
             if (mic && mic_device != NULL && mic_device[0] != 0) {
                 config.microphoneCaptureDeviceID = [NSString stringWithUTF8String:mic_device];
             }
@@ -310,7 +316,7 @@ int cs_record_active(void) {
 const char *cs_record_inputs(void) {
     @autoreleasepool {
         NSMutableArray<AVCaptureDeviceType> *types = [NSMutableArray array];
-        if (@available(macOS 14.0, *)) {
+        if (os_at_least(14, 0)) {
             [types addObject:AVCaptureDeviceTypeMicrophone];
             [types addObject:AVCaptureDeviceTypeExternal];
         } else {
