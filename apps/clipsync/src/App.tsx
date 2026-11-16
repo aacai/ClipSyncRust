@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AppShell, Group, Nav, NavItem, Row, Surface, Text, toast, useOink } from 'oink-ui';
+import { AppShell, Group, Icon, Nav, NavGroup, NavItem, Row, Surface, Text, toast, useAppShell, useOink } from 'oink-ui';
 import { listen } from '@tauri-apps/api/event';
 import { ClipIcon } from './components/ClipIcon';
 import { TitleBar } from './components/TitleBar';
@@ -160,49 +160,22 @@ export function App() {
   const hovering = useFileDrop(onDrop);
 
   return (
-    <AppShell contained collapsed={false} className="app-shell">
+    <AppShell contained collapsed="auto" collapseBelow="md" className="app-shell">
       <AppShell.Header className="title-bar-host">
         <TitleBar status={app.status} room={app.room} peers={app.peers.length} memory={memory} />
       </AppShell.Header>
 
-      <AppShell.Sidebar className="sidebar" width={220}>
-        <div className="brand">
-          <span className="brand__mark" aria-hidden="true">C</span>
-          <div>
-            <Text variant="label">ClipSync</Text>
-            <Text variant="micro" tone="subtle">剪贴板同步</Text>
-          </div>
-        </div>
-
-        <Nav aria-label="主导航" className="nav">
-          <NavItem current={screen === 'clips'} icon={<ClipIcon name="clipboard" />} badge={String(app.items.length)} onClick={() => setScreen('clips')}>剪贴板</NavItem>
-          <NavItem current={screen === 'devices'} icon={<ClipIcon name="devices" />} badge={String(app.peers.length)} onClick={() => setScreen('devices')}>设备</NavItem>
-          <NavItem current={screen === 'settings'} icon={<ClipIcon name="settings" />} onClick={() => setScreen('settings')}>设置</NavItem>
-        </Nav>
-
-        <div className="sidebar__footer">
-          <Surface size="sm">
-            <Group compact>
-              <Row
-                label={statusLabel(app.status)}
-                description={app.room ?? '点击加入房间'}
-                leading={<span className={`status-dot${isOnline(app.status) ? ' status-dot--on' : ''}`} />}
-                onClick={() => setRoomDialogOpen(true)}
-                interactive
-              />
-              <Row
-                label="端到端加密"
-                description={app.room ? '点击查看安全码' : '点击加入房间'}
-                onClick={() => {
-                  if (app.room) setSafetyOpen(true);
-                  else setRoomDialogOpen(true);
-                }}
-                interactive
-              />
-              <Row label="本机记录" description={`${app.items.length} 条`} />
-            </Group>
-          </Surface>
-        </div>
+      <AppShell.Sidebar className="sidebar" width={224} drawerWidth={300}>
+        <SidebarContent
+          screen={screen}
+          onScreen={setScreen}
+          status={app.status}
+          room={app.room}
+          itemCount={app.items.length}
+          peerCount={app.peers.length}
+          onRoom={() => setRoomDialogOpen(true)}
+          onSafety={() => (app.room ? setSafetyOpen(true) : setRoomDialogOpen(true))}
+        />
       </AppShell.Sidebar>
 
       <AppShell.Main className="main">
@@ -274,6 +247,97 @@ export function App() {
         </div>
       )}
     </AppShell>
+  );
+}
+
+interface SidebarContentProps {
+  screen: Screen;
+  onScreen: (screen: Screen) => void;
+  status: unknown;
+  room: string | null;
+  itemCount: number;
+  peerCount: number;
+  onRoom: () => void;
+  onSafety: () => void;
+}
+
+function SidebarContent({ screen, onScreen, status, room, itemCount, peerCount, onRoom, onSafety }: SidebarContentProps) {
+  const { rail, sidebarCollapsed, toggleRail } = useAppShell();
+
+  return (
+    <>
+      <div className="brand">
+        <span className="brand__mark" aria-hidden="true">C</span>
+        <div className="brand__text">
+          <Text variant="label">ClipSync</Text>
+          <Text variant="micro" tone="subtle">剪贴板同步</Text>
+        </div>
+        {!sidebarCollapsed && (
+          <button type="button" className="brand__rail" aria-label="收起侧栏" onClick={toggleRail}>
+            <Icon name="chevron-left" size={15} />
+          </button>
+        )}
+      </div>
+
+      <Nav aria-label="主导航" className="nav">
+        <NavGroup label="工作区">
+          <NavItem
+            current={screen === 'clips'}
+            icon={<ClipIcon name="clipboard" />}
+            badge={String(itemCount)}
+            label="剪贴板"
+            onClick={() => onScreen('clips')}
+          >
+            剪贴板
+          </NavItem>
+          <NavItem
+            current={screen === 'devices'}
+            icon={<ClipIcon name="devices" />}
+            badge={String(peerCount)}
+            label="设备"
+            onClick={() => onScreen('devices')}
+          >
+            设备
+          </NavItem>
+        </NavGroup>
+        <NavGroup label="偏好">
+          <NavItem
+            current={screen === 'settings'}
+            icon={<ClipIcon name="settings" />}
+            label="设置"
+            onClick={() => onScreen('settings')}
+          >
+            设置
+          </NavItem>
+        </NavGroup>
+      </Nav>
+
+      <div className="sidebar__footer">
+        <Surface size="sm">
+          <Group compact>
+            <Row
+              label={statusLabel(status)}
+              description={room ?? '点击加入房间'}
+              leading={<span className={`status-dot${isOnline(status) ? ' status-dot--on' : ''}`} />}
+              onClick={onRoom}
+              interactive
+            />
+            <Row
+              label="端到端加密"
+              description={room ? '点击查看安全码' : '点击加入房间'}
+              onClick={onSafety}
+              interactive
+            />
+            <Row label="本机记录" description={`${itemCount} 条`} />
+          </Group>
+        </Surface>
+        {rail && !sidebarCollapsed && (
+          <button type="button" className="brand__rail brand__rail--foot" aria-label="展开侧栏" onClick={toggleRail}>
+            <Icon name="chevron-right" size={15} />
+          </button>
+        )}
+      </div>
+    </>
   );
 }
 

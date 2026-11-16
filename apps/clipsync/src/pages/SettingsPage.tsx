@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Button, Group, Hotkey, Icon, Row, Slider, Surface, Switch, Text, toast, useOink, type Accent } from 'oink-ui';
+import { Button, Group, Hotkey, Icon, Page, PageHeader, Row, Slider, Surface, Switch, Text, toast, useOink, type Accent } from 'oink-ui';
 import { ClipIcon } from '../components/ClipIcon';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { isTauri } from '../lib/api';
@@ -40,9 +40,9 @@ export function SettingsPage({ app, onOpenAbout, onBack }: SettingsPageProps) {
 
   if (!prefs) {
     return (
-      <div className="page">
+      <Page size="lg" padded={false} className="page">
         <Text variant="caption" tone="subtle">正在载入…</Text>
-      </div>
+      </Page>
     );
   }
 
@@ -192,18 +192,16 @@ export function SettingsPage({ app, onOpenAbout, onBack }: SettingsPageProps) {
   };
 
   return (
-    <div className="page">
-      <header className="page__header">
-        <div className="settings__heading">
+    <Page size="lg" padded={false} className="page">
+      <PageHeader
+        title="设置"
+        description="外观、同步与剪贴板行为"
+        breadcrumb={
           <Button variant="ghost" size="sm" leading={<ClipIcon name="arrow-back" />} onClick={onBack}>
             返回
           </Button>
-          <div>
-            <Text as="h1" variant="h2">设置</Text>
-            <Text variant="caption" tone="subtle">外观、同步与剪贴板行为</Text>
-          </div>
-        </div>
-      </header>
+        }
+      />
 
       <div className="settings">
         <section>
@@ -525,7 +523,7 @@ export function SettingsPage({ app, onOpenAbout, onBack }: SettingsPageProps) {
         }}
         onClose={() => setChoice(null)}
       />
-    </div>
+    </Page>
   );
 }
 

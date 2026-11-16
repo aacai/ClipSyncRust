@@ -16,8 +16,8 @@
         "title": "ClipSync",
         "width": 960,
         "height": 640,
-        "minWidth": 680,
-        "minHeight": 460,
+        "minWidth": 560,
+        "minHeight": 400,
         "decorations": false,
         "center": true
       }

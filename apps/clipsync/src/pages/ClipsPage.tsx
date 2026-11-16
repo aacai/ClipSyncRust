@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent } from 'react';
-import { Button, Card, EmptyState, Icon, SearchInput, Segmented, Text, toast } from 'oink-ui';
+import { Button, Card, EmptyState, Icon, Page, PageHeader, SearchInput, Segmented, Text, Toolbar, toast } from 'oink-ui';
 import { call, isTauri } from '../lib/api';
 import type { ClipRecord } from '../lib/types';
 import type { RecordStatus } from '../hooks/useClipsync';
@@ -456,20 +456,20 @@ export function ClipsPage({ app, onOpenRoomDialog, onNewEntry, searchRef }: Clip
 
   if (!app.ready) {
     return (
-      <div className="page">
+      <Page size="lg" padded={false} className="page">
         <Text variant="caption" tone="subtle">正在载入…</Text>
-      </div>
+      </Page>
     );
   }
 
   return (
-    <div className="page">
-      <header className="page__header">
-        <div>
-          <Text as="h1" variant="h2">剪贴板</Text>
-          <Text variant="caption" tone="subtle">所有设备的最新内容，都会同步到这里</Text>
-        </div>
-        <div className="page__header-actions">
+    <Page size="lg" padded={false} className="page">
+      <PageHeader
+        title="剪贴板"
+        description="所有设备的最新内容，都会同步到这里"
+        actions={
+          <Toolbar wrap className="page__header-actions" aria-label="剪贴板操作" gap={2}>
+
           <Button
             variant="soft"
             leading={<ClipIcon name="send" />}
@@ -502,8 +502,9 @@ export function ClipsPage({ app, onOpenRoomDialog, onNewEntry, searchRef }: Clip
           <Button variant="accent" leading={<ClipIcon name="plus" />} onClick={onNewEntry}>
             新建
           </Button>
-        </div>
-      </header>
+          </Toolbar>
+        }
+      />
 
       {badRegex && (
         <Text variant="caption" tone="danger">正则表达式写错了，改一下再搜</Text>
@@ -518,8 +519,8 @@ export function ClipsPage({ app, onOpenRoomDialog, onNewEntry, searchRef }: Clip
         </div>
       )}
 
-      <div className="page__toolbar">
-        <SearchInput ref={searchRef} value={query} onChange={setQuery} placeholder="搜索内容、来源设备…" />
+      <Toolbar wrap className="page__toolbar" aria-label="筛选剪贴板" gap={2}>
+        <SearchInput ref={searchRef} value={query} onChange={setQuery} placeholder="搜索内容、来源设备…" className="toolbar__search" />
         <button
           type="button"
           className="chip"
@@ -573,10 +574,10 @@ export function ClipsPage({ app, onOpenRoomDialog, onNewEntry, searchRef }: Clip
         <Button variant="ghost" size="sm" leading={<ClipIcon name="trash" />} onClick={() => setDeletingHistory(true)}>
           删除历史
         </Button>
-      </div>
+      </Toolbar>
 
       {devices.length > 0 && (
-        <div className="page__toolbar page__toolbar--devices">
+        <Toolbar wrap className="page__toolbar page__toolbar--devices" aria-label="按来源筛选" gap={2}>
           <Segmented<DeviceScope>
             value={device}
             onChange={setDevice}
@@ -586,7 +587,7 @@ export function ClipsPage({ app, onOpenRoomDialog, onNewEntry, searchRef }: Clip
               ...devices.map((name) => ({ value: name, label: name })),
             ]}
           />
-        </div>
+        </Toolbar>
       )}
 
       {visible.length === 0 ? (
@@ -771,7 +772,7 @@ export function ClipsPage({ app, onOpenRoomDialog, onNewEntry, searchRef }: Clip
         onClose={() => setDeletingHistory(false)}
         onDeleted={() => void app.refresh()}
       />
-    </div>
+    </Page>
   );
 }
 

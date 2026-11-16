@@ -1,4 +1,4 @@
-import { Button, Card, Text } from 'oink-ui';
+import { Button, Card, Page, PageHeader, Text } from 'oink-ui';
 import { ClipIcon } from '../components/ClipIcon';
 import type { ClipsyncState } from '../hooks/useClipsync';
 
@@ -14,16 +14,16 @@ export function DevicesPage({ app, onOpenRoomDialog }: DevicesPageProps) {
     : '';
 
   return (
-    <div className="page">
-      <header className="page__header">
-        <div>
-          <Text as="h1" variant="h2">设备</Text>
-          <Text variant="caption" tone="subtle">同一房间内的设备会自动发现并同步</Text>
-        </div>
-        <Button variant="accent" leading={<ClipIcon name="plus" />} onClick={onOpenRoomDialog}>
-          {app.room ? '切换房间' : '加入房间'}
-        </Button>
-      </header>
+    <Page size="lg" padded={false} className="page">
+      <PageHeader
+        title="设备"
+        description="同一房间内的设备会自动发现并同步"
+        actions={
+          <Button variant="accent" leading={<ClipIcon name="plus" />} onClick={onOpenRoomDialog}>
+            {app.room ? '切换房间' : '加入房间'}
+          </Button>
+        }
+      />
 
       {safety && (
         <Card size="sm" className="safety-card">
@@ -79,6 +79,6 @@ export function DevicesPage({ app, onOpenRoomDialog }: DevicesPageProps) {
       {app.room && (
         <Button variant="ghost" onClick={onOpenRoomDialog}>房间设置与退出</Button>
       )}
-    </div>
+    </Page>
   );
 }
