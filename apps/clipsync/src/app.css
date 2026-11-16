@@ -67,6 +67,7 @@ body {
 
 .title-bar--mac {
   position: relative;
+  padding-left: 84px;
 }
 
 .title-bar__title {
