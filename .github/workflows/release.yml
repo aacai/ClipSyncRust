@@ -52,7 +52,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
-            libpipewire-0.3-dev libspa-0.2-dev libasound2-dev libclang-dev
+            libpipewire-0.3-dev libspa-0.2-dev libasound2-dev libclang-dev libgbm-dev libegl1-mesa-dev
       - name: Build bundle and publish release
         if: startsWith(github.ref, 'refs/tags/')
         uses: tauri-apps/tauri-action@v0
