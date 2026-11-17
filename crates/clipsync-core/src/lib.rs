@@ -2,6 +2,7 @@ pub mod crypto;
 pub mod engine;
 pub mod envelope;
 pub mod files;
+pub mod lan;
 pub mod link;
 pub mod mqtt;
 pub mod protocol;

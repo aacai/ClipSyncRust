@@ -14,6 +14,8 @@ pub const RETENTION_CHOICES: [u32; 4] = [7, 30, 90, 365];
 const DEFAULT_RETENTION_DAYS: u32 = 30;
 pub const MAX_BACKGROUND_DIM: f32 = 0.9;
 const DEFAULT_BACKGROUND_DIM: f32 = 0.45;
+pub const MAX_GLASS_FROST: f32 = 1.0;
+const DEFAULT_GLASS_FROST: f32 = 0.55;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThemeMode {
@@ -61,6 +63,14 @@ fn dim_of(raw: f32) -> f32 {
     }
 }
 
+fn frost_of(raw: f32) -> f32 {
+    if raw.is_finite() {
+        raw.clamp(0.0, MAX_GLASS_FROST)
+    } else {
+        DEFAULT_GLASS_FROST
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct StoredPreferences {
@@ -95,6 +105,7 @@ struct StoredPreferences {
     last_room_code: Option<String>,
     background: Option<String>,
     background_dim: f32,
+    glass_frost: f32,
 }
 
 fn de_theme<'de, D>(deserializer: D) -> Result<ThemeMode, D::Error>
@@ -148,6 +159,7 @@ impl Default for StoredPreferences {
             last_room_code: None,
             background: None,
             background_dim: DEFAULT_BACKGROUND_DIM,
+            glass_frost: DEFAULT_GLASS_FROST,
         }
     }
 }
@@ -276,6 +288,10 @@ impl Preferences {
         dim_of(self.stored.background_dim)
     }
 
+    pub fn glass_frost(&self) -> f32 {
+        frost_of(self.stored.glass_frost)
+    }
+
     pub fn set_background(&mut self, path: Option<String>) {
         self.stored.background = path
             .map(|path| path.trim().to_string())
@@ -285,6 +301,11 @@ impl Preferences {
 
     pub fn set_background_dim(&mut self, dim: f32) {
         self.stored.background_dim = dim_of(dim);
+        self.save();
+    }
+
+    pub fn set_glass_frost(&mut self, frost: f32) {
+        self.stored.glass_frost = frost_of(frost);
         self.save();
     }
 
@@ -717,6 +738,24 @@ mod tests {
         let loaded = super::Preferences::open(path.clone());
         assert_eq!(loaded.background_path(), Some("/tmp/wall.png"));
         assert_eq!(loaded.background_dim(), 0.0);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn glass_frost_is_clamped_and_persisted() {
+        let path = prefs("glass-frost");
+        cleanup(&path);
+        {
+            let mut loaded = super::Preferences::open(path.clone());
+            assert!((loaded.glass_frost() - 0.55).abs() < f32::EPSILON);
+            loaded.set_glass_frost(0.8);
+            assert!((loaded.glass_frost() - 0.8).abs() < f32::EPSILON);
+            loaded.set_glass_frost(5.0);
+            assert_eq!(loaded.glass_frost(), super::MAX_GLASS_FROST);
+            loaded.set_glass_frost(-1.0);
+            assert_eq!(loaded.glass_frost(), 0.0);
+        }
+        assert_eq!(super::Preferences::open(path.clone()).glass_frost(), 0.0);
         cleanup(&path);
     }
 

@@ -176,9 +176,10 @@ fn presence_json_is_byte_identical_to_kotlin() {
             online: true,
             ts: 1700000000000,
             answer: false,
+            lan: None,
         })
         .unwrap(),
-        "{\"dev\":\"d1\",\"name\":\"Pixel\",\"os\":\"Android\",\"online\":true,\"ts\":1700000000000,\"answer\":false}"
+        "{\"dev\":\"d1\",\"name\":\"Pixel\",\"os\":\"Android\",\"online\":true,\"ts\":1700000000000,\"answer\":false,\"lan\":null}"
     );
     assert!(serde_json::from_str::<PresencePayload>(
         "{\"dev\":\"d1\",\"name\":\"Pixel\",\"os\":\"Android\",\"online\":true,\"ts\":1,\"answer\":true}"

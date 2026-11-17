@@ -16,6 +16,7 @@ use clipsync_core::engine::{Clip, Config, EngineHandle, Event, FileUpload, Peer,
 use clipsync_core::files::{
     human_size, is_image, mime_for_name, sanitize_file_name, MAX_FILE_BYTES,
 };
+use clipsync_core::lan::{blob_dir, LanPeer};
 use clipsync_core::protocol::{clip_topic, room_hash};
 use clipsync_core::RoomCrypto;
 
@@ -27,6 +28,7 @@ use crate::jobs::{
 };
 use crate::settings::{
     normalize_nickname, Language, Preferences, Settings, ThemeMode, MAX_BACKGROUND_DIM,
+    MAX_GLASS_FROST,
     RETENTION_CHOICES,
 };
 use crate::store::{FileInfo, History, Record, KIND_FILE, KIND_TEXT};
@@ -80,6 +82,7 @@ pub struct ClipSyncApp {
     clipboard: ClipboardWatcher,
     status: Status,
     peers: Vec<Peer>,
+    lan_peers: Vec<LanPeer>,
     mismatch: Vec<String>,
     room_code: String,
     password: String,
@@ -209,6 +212,7 @@ enum SettingsAction {
     Background,
     ClearBackground,
     BackgroundDim(f32),
+    GlassFrost(f32),
     Retention,
     Hotkey,
     Nickname,
@@ -451,6 +455,7 @@ impl ClipSyncApp {
             clipboard: ClipboardWatcher::new(),
             status: Status::Idle,
             peers: Vec::new(),
+            lan_peers: Vec::new(),
             mismatch: Vec::new(),
             room_code: String::new(),
             password: String::new(),
@@ -656,6 +661,7 @@ impl ClipSyncApp {
                     self.status = status;
                 }
                 Event::Peers(peers) => self.peers = peers,
+                Event::LanPeers(peers) => self.lan_peers = peers,
                 Event::KeyMismatch(names) => self.mismatch = names,
                 Event::Clip(clip) => self.on_clip(clip),
                 Event::FileTooLarge(name) => self.notify_error(format!(
@@ -1013,7 +1019,10 @@ impl ClipSyncApp {
             crypto: self.room_crypto.clone()?,
             client: self.client.clone(),
             clip_topic: clip_topic(&self.room_hash),
+            room_hash: self.room_hash.clone(),
             live: self.live_uploads.clone(),
+            lan_peers: self.lan_peers.clone(),
+            lan_dir: blob_dir(),
         })
     }
 
@@ -1094,6 +1103,7 @@ impl ClipSyncApp {
         self.joined = true;
         self.status = Status::Connecting;
         self.peers.clear();
+        self.lan_peers.clear();
         self.mismatch.clear();
         self.overlay = None;
         self.pick_mode = false;
@@ -1110,6 +1120,7 @@ impl ClipSyncApp {
         self.joined = false;
         self.status = Status::Idle;
         self.peers.clear();
+        self.lan_peers.clear();
         self.mismatch.clear();
         self.overlay = None;
         self.pick_mode = false;
@@ -1977,6 +1988,13 @@ impl ClipSyncApp {
                                 ) {
                                     action = Some(SettingsAction::Language);
                                 }
+                                let frost = self.preferences.glass_frost();
+                                settings_divider(ui);
+                                if let Some(next) =
+                                    settings_slider_row(ui, "磨砂度", frost, MAX_GLASS_FROST)
+                                {
+                                    action = Some(SettingsAction::GlassFrost(next));
+                                }
                                 let has_background = self.preferences.background_path().is_some();
                                 let dim = self.preferences.background_dim();
                                 settings_divider(ui);
@@ -2364,6 +2382,11 @@ impl ClipSyncApp {
                 self.preferences.set_background_dim(dim);
                 ctx.request_repaint();
             }
+            SettingsAction::GlassFrost(frost) => {
+                self.preferences.set_glass_frost(frost);
+                theme::set_frost_amount(frost);
+                ctx.request_repaint();
+            }
             SettingsAction::Retention => self.open(Overlay::Choice(SettingsChoice::Retention)),
             SettingsAction::Hotkey => self.open(Overlay::Hotkey {
                 record: false,
@@ -2627,6 +2650,7 @@ impl ClipSyncApp {
     }
 
     fn sync_background(&mut self) {
+        theme::set_frost_amount(self.preferences.glass_frost());
         let key = self
             .preferences
             .background_path()
@@ -4580,6 +4604,13 @@ impl ClipSyncApp {
                                                 .size(10.5)
                                                 .color(theme::p().faint),
                                         );
+                                        if self.lan_peers.iter().any(|p| p.id == peer.id) {
+                                            ui.label(
+                                                RichText::new("局域网")
+                                                    .size(10.0)
+                                                    .color(theme::p().green),
+                                            );
+                                        }
                                     });
                                     ui.with_layout(
                                         Layout::right_to_left(Align::Center),

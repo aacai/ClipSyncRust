@@ -237,6 +237,7 @@ impl Harness {
             online,
             ts: clipsync_core::protocol::now_millis() + ts_delta,
             answer,
+            lan: None,
         })
         .unwrap();
         let ct = with

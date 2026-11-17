@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::lan::LanInfo;
 use crate::protocol::PROTOCOL_VERSION;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +49,8 @@ pub struct PresencePayload {
     pub ts: i64,
     #[serde(default)]
     pub answer: bool,
+    #[serde(default)]
+    pub lan: Option<LanInfo>,
 }
 
 fn protocol_version() -> i32 {

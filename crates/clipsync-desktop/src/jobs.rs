@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
@@ -7,7 +8,8 @@ use clipsync_core::files::{
     decrypt_file, encrypt_file_with_sha, max_mb, sanitize_file_name, upload_file_name,
     validate_outgoing_file, RejectReason, MAX_FILE_BYTES,
 };
-use clipsync_core::protocol::{now_millis, random_mid};
+use clipsync_core::lan::{LanPeer, BLOB_SEGMENT, LAN_LINK_TTL_MS};
+use clipsync_core::protocol::{now_millis, random_mid, ROOT};
 use clipsync_core::RoomCrypto;
 
 use crate::paths;
@@ -17,7 +19,10 @@ pub struct JobContext {
     pub crypto: Arc<RoomCrypto>,
     pub client: Arc<TransferClient>,
     pub clip_topic: String,
+    pub room_hash: String,
     pub live: Arc<LiveUploads>,
+    pub lan_peers: Vec<LanPeer>,
+    pub lan_dir: PathBuf,
 }
 
 /// 这间房已经挂上托管方的那几份：链接还活着就复用，同一份内容不传第二遍。
@@ -214,12 +219,27 @@ pub fn perform_upload(
                 &sha,
             )
             .map_err(|error| format!("加密失败：{error}"))?;
-            let uploaded =
-                context
+            let blob_name = upload_file_name();
+            let lan_link = context.lan_peers.first().and_then(|peer| peer.base()).map(|base| {
+                format!(
+                    "{base}/{ROOT}/{}/{BLOB_SEGMENT}/{blob_name}",
+                    context.room_hash
+                )
+            });
+            let (link, expires_at) = if let Some(link) = lan_link {
+                std::fs::create_dir_all(&context.lan_dir)
+                    .map_err(|error| format!("建立局域网目录失败：{error}"))?;
+                std::fs::write(context.lan_dir.join(&blob_name), &encrypted.cipher)
+                    .map_err(|error| format!("写入局域网文件失败：{error}"))?;
+                (link, now_millis() + LAN_LINK_TTL_MS)
+            } else {
+                let uploaded = context
                     .client
-                    .upload(&upload_file_name(), &encrypted.cipher, on_progress)?;
-            context.live.put(&key, &uploaded.url, uploaded.expires_at);
-            (uploaded.url, uploaded.expires_at)
+                    .upload(&blob_name, &encrypted.cipher, on_progress)?;
+                (uploaded.url, uploaded.expires_at)
+            };
+            context.live.put(&key, &link, expires_at);
+            (link, expires_at)
         }
     };
     let (id, ts) = match &request.target {
@@ -341,7 +361,10 @@ mod tests {
                 "http://127.0.0.1:1/",
             )),
             clip_topic: topic(),
+            room_hash: "testhash".to_string(),
             live: std::sync::Arc::new(LiveUploads::default()),
+            lan_peers: Vec::new(),
+            lan_dir: std::env::temp_dir(),
         }
     }
 
@@ -490,7 +513,10 @@ mod tests {
             crypto: std::sync::Arc::new(RoomCrypto::open("TESTROOM", "pw").unwrap()),
             client: std::sync::Arc::new(TransferClient::with_hosts(&origin, &origin)),
             clip_topic: topic(),
+            room_hash: "testhash".to_string(),
             live: std::sync::Arc::new(LiveUploads::default()),
+            lan_peers: Vec::new(),
+            lan_dir: std::env::temp_dir(),
         };
 
         let first = super::perform_upload(&context, upload_request(), |_, _| {}).expect("upload");
@@ -510,7 +536,10 @@ mod tests {
             crypto: std::sync::Arc::new(RoomCrypto::open("TESTROOM", "pw").unwrap()),
             client: std::sync::Arc::new(TransferClient::with_hosts(&first_origin, &first_origin)),
             clip_topic: topic(),
+            room_hash: "testhash".to_string(),
             live: live.clone(),
+            lan_peers: Vec::new(),
+            lan_dir: std::env::temp_dir(),
         };
         super::perform_upload(&context, upload_request(), |_, _| {}).expect("upload");
 
@@ -520,7 +549,10 @@ mod tests {
             crypto: context.crypto.clone(),
             client: std::sync::Arc::new(TransferClient::with_hosts(&second_origin, &second_origin)),
             clip_topic: clipsync_core::protocol::clip_topic("otherhash"),
+            room_hash: "otherhash".to_string(),
             live: live.clone(),
+            lan_peers: Vec::new(),
+            lan_dir: std::env::temp_dir(),
         };
         let done = super::perform_upload(&other, upload_request(), |_, _| {}).expect("upload");
 

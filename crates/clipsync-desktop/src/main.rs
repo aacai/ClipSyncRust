@@ -36,6 +36,7 @@ use std::thread;
 
 use app::ClipSyncApp;
 use clipsync_core::engine;
+use clipsync_core::lan::LanConfig;
 use clipsync_core::mqtt::BrokerLinks;
 use settings::{Preferences, Settings, ThemeMode};
 use store::History;
@@ -78,7 +79,7 @@ fn main() -> eframe::Result {
         .build()
         .expect("tokio runtime");
     let _guard = runtime.enter();
-    let engine = engine::spawn(BrokerLinks);
+    let engine = engine::spawn_with_lan(BrokerLinks, Some(LanConfig::default()));
     let history = History::open(paths::app_dir().join("history.json"));
     let settings = Settings::open(paths::app_dir().join("settings.json"), &paths::install_id());
     let preferences = Preferences::open(paths::app_dir().join("preferences.json"));

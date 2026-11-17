@@ -6,6 +6,7 @@ use tokio::time::Instant;
 
 use crate::envelope::{ClipEnvelope, ClipPayload, FilePayload, PresenceEnvelope, PresencePayload};
 use crate::files::{sanitize_file_name, MAX_FILE_BYTES};
+use crate::lan::{LanConfig, LanPeer, LanRuntime};
 use crate::link::{self, LinkEvent, LinkHandle, MqttLink};
 use crate::protocol::{
     clip_topic, now_millis, parse_topic, presence_topic, random_mid, room_filter, room_hash,
@@ -98,6 +99,7 @@ pub enum Event {
     Peers(Vec<Peer>),
     KeyMismatch(Vec<String>),
     FileTooLarge(String),
+    LanPeers(Vec<LanPeer>),
 }
 
 #[derive(Debug)]
@@ -147,10 +149,14 @@ impl EngineHandle {
 }
 
 pub fn spawn<F: LinkFactory>(links: F) -> EngineHandle {
+    spawn_with_lan(links, None)
+}
+
+pub fn spawn_with_lan<F: LinkFactory>(links: F, lan: Option<LanConfig>) -> EngineHandle {
     let (commands, command_rx) = mpsc::unbounded_channel();
     let (events, out) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        Engine::new(links, events).run(command_rx).await;
+        Engine::new(links, events, lan).run(command_rx).await;
     });
     EngineHandle {
         commands,
@@ -168,6 +174,10 @@ struct Engine<F: LinkFactory> {
     status: Status,
     link: Option<LinkHandle>,
     inbound: Option<async_channel::Receiver<LinkEvent>>,
+    lan_config: Option<LanConfig>,
+    lan: Option<LanRuntime>,
+    lan_rx: Option<async_channel::Receiver<(String, String)>>,
+    lan_peers: HashMap<String, LanPeer>,
     peers: HashMap<String, Peer>,
     seen: HashMap<String, Instant>,
     presence_ts: HashMap<String, i64>,
@@ -176,7 +186,7 @@ struct Engine<F: LinkFactory> {
 }
 
 impl<F: LinkFactory> Engine<F> {
-    fn new(links: F, events: mpsc::UnboundedSender<Event>) -> Self {
+    fn new(links: F, events: mpsc::UnboundedSender<Event>, lan_config: Option<LanConfig>) -> Self {
         Self {
             links,
             events,
@@ -187,6 +197,10 @@ impl<F: LinkFactory> Engine<F> {
             status: Status::Idle,
             link: None,
             inbound: None,
+            lan_config,
+            lan: None,
+            lan_rx: None,
+            lan_peers: HashMap::new(),
             peers: HashMap::new(),
             seen: HashMap::new(),
             presence_ts: HashMap::new(),
@@ -200,10 +214,21 @@ impl<F: LinkFactory> Engine<F> {
         let mut recovery: Option<Instant> = None;
         loop {
             let inbound = self.inbound.clone();
+            let lan_rx = self.lan_rx.clone();
             let received = async move {
-                match inbound {
-                    Some(receiver) => receiver.recv().await.ok(),
-                    None => std::future::pending::<Option<LinkEvent>>().await,
+                tokio::select! {
+                    event = async {
+                        match inbound {
+                            Some(receiver) => receiver.recv().await.ok(),
+                            None => std::future::pending::<Option<LinkEvent>>().await,
+                        }
+                    } => event,
+                    message = async {
+                        match lan_rx {
+                            Some(receiver) => receiver.recv().await.ok(),
+                            None => std::future::pending::<Option<(String, String)>>().await,
+                        }
+                    } => message.map(|(topic, payload)| LinkEvent::Message { topic, payload }),
                 }
             };
             let online = self.is_online();
@@ -307,6 +332,17 @@ impl<F: LinkFactory> Engine<F> {
         self.safety = crypto.safety_number();
         self.crypto = Some(crypto);
         self.hash = hash;
+        self.lan = None;
+        self.lan_rx = None;
+        self.lan_peers.clear();
+        if let Some(lan) = self.lan_config.clone() {
+            let (tx, rx) = async_channel::unbounded();
+            if let Ok(runtime) = LanRuntime::start(lan, self.hash.clone(), tx).await {
+                self.lan = Some(runtime);
+                self.lan_rx = Some(rx);
+            }
+        }
+        self.publish_lan_peers();
         self.open_link(&config, heartbeat, recovery).await;
     }
 
@@ -543,6 +579,22 @@ impl<F: LinkFactory> Engine<F> {
             self.presence_ts.remove(&payload.dev);
             self.unknown_key.remove(&payload.dev);
         }
+        match (payload.online, payload.lan) {
+            (true, Some(lan)) => {
+                self.lan_peers.insert(
+                    payload.dev.clone(),
+                    LanPeer {
+                        id: payload.dev.clone(),
+                        addrs: lan.addrs,
+                        port: lan.port,
+                    },
+                );
+            }
+            _ => {
+                self.lan_peers.remove(&payload.dev);
+            }
+        }
+        self.publish_lan_peers();
         self.prune_peers();
         self.publish_peers();
         if fresh && payload.online {
@@ -610,8 +662,16 @@ impl<F: LinkFactory> Engine<F> {
         };
         // 先发历史：那条复制不能因为发不出去就当没发生过。
         let _ = self.events.send(Event::Clip(clip));
+        self.deliver(&topic, &wire).await;
+    }
+
+    async fn deliver(&self, topic: &str, wire: &str) {
+        if let Some(runtime) = self.lan.clone() {
+            let peers: Vec<LanPeer> = self.lan_peers.values().cloned().collect();
+            runtime.publish(&peers, wire).await;
+        }
         if let Some(handle) = self.link.clone() {
-            let _ = handle.publish(&topic, &wire).await;
+            let _ = handle.publish(topic, wire).await;
         }
     }
 
@@ -662,9 +722,7 @@ impl<F: LinkFactory> Engine<F> {
                 }),
             }));
         }
-        if let Some(handle) = self.link.clone() {
-            let _ = handle.publish(&topic, &wire).await;
-        }
+        self.deliver(&topic, &wire).await;
     }
 
     /// presence 整条进密文，AAD 用它落进的那条 topic：点名帧在 sync 频道，正常帧在各自的 presence 频道。
@@ -683,6 +741,7 @@ impl<F: LinkFactory> Engine<F> {
             online,
             ts: now_millis(),
             answer,
+            lan: self.lan.as_ref().map(|runtime| runtime.info()),
         })
         .ok()?;
         let ct = crypto.encrypt(json.as_bytes(), topic.as_bytes()).ok()?;
@@ -738,6 +797,10 @@ impl<F: LinkFactory> Engine<F> {
             self.peers.remove(id);
             self.seen.remove(id);
             self.presence_ts.remove(id);
+            self.lan_peers.remove(id);
+        }
+        if !gone.is_empty() {
+            self.publish_lan_peers();
         }
         let stale: Vec<String> = self
             .unknown_key
@@ -779,11 +842,22 @@ impl<F: LinkFactory> Engine<F> {
         let _ = self.events.send(Event::KeyMismatch(mismatch));
     }
 
+    fn publish_lan_peers(&self) {
+        if self.lan_config.is_none() {
+            return;
+        }
+        let mut peers: Vec<LanPeer> = self.lan_peers.values().cloned().collect();
+        peers.sort_by(|a, b| a.id.cmp(&b.id));
+        let _ = self.events.send(Event::LanPeers(peers));
+    }
+
     fn clear_peers(&mut self) {
         self.peers.clear();
         self.seen.clear();
         self.presence_ts.clear();
         self.unknown_key.clear();
+        self.lan_peers.clear();
+        self.publish_lan_peers();
         self.publish_peers();
     }
 
@@ -826,6 +900,8 @@ impl<F: LinkFactory> Engine<F> {
 
     async fn close_link(&mut self) {
         self.inbound = None;
+        self.lan_rx = None;
+        self.lan = None;
         if let Some(handle) = self.link.take() {
             let _ = handle.shutdown().await;
         }

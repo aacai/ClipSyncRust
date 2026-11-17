@@ -1,4 +1,5 @@
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -82,8 +83,8 @@ pub fn palette(dark: bool) -> Palette {
             on_error_container: Color32::from_rgb(0xff, 0xc9, 0xc9),
             inverse_surface: Color32::from_rgb(0xf0, 0xe4, 0xe9),
             inverse_text: Color32::from_rgb(0x1a, 0x12, 0x18),
-            glass_fill: Color32::from_white_alpha(13),
-            glass_border: Color32::from_white_alpha(23),
+            glass_fill: Color32::from_white_alpha(18),
+            glass_border: Color32::from_white_alpha(28),
             hairline: Color32::from_white_alpha(10),
             hover: Color32::from_white_alpha(10),
             inset: Color32::from_white_alpha(5),
@@ -120,8 +121,8 @@ pub fn palette(dark: bool) -> Palette {
             on_error_container: Color32::from_rgb(0x7a, 0x1b, 0x18),
             inverse_surface: Color32::from_rgb(0x2a, 0x1f, 0x24),
             inverse_text: Color32::from_rgb(0xfb, 0xee, 0xf1),
-            glass_fill: Color32::from_white_alpha(205),
-            glass_border: Color32::from_white_alpha(235),
+            glass_fill: Color32::from_white_alpha(92),
+            glass_border: Color32::from_white_alpha(140),
             hairline: Color32::from_white_alpha(150),
             hover: Color32::from_rgba_unmultiplied(0x24, 0x1a, 0x1e, 12),
             inset: Color32::from_rgba_unmultiplied(0x24, 0x1a, 0x1e, 7),
@@ -485,23 +486,54 @@ fn backdrop_color(at: Pos2, palette: &Palette) -> Color32 {
 
 /// One frost texel covers this many logical points.
 const FROST_TEXEL: f32 = 4.0;
-/// Compose frosts the glass with `blur(20.dp)`.
-const FROST_BLUR: f32 = 20.0;
+/// Default matches Compose `blur(~19.dp)` at frost 0.55.
+const DEFAULT_FROST_BLUR: f32 = 19.0;
 /// Three box passes land on roughly the same spread as one gaussian of that radius.
 const FROST_PASSES: usize = 3;
 const ARC_SEGMENTS: usize = 8;
+
+static FROST_AMOUNT: AtomicU32 = AtomicU32::new(f32::to_bits(0.55));
+
+/// 0..1；同时驱动 blur 半径与磨砂罩透明度。
+pub fn set_frost_amount(amount: f32) {
+    let value = if amount.is_finite() {
+        amount.clamp(0.0, 1.0)
+    } else {
+        0.55
+    };
+    FROST_AMOUNT.store(value.to_bits(), Ordering::Relaxed);
+}
+
+pub fn frost_amount() -> f32 {
+    f32::from_bits(FROST_AMOUNT.load(Ordering::Relaxed))
+}
+
+fn frost_blur_px(amount: f32) -> f32 {
+    8.0 + amount.clamp(0.0, 1.0) * 28.0
+}
+
+fn frost_veil_alpha(amount: f32, dark: bool) -> u8 {
+    let t = amount.clamp(0.0, 1.0);
+    if dark {
+        (120.0 + t * 90.0) as u8
+    } else {
+        (100.0 + t * 80.0) as u8
+    }
+}
 
 struct FrostBake {
     content: Rect,
     texel: f32,
     dark: bool,
+    blur: f32,
     image: Arc<egui::ColorImage>,
 }
 
 impl FrostBake {
-    fn fits(&self, content: Rect, texel: f32, dark: bool) -> bool {
+    fn fits(&self, content: Rect, texel: f32, dark: bool, blur: f32) -> bool {
         self.dark == dark
             && self.texel == texel
+            && (self.blur - blur).abs() < 0.05
             && (self.content.min - content.min).length() < texel
             && (self.content.size() - content.size()).length() < texel
     }
@@ -516,12 +548,13 @@ fn aura_image(content: Rect, texel: f32, dark: bool) -> Arc<egui::ColorImage> {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if bake
         .as_ref()
-        .is_none_or(|baked| !baked.fits(content, texel, dark))
+        .is_none_or(|baked| !baked.fits(content, texel, dark, 0.0))
     {
         bake.replace(FrostBake {
             content,
             texel,
             dark,
+            blur: 0.0,
             image: bake_aura(content, texel, dark),
         });
     }
@@ -558,9 +591,11 @@ pub fn frost(ctx: &egui::Context, rect: Rect, radius: u8, layer: egui::LayerId) 
         return;
     }
     let dark = p().dark;
+    let amount = frost_amount();
+    let blur = frost_blur_px(amount);
     let limit = ctx.input(|input| input.max_texture_side);
     let texel = frost_texel(content, limit);
-    let image = frost_image(content, texel, dark);
+    let image = frost_image(content, texel, dark, blur);
     let texture = ctx.load_texture_cached(
         "clipsync-frost",
         Id::unique("clip-frost"),
@@ -572,6 +607,7 @@ pub fn frost(ctx: &egui::Context, rect: Rect, radius: u8, layer: egui::LayerId) 
         radius as f32,
         content,
         texture.id(),
+        frost_veil_alpha(amount, dark),
     )));
 }
 
@@ -589,25 +625,26 @@ fn frost_texel(content: Rect, max_side: usize) -> f32 {
     FROST_TEXEL * scale
 }
 
-fn frost_image(content: Rect, texel: f32, dark: bool) -> Arc<egui::ColorImage> {
+fn frost_image(content: Rect, texel: f32, dark: bool, blur: f32) -> Arc<egui::ColorImage> {
     let mut bake = FROST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if bake
         .as_ref()
-        .is_none_or(|baked| !baked.fits(content, texel, dark))
+        .is_none_or(|baked| !baked.fits(content, texel, dark, blur))
     {
         bake.replace(FrostBake {
             content,
             texel,
             dark,
-            image: bake_frost(content, texel, dark),
+            blur,
+            image: bake_frost(content, texel, dark, blur),
         });
     }
     Arc::clone(&bake.as_ref().expect("baked").image)
 }
 
-fn bake_frost(content: Rect, texel: f32, dark: bool) -> Arc<egui::ColorImage> {
+fn bake_frost(content: Rect, texel: f32, dark: bool, blur: f32) -> Arc<egui::ColorImage> {
     let palette = palette(dark);
     let background = background();
     let backdrop = background.as_deref();
@@ -627,7 +664,7 @@ fn bake_frost(content: Rect, texel: f32, dark: bool) -> Arc<egui::ColorImage> {
             field.extend_from_slice(&color.to_array().map(f32::from));
         }
     }
-    let radius = (FROST_BLUR / texel).round().max(1.0) as usize;
+    let radius = (blur.max(1.0) / texel).round().max(1.0) as usize;
     let blurred = box_blur(&field, size[0], size[1], radius);
     let mut pixels = Vec::with_capacity(size[0] * size[1]);
     for pixel in blurred.chunks_exact(4) {
@@ -700,15 +737,16 @@ fn frost_mesh(
     radius: f32,
     content: Rect,
     texture: egui::epaint::TextureId,
+    veil: u8,
 ) -> egui::Mesh {
     let mut mesh = egui::Mesh::with_texture(texture);
-    let white = Color32::from_rgb(255, 255, 255);
+    let tint = Color32::from_white_alpha(veil);
     let push = |mesh: &mut egui::Mesh, pos: Pos2| {
         let uv = (pos - content.min) / content.size();
         mesh.vertices.push(egui::epaint::Vertex {
             pos,
             uv: Pos2::new(uv.x.clamp(0.0, 1.0), uv.y.clamp(0.0, 1.0)),
-            color: white,
+            color: tint,
         });
     };
     let center = rect.center();
@@ -928,7 +966,7 @@ mod tests {
             vec![Color32::from_rgb(200, 100, 50); 8],
         ));
         set_background(0.5, Some(photo));
-        let baked = bake_frost(content, FROST_TEXEL, true);
+        let baked = bake_frost(content, FROST_TEXEL, true, DEFAULT_FROST_BLUR);
         set_background(0.0, None);
         assert_eq!(baked.size, [50, 25], "one texel per 4 points");
         for pixel in &baked.pixels {
@@ -973,14 +1011,14 @@ mod tests {
         let content = Rect::from_min_size(Pos2::new(20.0, 30.0), egui::vec2(400.0, 300.0));
         let panel = Rect::from_min_size(Pos2::new(60.0, 80.0), egui::vec2(240.0, 60.0));
         let radius = 20.0;
-        let mesh = frost_mesh(panel, radius, content, egui::epaint::TextureId::default());
+        let mesh = frost_mesh(panel, radius, content, egui::epaint::TextureId::default(), 255);
         assert_eq!(mesh.vertices.len(), 1 + 4 * (ARC_SEGMENTS + 1));
         assert_eq!(mesh.indices.len(), 3 * (mesh.vertices.len() - 1));
-        let white = Color32::from_rgb(255, 255, 255);
+        let white = Color32::from_white_alpha(255);
         for vertex in &mesh.vertices {
             assert_eq!(
                 vertex.color, white,
-                "the texture must pass through untinted"
+                "the texture must pass through with the veil tint"
             );
             assert!(
                 vertex.pos.x >= panel.left() - 0.01
@@ -1059,29 +1097,36 @@ mod tests {
             content: small,
             texel: FROST_TEXEL,
             dark: true,
+            blur: DEFAULT_FROST_BLUR,
             image: Arc::new(egui::ColorImage::new([1, 1], vec![Color32::BLACK])),
         };
-        assert!(bake.fits(small, FROST_TEXEL, true));
+        assert!(bake.fits(small, FROST_TEXEL, true, DEFAULT_FROST_BLUR));
         assert!(
             bake.fits(
                 Rect::from_min_size(Pos2::ZERO, egui::vec2(403.0, 300.0)),
                 FROST_TEXEL,
-                true
+                true,
+                DEFAULT_FROST_BLUR
             ),
             "sub-texel growth must not rebake"
         );
         assert!(!bake.fits(
             Rect::from_min_size(Pos2::ZERO, egui::vec2(420.0, 300.0)),
             FROST_TEXEL,
-            true
+            true,
+            DEFAULT_FROST_BLUR
         ));
         assert!(
-            !bake.fits(small, FROST_TEXEL * 2.0, true),
+            !bake.fits(small, FROST_TEXEL * 2.0, true, DEFAULT_FROST_BLUR),
             "a coarser texel must rebake"
         );
         assert!(
-            !bake.fits(small, FROST_TEXEL, false),
+            !bake.fits(small, FROST_TEXEL, false, DEFAULT_FROST_BLUR),
             "a theme flip must rebake"
+        );
+        assert!(
+            !bake.fits(small, FROST_TEXEL, true, DEFAULT_FROST_BLUR + 4.0),
+            "a frost change must rebake"
         );
     }
 }
