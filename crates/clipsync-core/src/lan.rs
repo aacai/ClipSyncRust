@@ -524,6 +524,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs real UDP broadcast sockets; run locally only"]
     async fn clip_and_blob_cross_the_lan() {
         let dir = temp_dir("clip");
         let (tx, rx) = async_channel::unbounded();
