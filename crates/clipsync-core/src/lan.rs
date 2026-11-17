@@ -85,19 +85,48 @@ pub fn blob_dir() -> PathBuf {
 }
 
 pub fn local_addrs() -> Vec<String> {
-    let mut found = Vec::new();
-    if let Ok(interfaces) = get_if_addrs() {
-        for address in interfaces {
-            match address {
-                IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => found.push(ip.to_string()),
-                IpAddr::V6(ip) if !ip.is_loopback() && !ip.is_unspecified() => {
-                    found.push(format!("[{ip}]"))
-                }
-                _ => {}
-            }
+    let mut found: Vec<String> = get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|addr| match addr {
+            IpAddr::V4(ip) if is_lan_addr(&ip) => Some(ip.to_string()),
+            _ => None,
+        })
+        .collect();
+    found.sort_by_key(|host| std::cmp::Reverse(address_rank(host)));
+    if let Some(via) = route_addr() {
+        if let Some(index) = found.iter().position(|host| host == &via) {
+            let primary = found.remove(index);
+            found.insert(0, primary);
         }
     }
     found
+}
+
+fn is_lan_addr(ip: &std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 10
+        || (o[0] == 192 && o[1] == 168)
+        || (o[0] == 172 && (16..=31).contains(&o[1]) && o[1] != 17)
+}
+
+fn address_rank(host: &str) -> u8 {
+    let parts: Vec<u8> = host.split('.').filter_map(|part| part.parse().ok()).collect();
+    match parts.as_slice() {
+        [192, 168, ..] => 2,
+        [10, ..] => 1,
+        _ => 0,
+    }
+}
+
+fn route_addr() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let addr = socket.local_addr().ok()?;
+    match addr.ip() {
+        IpAddr::V4(ip) if is_lan_addr(&ip) => Some(ip.to_string()),
+        _ => None,
+    }
 }
 
 fn get_if_addrs() -> Result<Vec<IpAddr>, String> {
@@ -304,7 +333,7 @@ async fn serve(
 ) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
-            continue;
+            break;
         };
         let hash = room_hash.clone();
         let dir = blob_dir.clone();
