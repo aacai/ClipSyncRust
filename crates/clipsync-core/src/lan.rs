@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,19 +6,22 @@ use std::time::Duration;
 use async_channel::Sender;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use crate::protocol::{clip_topic, ROOT};
 
 pub const LAN_PORT: u16 = 43871;
+pub const LAN_DISCOVERY_PORT: u16 = 43879;
 pub const BLOB_SEGMENT: &str = "blob";
 pub const LAN_LINK_TTL_MS: i64 = 24 * 3_600_000;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_HEAD: usize = 16 * 1024;
 const MAX_BODY: usize = 64 * 1024 * 1024 + 4096;
+const BEACON_INTERVAL: Duration = Duration::from_millis(1500);
+const BEACON_MAX_AGE: Duration = Duration::from_secs(6);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LanInfo {
@@ -27,9 +30,22 @@ pub struct LanInfo {
     pub nonce: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanBeacon {
+    pub id: String,
+    pub name: String,
+    pub os: String,
+    pub port: u16,
+    pub addrs: Vec<String>,
+    pub room_hash: String,
+    pub nonce: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LanPeer {
     pub id: String,
+    pub name: String,
+    pub os: String,
     pub addrs: Vec<String>,
     pub port: u16,
 }
@@ -40,6 +56,13 @@ impl LanPeer {
             .first()
             .map(|host| format!("http://{host}:{}", self.port))
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct LanIdentity {
+    pub id: String,
+    pub name: String,
+    pub os: String,
 }
 
 #[derive(Debug, Clone)]
@@ -63,20 +86,44 @@ pub fn blob_dir() -> PathBuf {
 
 pub fn local_addrs() -> Vec<String> {
     let mut found = Vec::new();
-    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
-        if socket.connect("8.8.8.8:80").is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                match addr.ip() {
-                    std::net::IpAddr::V4(ip) if !ip.is_loopback() => found.push(ip.to_string()),
-                    std::net::IpAddr::V6(ip) if !ip.is_loopback() => {
-                        found.push(format!("[{ip}]"))
-                    }
-                    _ => {}
+    if let Ok(interfaces) = get_if_addrs() {
+        for address in interfaces {
+            match address {
+                IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => found.push(ip.to_string()),
+                IpAddr::V6(ip) if !ip.is_loopback() && !ip.is_unspecified() => {
+                    found.push(format!("[{ip}]"))
                 }
+                _ => {}
             }
         }
     }
     found
+}
+
+fn get_if_addrs() -> Result<Vec<IpAddr>, String> {
+    let script = if cfg!(windows) {
+        "Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -ne '127.0.0.1'} | Select-Object -ExpandProperty IPAddress"
+    } else {
+        "ifconfig 2>/dev/null | grep -o 'inet [0-9.]*' | awk '{print $2}' || ip -4 addr show 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1"
+    };
+    let output = if cfg!(windows) {
+        std::process::Command::new("powershell")
+            .arg("-NoProfile")
+            .arg("-Command")
+            .arg(script)
+            .output()
+    } else {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+    }
+    .map_err(|error| error.to_string())?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(text
+        .lines()
+        .filter_map(|line| line.trim().parse::<IpAddr>().ok())
+        .collect())
 }
 
 #[derive(Clone)]
@@ -89,6 +136,7 @@ struct Inner {
     room_hash: String,
     blob_dir: PathBuf,
     _server: Arc<ServerTask>,
+    _discovery: Option<Arc<ServerTask>>,
 }
 
 struct ServerTask(JoinHandle<()>);
@@ -102,8 +150,10 @@ impl Drop for ServerTask {
 impl LanRuntime {
     pub async fn start(
         config: LanConfig,
+        identity: LanIdentity,
         room_hash: String,
         clips: Sender<(String, String)>,
+        peers: Sender<LanBeacon>,
     ) -> Result<Self, String> {
         let address = SocketAddr::from(([0, 0, 0, 0], config.port));
         let listener = TcpListener::bind(address)
@@ -128,11 +178,16 @@ impl LanRuntime {
             config.blob_dir.clone(),
             clips,
         ))));
+        let _discovery =
+            spawn_discovery(info.clone(), identity, room_hash.clone(), peers)
+                .await
+                .ok();
         let inner = Arc::new(Inner {
             info: info.clone(),
             room_hash,
             blob_dir: config.blob_dir,
             _server: server,
+            _discovery,
         });
         Ok(Self { inner })
     }
@@ -192,6 +247,53 @@ impl LanRuntime {
         }
         delivered
     }
+}
+
+async fn spawn_discovery(
+    info: LanInfo,
+    identity: LanIdentity,
+    room_hash: String,
+    peers: Sender<LanBeacon>,
+) -> Result<Arc<ServerTask>, String> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, LAN_DISCOVERY_PORT))
+        .await
+        .map_err(|error| format!("局域网发现端口不可用：{error}"))?;
+    socket.set_broadcast(true).ok();
+    let beacon = LanBeacon {
+        id: identity.id.clone(),
+        name: identity.name,
+        os: identity.os,
+        port: info.port,
+        addrs: info.addrs,
+        room_hash: room_hash.clone(),
+        nonce: info.nonce,
+    };
+    let wire = serde_json::to_vec(&beacon).map_err(|error| error.to_string())?;
+    let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), LAN_DISCOVERY_PORT);
+    let task = tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(BEACON_INTERVAL) => {
+                    let _ = socket.send_to(&wire, target).await;
+                }
+                result = socket.recv_from(&mut buf) => {
+                    let Ok((len, from)) = result else { break };
+                    let Ok(found) = serde_json::from_slice::<LanBeacon>(&buf[..len]) else {
+                        continue;
+                    };
+                    if found.room_hash != room_hash || found.id == identity.id {
+                        continue;
+                    }
+                    let mut addrs = vec![from.ip().to_string()];
+                    addrs.extend(found.addrs.iter().cloned());
+                    addrs.dedup();
+                    let _ = peers.send(LanBeacon { addrs, port: found.port, ..found }).await;
+                }
+            }
+        }
+    });
+    Ok(Arc::new(ServerTask(task)))
 }
 
 async fn serve(
@@ -383,7 +485,7 @@ fn valid_blob_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{LanConfig, LanPeer, LanRuntime};
+    use super::{LanConfig, LanIdentity, LanPeer, LanRuntime};
     use crate::protocol::clip_topic;
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
@@ -396,18 +498,27 @@ mod tests {
     async fn clip_and_blob_cross_the_lan() {
         let dir = temp_dir("clip");
         let (tx, rx) = async_channel::unbounded();
+        let (peer_tx, _peer_rx) = async_channel::unbounded();
         let runtime = LanRuntime::start(
             LanConfig {
                 port: 0,
                 blob_dir: dir.clone(),
             },
+            LanIdentity {
+                id: "self".to_string(),
+                name: "self".to_string(),
+                os: "test".to_string(),
+            },
             "testhash".to_string(),
             tx,
+            peer_tx,
         )
         .await
         .expect("lan server");
         let peer = LanPeer {
             id: "peer".to_string(),
+            name: "peer".to_string(),
+            os: "test".to_string(),
             addrs: vec!["127.0.0.1".to_string()],
             port: runtime.info().port,
         };
@@ -432,6 +543,8 @@ mod tests {
         assert!(LanRuntime::fetch_blob(
             &LanPeer {
                 id: "peer".to_string(),
+                name: "peer".to_string(),
+                os: "test".to_string(),
                 addrs: vec!["127.0.0.1".to_string()],
                 port: 1,
             },

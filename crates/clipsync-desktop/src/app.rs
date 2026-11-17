@@ -83,6 +83,7 @@ pub struct ClipSyncApp {
     status: Status,
     peers: Vec<Peer>,
     lan_peers: Vec<LanPeer>,
+    lan_self: Option<clipsync_core::lan::LanInfo>,
     mismatch: Vec<String>,
     room_code: String,
     password: String,
@@ -456,6 +457,7 @@ impl ClipSyncApp {
             status: Status::Idle,
             peers: Vec::new(),
             lan_peers: Vec::new(),
+            lan_self: None,
             mismatch: Vec::new(),
             room_code: String::new(),
             password: String::new(),
@@ -662,6 +664,7 @@ impl ClipSyncApp {
                 }
                 Event::Peers(peers) => self.peers = peers,
                 Event::LanPeers(peers) => self.lan_peers = peers,
+                Event::LanSelf(info) => self.lan_self = Some(info),
                 Event::KeyMismatch(names) => self.mismatch = names,
                 Event::Clip(clip) => self.on_clip(clip),
                 Event::FileTooLarge(name) => self.notify_error(format!(
@@ -1022,6 +1025,7 @@ impl ClipSyncApp {
             room_hash: self.room_hash.clone(),
             live: self.live_uploads.clone(),
             lan_peers: self.lan_peers.clone(),
+            lan_self: self.lan_self.clone(),
             lan_dir: blob_dir(),
         })
     }

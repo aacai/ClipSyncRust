@@ -22,6 +22,7 @@ pub struct JobContext {
     pub room_hash: String,
     pub live: Arc<LiveUploads>,
     pub lan_peers: Vec<LanPeer>,
+    pub lan_self: Option<clipsync_core::lan::LanInfo>,
     pub lan_dir: PathBuf,
 }
 
@@ -220,12 +221,21 @@ pub fn perform_upload(
             )
             .map_err(|error| format!("加密失败：{error}"))?;
             let blob_name = upload_file_name();
-            let lan_link = context.lan_peers.first().and_then(|peer| peer.base()).map(|base| {
-                format!(
-                    "{base}/{ROOT}/{}/{BLOB_SEGMENT}/{blob_name}",
-                    context.room_hash
-                )
+            let lan_base = context.lan_self.as_ref().and_then(|info| {
+                info.addrs
+                    .first()
+                    .map(|host| format!("http://{host}:{}", info.port))
             });
+            let lan_link = if !context.lan_peers.is_empty() {
+                lan_base.map(|base| {
+                    format!(
+                        "{base}/{ROOT}/{}/{BLOB_SEGMENT}/{blob_name}",
+                        context.room_hash
+                    )
+                })
+            } else {
+                None
+            };
             let (link, expires_at) = if let Some(link) = lan_link {
                 std::fs::create_dir_all(&context.lan_dir)
                     .map_err(|error| format!("建立局域网目录失败：{error}"))?;
@@ -364,6 +374,7 @@ mod tests {
             room_hash: "testhash".to_string(),
             live: std::sync::Arc::new(LiveUploads::default()),
             lan_peers: Vec::new(),
+            lan_self: None,
             lan_dir: std::env::temp_dir(),
         }
     }
@@ -516,6 +527,7 @@ mod tests {
             room_hash: "testhash".to_string(),
             live: std::sync::Arc::new(LiveUploads::default()),
             lan_peers: Vec::new(),
+            lan_self: None,
             lan_dir: std::env::temp_dir(),
         };
 
@@ -539,6 +551,7 @@ mod tests {
             room_hash: "testhash".to_string(),
             live: live.clone(),
             lan_peers: Vec::new(),
+            lan_self: None,
             lan_dir: std::env::temp_dir(),
         };
         super::perform_upload(&context, upload_request(), |_, _| {}).expect("upload");
@@ -552,6 +565,7 @@ mod tests {
             room_hash: "otherhash".to_string(),
             live: live.clone(),
             lan_peers: Vec::new(),
+            lan_self: None,
             lan_dir: std::env::temp_dir(),
         };
         let done = super::perform_upload(&other, upload_request(), |_, _| {}).expect("upload");

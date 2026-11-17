@@ -6,7 +6,7 @@ use tokio::time::Instant;
 
 use crate::envelope::{ClipEnvelope, ClipPayload, FilePayload, PresenceEnvelope, PresencePayload};
 use crate::files::{sanitize_file_name, MAX_FILE_BYTES};
-use crate::lan::{LanConfig, LanPeer, LanRuntime};
+use crate::lan::{LanBeacon, LanConfig, LanIdentity, LanPeer, LanRuntime};
 use crate::link::{self, LinkEvent, LinkHandle, MqttLink};
 use crate::protocol::{
     clip_topic, now_millis, parse_topic, presence_topic, random_mid, room_filter, room_hash,
@@ -22,6 +22,7 @@ pub const KIND_TEXT: &str = "text";
 // 密钥不一致的名单是陌生人也能往我们频道灌帧喂出来的，给它一个上限
 const MAX_UNKNOWN_KEY: usize = 8;
 const MISMATCH_ID_CHARS: usize = 8;
+const LAN_PEER_TTL: Duration = Duration::from_secs(6);
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -92,6 +93,13 @@ pub struct FileUpload {
     pub expires_at: i64,
 }
 
+#[derive(Debug)]
+enum EngineInput {
+    Link(LinkEvent),
+    Clip(String, String),
+    LanPeer(LanBeacon),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Status(Status),
@@ -100,6 +108,7 @@ pub enum Event {
     KeyMismatch(Vec<String>),
     FileTooLarge(String),
     LanPeers(Vec<LanPeer>),
+    LanSelf(crate::lan::LanInfo),
 }
 
 #[derive(Debug)]
@@ -177,6 +186,8 @@ struct Engine<F: LinkFactory> {
     lan_config: Option<LanConfig>,
     lan: Option<LanRuntime>,
     lan_rx: Option<async_channel::Receiver<(String, String)>>,
+    lan_peer_rx: Option<async_channel::Receiver<LanBeacon>>,
+    lan_seen: HashMap<String, Instant>,
     lan_peers: HashMap<String, LanPeer>,
     peers: HashMap<String, Peer>,
     seen: HashMap<String, Instant>,
@@ -200,6 +211,8 @@ impl<F: LinkFactory> Engine<F> {
             lan_config,
             lan: None,
             lan_rx: None,
+            lan_peer_rx: None,
+            lan_seen: HashMap::new(),
             lan_peers: HashMap::new(),
             peers: HashMap::new(),
             seen: HashMap::new(),
@@ -215,6 +228,7 @@ impl<F: LinkFactory> Engine<F> {
         loop {
             let inbound = self.inbound.clone();
             let lan_rx = self.lan_rx.clone();
+            let lan_peer_rx = self.lan_peer_rx.clone();
             let received = async move {
                 tokio::select! {
                     event = async {
@@ -222,13 +236,19 @@ impl<F: LinkFactory> Engine<F> {
                             Some(receiver) => receiver.recv().await.ok(),
                             None => std::future::pending::<Option<LinkEvent>>().await,
                         }
-                    } => event,
+                    } => event.map(EngineInput::Link),
                     message = async {
                         match lan_rx {
                             Some(receiver) => receiver.recv().await.ok(),
                             None => std::future::pending::<Option<(String, String)>>().await,
                         }
-                    } => message.map(|(topic, payload)| LinkEvent::Message { topic, payload }),
+                    } => message.map(|(topic, payload)| EngineInput::Clip(topic, payload)),
+                    peer = async {
+                        match lan_peer_rx {
+                            Some(receiver) => receiver.recv().await.ok(),
+                            None => std::future::pending::<Option<LanBeacon>>().await,
+                        }
+                    } => peer.map(EngineInput::LanPeer),
                 }
             };
             let online = self.is_online();
@@ -241,14 +261,20 @@ impl<F: LinkFactory> Engine<F> {
                     self.on_command(command, &mut heartbeat, &mut recovery).await;
                 }
                 event = received => {
-                    match event {
-                        Some(event) => self.on_link_event(event, &mut heartbeat, &mut recovery).await,
-                        None => self.inbound = None,
+                    if let Some(event) = event {
+                        match event {
+                            EngineInput::Link(event) => {
+                                self.on_link_event(event, &mut heartbeat, &mut recovery).await
+                            }
+                            EngineInput::Clip(topic, payload) => self.on_message(&topic, &payload).await,
+                            EngineInput::LanPeer(beacon) => self.on_lan_peer(beacon),
+                        }
                     }
                 }
-                _ = wait_until(heartbeat_at), if self.link.is_some() => {
+                _ = wait_until(heartbeat_at), if self.link.is_some() || self.lan.is_some() => {
                     self.prune_peers();
                     self.publish_peers();
+                    self.prune_lan_peers();
                     if self.link.as_ref().is_some_and(|handle| handle.is_connected()) {
                         self.publish_presence(true).await;
                     }
@@ -260,6 +286,7 @@ impl<F: LinkFactory> Engine<F> {
             }
         }
         self.close_link().await;
+        self.close_lan();
     }
 
     async fn on_command(
@@ -276,6 +303,7 @@ impl<F: LinkFactory> Engine<F> {
                 }
                 self.desired = None;
                 self.close_link().await;
+                self.close_lan();
                 self.set_status(Status::Idle, recovery);
             }
             Command::PublishText(text) => self.publish_text(&text).await,
@@ -334,12 +362,24 @@ impl<F: LinkFactory> Engine<F> {
         self.hash = hash;
         self.lan = None;
         self.lan_rx = None;
+        self.lan_peer_rx = None;
+        self.lan_seen.clear();
         self.lan_peers.clear();
         if let Some(lan) = self.lan_config.clone() {
             let (tx, rx) = async_channel::unbounded();
-            if let Ok(runtime) = LanRuntime::start(lan, self.hash.clone(), tx).await {
+            let (peer_tx, peer_rx) = async_channel::unbounded();
+            let identity = LanIdentity {
+                id: config.device_id.clone(),
+                name: config.device_name.clone(),
+                os: config.device_os.clone(),
+            };
+            if let Ok(runtime) =
+                LanRuntime::start(lan, identity, self.hash.clone(), tx, peer_tx).await
+            {
+                let _ = self.events.send(Event::LanSelf(runtime.info()));
                 self.lan = Some(runtime);
                 self.lan_rx = Some(rx);
+                self.lan_peer_rx = Some(peer_rx);
             }
         }
         self.publish_lan_peers();
@@ -579,22 +619,11 @@ impl<F: LinkFactory> Engine<F> {
             self.presence_ts.remove(&payload.dev);
             self.unknown_key.remove(&payload.dev);
         }
-        match (payload.online, payload.lan) {
-            (true, Some(lan)) => {
-                self.lan_peers.insert(
-                    payload.dev.clone(),
-                    LanPeer {
-                        id: payload.dev.clone(),
-                        addrs: lan.addrs,
-                        port: lan.port,
-                    },
-                );
-            }
-            _ => {
-                self.lan_peers.remove(&payload.dev);
-            }
+        if !payload.online {
+            self.lan_seen.remove(&payload.dev);
+            self.lan_peers.remove(&payload.dev);
+            self.publish_lan_peers();
         }
-        self.publish_lan_peers();
         self.prune_peers();
         self.publish_peers();
         if fresh && payload.online {
@@ -842,6 +871,39 @@ impl<F: LinkFactory> Engine<F> {
         let _ = self.events.send(Event::KeyMismatch(mismatch));
     }
 
+    fn on_lan_peer(&mut self, beacon: LanBeacon) {
+        self.lan_seen.insert(beacon.id.clone(), Instant::now());
+        self.lan_peers.insert(
+            beacon.id.clone(),
+            LanPeer {
+                id: beacon.id,
+                name: beacon.name,
+                os: beacon.os,
+                addrs: beacon.addrs,
+                port: beacon.port,
+            },
+        );
+        self.publish_lan_peers();
+    }
+
+    fn prune_lan_peers(&mut self) {
+        let cutoff = Instant::now() - LAN_PEER_TTL;
+        let gone: Vec<String> = self
+            .lan_seen
+            .iter()
+            .filter(|(_, seen)| **seen < cutoff)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        for id in gone {
+            self.lan_seen.remove(&id);
+            self.lan_peers.remove(&id);
+        }
+        self.publish_lan_peers();
+    }
+
     fn publish_lan_peers(&self) {
         if self.lan_config.is_none() {
             return;
@@ -856,8 +918,6 @@ impl<F: LinkFactory> Engine<F> {
         self.seen.clear();
         self.presence_ts.clear();
         self.unknown_key.clear();
-        self.lan_peers.clear();
-        self.publish_lan_peers();
         self.publish_peers();
     }
 
@@ -900,12 +960,19 @@ impl<F: LinkFactory> Engine<F> {
 
     async fn close_link(&mut self) {
         self.inbound = None;
-        self.lan_rx = None;
-        self.lan = None;
         if let Some(handle) = self.link.take() {
             let _ = handle.shutdown().await;
         }
         self.clear_peers();
+    }
+
+    fn close_lan(&mut self) {
+        self.lan_rx = None;
+        self.lan_peer_rx = None;
+        self.lan = None;
+        self.lan_seen.clear();
+        self.lan_peers.clear();
+        self.publish_lan_peers();
     }
 }
 
