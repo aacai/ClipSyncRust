@@ -236,7 +236,7 @@ enum SettingsAction {
     RecordSystem(bool),
     LanShare(bool),
     LanOnly(bool),
-    LanPort(u16),
+    LanPortEdit,
     AddLanRoot,
     RemoveLanRoot(usize),
     OpenUrl(String),
@@ -285,6 +285,9 @@ enum Overlay {
     LeaveRoom,
     Choice(SettingsChoice),
     Nickname {
+        input: String,
+    },
+    LanPort {
         input: String,
     },
     NewEntry {
@@ -355,6 +358,7 @@ enum DialogAction {
     SetRecordFps(u32),
     SetRecordMicDevice(String),
     SaveNickname(String),
+    SaveLanPort(String),
     PickFiles,
 }
 
@@ -2239,9 +2243,8 @@ impl ClipSyncApp {
                                     action = Some(SettingsAction::LanOnly(!lan_only));
                                 }
                                 settings_divider(ui);
-                                let mut port = lan_port;
-                                if settings_port_row(ui, &mut port) {
-                                    action = Some(SettingsAction::LanPort(port));
+                                if settings_port_row(ui, lan_port) {
+                                    action = Some(SettingsAction::LanPortEdit);
                                 }
                                 if lan_share {
                                     for (index, root) in lan_roots.iter().enumerate() {
@@ -2532,10 +2535,9 @@ impl ClipSyncApp {
                 self.preferences.set_lan_only(enabled);
                 self.sync_lan_config();
             }
-            SettingsAction::LanPort(port) => {
-                self.preferences.set_lan_port(port);
-                self.sync_lan_config();
-            }
+            SettingsAction::LanPortEdit => self.open(Overlay::LanPort {
+                input: self.preferences.lan_port().to_string(),
+            }),
             SettingsAction::AddLanRoot => self.add_lan_root(),
             SettingsAction::RemoveLanRoot(index) => {
                 let mut roots = self.preferences.lan_roots().to_vec();
@@ -4582,6 +4584,7 @@ impl ClipSyncApp {
             Overlay::Translate { .. } => 520.0,
             Overlay::Choice(_) => 360.0,
             Overlay::Nickname { .. } => 400.0,
+            Overlay::LanPort { .. } => 360.0,
             Overlay::Hotkey { .. } => 380.0,
             _ => 420.0,
         };
@@ -5175,6 +5178,39 @@ impl ClipSyncApp {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if accent_button(ui, "保存").clicked() || save {
                                     action = DialogAction::SaveNickname(input.clone());
+                                }
+                                if secondary_button(ui, "取消").clicked() {
+                                    close = true;
+                                }
+                            });
+                        });
+                    }
+                    Overlay::LanPort { input } => {
+                        dialog_header(ui, Icon::Edit, "局域网端口");
+                        ui.add_space(10.0);
+                        let parsed = input.trim().parse::<u16>().ok();
+                        let valid = parsed.is_some_and(|port| (1024..=u16::MAX).contains(&port));
+                        let edit = ui.add_sized(
+                            Vec2::new(ui.available_width(), 34.0),
+                            TextEdit::singleline(input)
+                                .hint_text("1024 - 65535")
+                                .margin(Margin::symmetric(10, 8))
+                                .font(FontId::proportional(13.0)),
+                        );
+                        if focus {
+                            edit.request_focus();
+                        }
+                        if !valid {
+                            hint(ui, "端口需为 1024 到 65535 之间的整数");
+                        }
+                        let submit = ui.input_mut(|input| {
+                            input.consume_key(Modifiers::COMMAND, Key::Enter)
+                        });
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if accent_button(ui, "保存").clicked() || (submit && valid) {
+                                    action = DialogAction::SaveLanPort(input.clone());
                                 }
                                 if secondary_button(ui, "取消").clicked() {
                                     close = true;
@@ -5905,6 +5941,15 @@ impl ClipSyncApp {
             }
             DialogAction::SaveNickname(name) => {
                 self.set_nickname(&name);
+                keep = false;
+            }
+            DialogAction::SaveLanPort(text) => {
+                if let Ok(port) = text.trim().parse::<u16>() {
+                    if (1024..=u16::MAX).contains(&port) {
+                        self.preferences.set_lan_port(port);
+                        self.sync_lan_config();
+                    }
+                }
                 keep = false;
             }
             DialogAction::SetHotkey(spec) => match self.set_screenshot_hotkey(&spec) {
@@ -7474,10 +7519,10 @@ fn settings_switch_row(ui: &mut Ui, title: &str, summary: &str, checked: bool) -
     response.clicked()
 }
 
-fn settings_port_row(ui: &mut Ui, port: &mut u16) -> bool {
-    let (rect, _) = ui.allocate_exact_size(
+fn settings_port_row(ui: &mut Ui, port: u16) -> bool {
+    let (rect, response) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), SETTINGS_ROW_HEIGHT),
-        Sense::hover(),
+        Sense::click(),
     );
     let center = rect.center().y;
     let title = row_line(
@@ -7493,12 +7538,20 @@ fn settings_port_row(ui: &mut Ui, port: &mut u16) -> bool {
         baseline_at(&title, center),
         title,
     );
-    let field = Rect::from_center_size(
-        Pos2::new(rect.right() - SETTINGS_PAD - 48.0, center),
-        Vec2::new(96.0, 24.0),
+    let value = row_line(
+        ui,
+        &port.to_string(),
+        FontId::proportional(14.0),
+        theme::p().text,
+        60.0,
     );
-    ui.put(field, DragValue::new(port).range(1024u16..=u16::MAX))
-        .changed()
+    paint_line_at(
+        ui,
+        rect.right() - SETTINGS_PAD - 60.0,
+        baseline_at(&value, center),
+        value,
+    );
+    response.clicked()
 }
 
 fn settings_slider_row(ui: &mut Ui, title: &str, value: f32, max: f32) -> Option<f32> {
