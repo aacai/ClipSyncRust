@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use clipsync_core::crypto::{
     aes_gcm_decrypt, aes_gcm_encrypt, random_iv, sha256, IV_SIZE, TAG_SIZE,
 };
-use clipsync_core::lan::SharedRoot;
+use clipsync_core::lan::{SharedRoot, LAN_PORT};
 
 const SALT: &[u8] = b"clipsync.room-vault.";
 const AAD: &[u8] = b"clipsync.settings";
@@ -72,6 +72,13 @@ fn frost_of(raw: f32) -> f32 {
     }
 }
 
+fn port_of(raw: u16) -> u16 {
+    match raw {
+        1024..=u16::MAX => raw,
+        _ => LAN_PORT,
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct StoredPreferences {
@@ -110,6 +117,7 @@ struct StoredPreferences {
     lan_share: bool,
     lan_only: bool,
     lan_roots: Vec<SharedRoot>,
+    lan_port: u16,
 }
 
 fn de_theme<'de, D>(deserializer: D) -> Result<ThemeMode, D::Error>
@@ -167,6 +175,7 @@ impl Default for StoredPreferences {
             lan_share: false,
             lan_only: false,
             lan_roots: Vec::new(),
+            lan_port: LAN_PORT,
         }
     }
 }
@@ -309,6 +318,15 @@ impl Preferences {
 
     pub fn lan_roots(&self) -> &[SharedRoot] {
         &self.stored.lan_roots
+    }
+
+    pub fn lan_port(&self) -> u16 {
+        port_of(self.stored.lan_port)
+    }
+
+    pub fn set_lan_port(&mut self, port: u16) {
+        self.stored.lan_port = port_of(port);
+        self.save();
     }
 
     pub fn set_lan_share(&mut self, enabled: bool) {

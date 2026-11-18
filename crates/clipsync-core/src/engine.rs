@@ -124,6 +124,7 @@ pub enum Command {
         share: bool,
         only: bool,
         roots: Vec<SharedRoot>,
+        port: u16,
     },
 }
 
@@ -158,8 +159,13 @@ impl EngineHandle {
         let _ = self.commands.send(Command::RetryNow);
     }
 
-    pub fn update_lan(&self, share: bool, only: bool, roots: Vec<SharedRoot>) {
-        let _ = self.commands.send(Command::UpdateLan { share, only, roots });
+    pub fn update_lan(&self, share: bool, only: bool, roots: Vec<SharedRoot>, port: u16) {
+        let _ = self.commands.send(Command::UpdateLan {
+            share,
+            only,
+            roots,
+            port,
+        });
     }
 
     pub fn leave(&self) {
@@ -347,8 +353,14 @@ impl<F: LinkFactory> Engine<F> {
                     *recovery = Some(Instant::now());
                 }
             }
-            Command::UpdateLan { share, only, roots } => {
-                self.update_lan(share, only, roots, heartbeat, recovery).await;
+            Command::UpdateLan {
+                share,
+                only,
+                roots,
+                port,
+            } => {
+                self.update_lan(share, only, roots, port, heartbeat, recovery)
+                    .await;
             }
         }
     }
@@ -358,17 +370,22 @@ impl<F: LinkFactory> Engine<F> {
         share: bool,
         only: bool,
         roots: Vec<SharedRoot>,
+        port: u16,
         heartbeat: &mut Option<Instant>,
         recovery: &mut Option<Instant>,
     ) {
         let roots = if share { roots } else { Vec::new() };
         let changed = share != self.lan_share
             || only != self.lan_only
-            || self.lan_config.as_ref().is_some_and(|config| config.fs_roots != roots);
+            || self
+                .lan_config
+                .as_ref()
+                .is_some_and(|config| config.port != port || config.fs_roots != roots);
         self.lan_share = share;
         self.lan_only = only;
         if let Some(config) = self.lan_config.as_mut() {
             config.fs_roots = roots;
+            config.port = port;
         }
         if changed {
             if let Some(config) = self.desired.clone() {

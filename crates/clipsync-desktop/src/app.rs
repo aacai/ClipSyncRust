@@ -7,8 +7,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::text::TextWrapping;
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Id, Key, Layout, Margin,
-    Modifiers, Order, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextEdit, TextFormat,
+    self, Align, Align2, Color32, CornerRadius, CursorIcon, DragValue, FontId, Frame, Id, Key,
+    Layout, Margin, Modifiers, Order, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextEdit,
+    TextFormat,
     TextureHandle, TextureOptions, Ui, UiBuilder, Vec2, ViewportCommand,
 };
 
@@ -235,6 +236,7 @@ enum SettingsAction {
     RecordSystem(bool),
     LanShare(bool),
     LanOnly(bool),
+    LanPort(u16),
     AddLanRoot,
     RemoveLanRoot(usize),
     OpenUrl(String),
@@ -1043,6 +1045,7 @@ impl ClipSyncApp {
             self.preferences.lan_share(),
             self.preferences.lan_only(),
             self.preferences.lan_roots().to_vec(),
+            self.preferences.lan_port(),
         );
     }
 
@@ -2215,6 +2218,7 @@ impl ClipSyncApp {
                             let lan_share = self.preferences.lan_share();
                             let lan_only = self.preferences.lan_only();
                             let lan_roots = self.preferences.lan_roots().to_vec();
+                            let lan_port = self.preferences.lan_port();
                             let local_fs = self.local_fs_url();
                             settings_group(ui, "文件共享", |ui| {
                                 if settings_switch_row(
@@ -2233,6 +2237,11 @@ impl ClipSyncApp {
                                     lan_only,
                                 ) {
                                     action = Some(SettingsAction::LanOnly(!lan_only));
+                                }
+                                settings_divider(ui);
+                                let mut port = lan_port;
+                                if settings_port_row(ui, &mut port) {
+                                    action = Some(SettingsAction::LanPort(port));
                                 }
                                 if lan_share {
                                     for (index, root) in lan_roots.iter().enumerate() {
@@ -2521,6 +2530,10 @@ impl ClipSyncApp {
             }
             SettingsAction::LanOnly(enabled) => {
                 self.preferences.set_lan_only(enabled);
+                self.sync_lan_config();
+            }
+            SettingsAction::LanPort(port) => {
+                self.preferences.set_lan_port(port);
                 self.sync_lan_config();
             }
             SettingsAction::AddLanRoot => self.add_lan_root(),
@@ -7459,6 +7472,33 @@ fn settings_switch_row(ui: &mut Ui, title: &str, summary: &str, checked: bool) -
         },
     );
     response.clicked()
+}
+
+fn settings_port_row(ui: &mut Ui, port: &mut u16) -> bool {
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), SETTINGS_ROW_HEIGHT),
+        Sense::hover(),
+    );
+    let center = rect.center().y;
+    let title = row_line(
+        ui,
+        "局域网端口",
+        FontId::proportional(15.0),
+        theme::p().text,
+        120.0,
+    );
+    paint_line_at(
+        ui,
+        rect.left() + SETTINGS_PAD,
+        baseline_at(&title, center),
+        title,
+    );
+    let field = Rect::from_center_size(
+        Pos2::new(rect.right() - SETTINGS_PAD - 48.0, center),
+        Vec2::new(96.0, 24.0),
+    );
+    ui.put(field, DragValue::new(port).range(1024u16..=u16::MAX))
+        .changed()
 }
 
 fn settings_slider_row(ui: &mut Ui, title: &str, value: f32, max: f32) -> Option<f32> {
