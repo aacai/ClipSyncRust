@@ -6,7 +6,7 @@ use tokio::time::Instant;
 
 use crate::envelope::{ClipEnvelope, ClipPayload, FilePayload, PresenceEnvelope, PresencePayload};
 use crate::files::{sanitize_file_name, MAX_FILE_BYTES};
-use crate::lan::{LanBeacon, LanConfig, LanIdentity, LanPeer, LanRuntime};
+use crate::lan::{LanBeacon, LanConfig, LanIdentity, LanPeer, LanRuntime, SharedRoot};
 use crate::link::{self, LinkEvent, LinkHandle, MqttLink};
 use crate::protocol::{
     clip_topic, now_millis, parse_topic, presence_topic, random_mid, room_filter, room_hash,
@@ -109,6 +109,7 @@ pub enum Event {
     FileTooLarge(String),
     LanPeers(Vec<LanPeer>),
     LanSelf(crate::lan::LanInfo),
+    LanUnavailable(String),
 }
 
 #[derive(Debug)]
@@ -119,6 +120,11 @@ pub enum Command {
     PublishFile { file: FileUpload, announce: bool },
     Rename(String),
     RetryNow,
+    UpdateLan {
+        share: bool,
+        only: bool,
+        roots: Vec<SharedRoot>,
+    },
 }
 
 pub trait LinkFactory: Send + Sync + 'static {
@@ -152,6 +158,10 @@ impl EngineHandle {
         let _ = self.commands.send(Command::RetryNow);
     }
 
+    pub fn update_lan(&self, share: bool, only: bool, roots: Vec<SharedRoot>) {
+        let _ = self.commands.send(Command::UpdateLan { share, only, roots });
+    }
+
     pub fn leave(&self) {
         let _ = self.commands.send(Command::Leave);
     }
@@ -161,7 +171,14 @@ pub fn spawn<F: LinkFactory>(links: F) -> EngineHandle {
     spawn_with_lan(links, None)
 }
 
-pub fn spawn_with_lan<F: LinkFactory>(links: F, lan: Option<LanConfig>) -> EngineHandle {
+pub fn spawn_with_lan<F: LinkFactory>(links: F, mut lan: Option<LanConfig>) -> EngineHandle {
+    if let Some(config) = lan.as_mut() {
+        if config.fs_token.is_empty() {
+            let mut token = [0u8; 16];
+            getrandom::fill(&mut token).expect("os random unavailable");
+            config.fs_token = hex::encode(token);
+        }
+    }
     let (commands, command_rx) = mpsc::unbounded_channel();
     let (events, out) = mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -184,6 +201,8 @@ struct Engine<F: LinkFactory> {
     link: Option<LinkHandle>,
     inbound: Option<async_channel::Receiver<LinkEvent>>,
     lan_config: Option<LanConfig>,
+    lan_share: bool,
+    lan_only: bool,
     lan: Option<LanRuntime>,
     lan_rx: Option<async_channel::Receiver<(String, String)>>,
     lan_peer_rx: Option<async_channel::Receiver<LanBeacon>>,
@@ -209,6 +228,8 @@ impl<F: LinkFactory> Engine<F> {
             link: None,
             inbound: None,
             lan_config,
+            lan_share: false,
+            lan_only: false,
             lan: None,
             lan_rx: None,
             lan_peer_rx: None,
@@ -326,6 +347,33 @@ impl<F: LinkFactory> Engine<F> {
                     *recovery = Some(Instant::now());
                 }
             }
+            Command::UpdateLan { share, only, roots } => {
+                self.update_lan(share, only, roots, heartbeat, recovery).await;
+            }
+        }
+    }
+
+    async fn update_lan(
+        &mut self,
+        share: bool,
+        only: bool,
+        roots: Vec<SharedRoot>,
+        heartbeat: &mut Option<Instant>,
+        recovery: &mut Option<Instant>,
+    ) {
+        let roots = if share { roots } else { Vec::new() };
+        let changed = share != self.lan_share
+            || only != self.lan_only
+            || self.lan_config.as_ref().is_some_and(|config| config.fs_roots != roots);
+        self.lan_share = share;
+        self.lan_only = only;
+        if let Some(config) = self.lan_config.as_mut() {
+            config.fs_roots = roots;
+        }
+        if changed {
+            if let Some(config) = self.desired.clone() {
+                self.join(config, heartbeat, recovery).await;
+            }
         }
     }
 
@@ -365,7 +413,10 @@ impl<F: LinkFactory> Engine<F> {
         self.lan_peer_rx = None;
         self.lan_seen.clear();
         self.lan_peers.clear();
-        if let Some(lan) = self.lan_config.clone() {
+        if let Some(mut lan) = self.lan_config.clone() {
+            if !self.lan_share {
+                lan.fs_roots.clear();
+            }
             let (tx, rx) = async_channel::unbounded();
             let (peer_tx, peer_rx) = async_channel::unbounded();
             let identity = LanIdentity {
@@ -373,13 +424,16 @@ impl<F: LinkFactory> Engine<F> {
                 name: config.device_name.clone(),
                 os: config.device_os.clone(),
             };
-            if let Ok(runtime) =
-                LanRuntime::start(lan, identity, self.hash.clone(), tx, peer_tx).await
-            {
-                let _ = self.events.send(Event::LanSelf(runtime.info()));
-                self.lan = Some(runtime);
-                self.lan_rx = Some(rx);
-                self.lan_peer_rx = Some(peer_rx);
+            match LanRuntime::start(lan, identity, self.hash.clone(), tx, peer_tx).await {
+                Ok(runtime) => {
+                    let _ = self.events.send(Event::LanSelf(runtime.info()));
+                    self.lan = Some(runtime);
+                    self.lan_rx = Some(rx);
+                    self.lan_peer_rx = Some(peer_rx);
+                }
+                Err(error) => {
+                    let _ = self.events.send(Event::LanUnavailable(error));
+                }
             }
         }
         self.publish_lan_peers();
@@ -699,6 +753,9 @@ impl<F: LinkFactory> Engine<F> {
             let peers: Vec<LanPeer> = self.lan_peers.values().cloned().collect();
             runtime.publish(&peers, wire).await;
         }
+        if self.lan_only {
+            return;
+        }
         if let Some(handle) = self.link.clone() {
             let _ = handle.publish(topic, wire).await;
         }
@@ -881,6 +938,7 @@ impl<F: LinkFactory> Engine<F> {
                 os: beacon.os,
                 addrs: beacon.addrs,
                 port: beacon.port,
+                nonce: beacon.nonce,
             },
         );
         self.publish_lan_peers();

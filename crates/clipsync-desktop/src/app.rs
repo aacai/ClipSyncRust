@@ -16,7 +16,7 @@ use clipsync_core::engine::{Clip, Config, EngineHandle, Event, FileUpload, Peer,
 use clipsync_core::files::{
     human_size, is_image, mime_for_name, sanitize_file_name, MAX_FILE_BYTES,
 };
-use clipsync_core::lan::{blob_dir, LanPeer};
+use clipsync_core::lan::{blob_dir, LanPeer, SharedRoot, LAN_FS_PATH};
 use clipsync_core::protocol::{clip_topic, room_hash};
 use clipsync_core::RoomCrypto;
 
@@ -206,7 +206,7 @@ enum SettingsChoice {
     RecordMicDevice,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum SettingsAction {
     Theme,
     Language,
@@ -233,6 +233,11 @@ enum SettingsAction {
     RecordMicDevice,
     RecordMic(bool),
     RecordSystem(bool),
+    LanShare(bool),
+    LanOnly(bool),
+    AddLanRoot,
+    RemoveLanRoot(usize),
+    OpenUrl(String),
     EditRoom,
     About,
     LeaveRoom,
@@ -532,6 +537,7 @@ impl ClipSyncApp {
             preview_save_tx,
             preview_save_rx,
         };
+        app.sync_lan_config();
         let restore = app.preferences.remember_room() && app.settings.session.is_some();
         if !app.preferences.remember_room() {
             app.settings.forget();
@@ -665,6 +671,7 @@ impl ClipSyncApp {
                 Event::Peers(peers) => self.peers = peers,
                 Event::LanPeers(peers) => self.lan_peers = peers,
                 Event::LanSelf(info) => self.lan_self = Some(info),
+                Event::LanUnavailable(message) => self.notify_error(message),
                 Event::KeyMismatch(names) => self.mismatch = names,
                 Event::Clip(clip) => self.on_clip(clip),
                 Event::FileTooLarge(name) => self.notify_error(format!(
@@ -1027,7 +1034,40 @@ impl ClipSyncApp {
             lan_peers: self.lan_peers.clone(),
             lan_self: self.lan_self.clone(),
             lan_dir: blob_dir(),
+            lan_only: self.preferences.lan_only(),
         })
+    }
+
+    fn sync_lan_config(&mut self) {
+        self.engine.update_lan(
+            self.preferences.lan_share(),
+            self.preferences.lan_only(),
+            self.preferences.lan_roots().to_vec(),
+        );
+    }
+
+    fn add_lan_root(&mut self) {
+        let Some(path) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let mut roots = self.preferences.lan_roots().to_vec();
+        roots.push(SharedRoot { name, path });
+        self.preferences.set_lan_roots(roots);
+        self.sync_lan_config();
+    }
+
+    fn local_fs_url(&self) -> Option<String> {
+        let info = self.lan_self.as_ref()?;
+        let host = info.addrs.first()?;
+        Some(format!(
+            "http://{host}:{}{LAN_FS_PATH}?token={}",
+            info.port, info.nonce
+        ))
     }
 
     fn record_local(&mut self, text: &str) {
@@ -2172,6 +2212,56 @@ impl ClipSyncApp {
                             });
                             ui.add_space(14.0);
 
+                            let lan_share = self.preferences.lan_share();
+                            let lan_only = self.preferences.lan_only();
+                            let lan_roots = self.preferences.lan_roots().to_vec();
+                            let local_fs = self.local_fs_url();
+                            settings_group(ui, "文件共享", |ui| {
+                                if settings_switch_row(
+                                    ui,
+                                    "文件共享",
+                                    "把选中的目录作为网页开放给同屋设备；链接带访问令牌，别公开转发",
+                                    lan_share,
+                                ) {
+                                    action = Some(SettingsAction::LanShare(!lan_share));
+                                }
+                                settings_divider(ui);
+                                if settings_switch_row(
+                                    ui,
+                                    "仅局域网",
+                                    "剪贴板和文件只在局域网内发送，不走云端 broker；文件没有局域网同伴时不会上传",
+                                    lan_only,
+                                ) {
+                                    action = Some(SettingsAction::LanOnly(!lan_only));
+                                }
+                                if lan_share {
+                                    for (index, root) in lan_roots.iter().enumerate() {
+                                        settings_divider(ui);
+                                        if settings_action_row(
+                                            ui,
+                                            &format!("{} · {}", root.name, root.path.display()),
+                                        ) {
+                                            action = Some(SettingsAction::RemoveLanRoot(index));
+                                        }
+                                    }
+                                    settings_divider(ui);
+                                    if settings_action_row(ui, "添加共享目录") {
+                                        action = Some(SettingsAction::AddLanRoot);
+                                    }
+                                    settings_footnote(
+                                        ui,
+                                        "点目录行可从共享列表移除；添加目录后局域网服务会重建。",
+                                    );
+                                }
+                                if let Some(url) = local_fs {
+                                    settings_divider(ui);
+                                    if settings_action_row(ui, "本机文件网页") {
+                                        action = Some(SettingsAction::OpenUrl(url));
+                                    }
+                                }
+                            });
+                            ui.add_space(14.0);
+
                             let watch = self.watch_clipboard;
                             let auto_copy = self.auto_copy;
                             let auto_paste_file = self.auto_paste_file;
@@ -2424,6 +2514,28 @@ impl ClipSyncApp {
             SettingsAction::DeleteExpired(enabled) => self.set_delete_expired(enabled),
             SettingsAction::ScreenshotKeepWindow(enabled) => {
                 self.preferences.set_screenshot_keep_window(enabled);
+            }
+            SettingsAction::LanShare(enabled) => {
+                self.preferences.set_lan_share(enabled);
+                self.sync_lan_config();
+            }
+            SettingsAction::LanOnly(enabled) => {
+                self.preferences.set_lan_only(enabled);
+                self.sync_lan_config();
+            }
+            SettingsAction::AddLanRoot => self.add_lan_root(),
+            SettingsAction::RemoveLanRoot(index) => {
+                let mut roots = self.preferences.lan_roots().to_vec();
+                if index < roots.len() {
+                    roots.remove(index);
+                    self.preferences.set_lan_roots(roots);
+                    self.sync_lan_config();
+                }
+            }
+            SettingsAction::OpenUrl(url) => {
+                if let Err(error) = paths::open_path(&url) {
+                    self.notify_error(format!("打开浏览器失败：{error}"));
+                }
             }
             SettingsAction::EditRoom => self.open(Overlay::Share),
             SettingsAction::About => self.open(Overlay::About),
@@ -4592,6 +4704,7 @@ impl ClipSyncApp {
                         ui.add_space(12.0);
                         field_label(ui, "同屋设备");
                         ui.add_space(4.0);
+                        let mut open_error: Option<String> = None;
                         if self.peers.is_empty() && self.mismatch.is_empty() {
                             hint(ui, "暂时没有其他设备。");
                         } else {
@@ -4619,6 +4732,19 @@ impl ClipSyncApp {
                                     ui.with_layout(
                                         Layout::right_to_left(Align::Center),
                                         |ui| {
+                                            if let Some(lan) =
+                                                self.lan_peers.iter().find(|item| item.id == peer.id)
+                                            {
+                                                if let Some(url) = peer_fs_url(lan) {
+                                                    if ui.small_button("浏览文件").clicked() {
+                                                        if let Err(error) = paths::open_path(&url) {
+                                                            open_error = Some(format!(
+                                                                "打开浏览器失败：{error}"
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             let (label, color) = if connected {
                                                 ("一致", theme::p().green)
                                             } else {
@@ -4657,6 +4783,9 @@ impl ClipSyncApp {
                                 ui.add_space(6.0);
                             }
                         }
+                        if let Some(message) = open_error {
+                            self.notify_error(message);
+                        }
                         ui.add_space(10.0);
                         for point in [
                             "安全码是本房间密钥的指纹：由房间码加上房间密码算出来，只用来当面核对，本身泄露不了内容。",
@@ -4677,21 +4806,67 @@ impl ClipSyncApp {
                         ui.add_space(12.0);
                         let mine = self.sender_name();
                         let mine_os = paths::device_os();
+                        let mut open_error: Option<String> = None;
                         egui::ScrollArea::vertical()
                             .max_height(360.0)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 device_row(ui, &mine, mine_os, true);
                                 ui.add_space(6.0);
-                                if self.peers.is_empty() {
+                                if self.peers.is_empty() && self.lan_peers.is_empty() {
                                     hint(ui, "暂时没有其他设备在线。");
                                 } else {
                                     for peer in &self.peers {
                                         device_row(ui, &peer.name, &peer.os, false);
+                                        if let Some(lan) =
+                                            self.lan_peers.iter().find(|item| item.id == peer.id)
+                                        {
+                                            if let Some(url) = peer_fs_url(lan) {
+                                                if ui.small_button("浏览文件").clicked() {
+                                                    if let Err(error) = paths::open_path(&url) {
+                                                        open_error = Some(format!(
+                                                            "打开浏览器失败：{error}"
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
                                         ui.add_space(6.0);
+                                    }
+                                    if !self.lan_peers.is_empty() {
+                                        field_label(ui, "局域网设备");
+                                        for lan in &self.lan_peers {
+                                            ui.horizontal(|ui| {
+                                                ui.vertical(|ui| {
+                                                    ui.label(
+                                                        RichText::new(&lan.name)
+                                                            .size(12.5)
+                                                            .color(theme::p().text),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new(&lan.os)
+                                                            .size(10.5)
+                                                            .color(theme::p().faint),
+                                                    );
+                                                });
+                                                if let Some(url) = peer_fs_url(lan) {
+                                                    if ui.small_button("浏览文件").clicked() {
+                                                        if let Err(error) = paths::open_path(&url) {
+                                                            open_error = Some(format!(
+                                                                "打开浏览器失败：{error}"
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                            ui.add_space(6.0);
+                                        }
                                     }
                                 }
                             });
+                        if let Some(message) = open_error {
+                            self.notify_error(message);
+                        }
                         ui.add_space(14.0);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if secondary_button(ui, "关闭").clicked() {
@@ -7046,6 +7221,11 @@ fn live_path(file: &FileInfo) -> Option<String> {
     file.local_path
         .clone()
         .filter(|path| std::fs::metadata(path).is_ok())
+}
+
+fn peer_fs_url(peer: &LanPeer) -> Option<String> {
+    let base = peer.base()?;
+    (!peer.nonce.is_empty()).then(|| format!("{base}{LAN_FS_PATH}?token={}", peer.nonce))
 }
 
 fn after_hint(after: DownloadAfter) -> String {

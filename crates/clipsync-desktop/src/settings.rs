@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use clipsync_core::crypto::{
     aes_gcm_decrypt, aes_gcm_encrypt, random_iv, sha256, IV_SIZE, TAG_SIZE,
 };
+use clipsync_core::lan::SharedRoot;
 
 const SALT: &[u8] = b"clipsync.room-vault.";
 const AAD: &[u8] = b"clipsync.settings";
@@ -106,6 +107,9 @@ struct StoredPreferences {
     background: Option<String>,
     background_dim: f32,
     glass_frost: f32,
+    lan_share: bool,
+    lan_only: bool,
+    lan_roots: Vec<SharedRoot>,
 }
 
 fn de_theme<'de, D>(deserializer: D) -> Result<ThemeMode, D::Error>
@@ -160,6 +164,9 @@ impl Default for StoredPreferences {
             background: None,
             background_dim: DEFAULT_BACKGROUND_DIM,
             glass_frost: DEFAULT_GLASS_FROST,
+            lan_share: false,
+            lan_only: false,
+            lan_roots: Vec::new(),
         }
     }
 }
@@ -290,6 +297,37 @@ impl Preferences {
 
     pub fn glass_frost(&self) -> f32 {
         frost_of(self.stored.glass_frost)
+    }
+
+    pub fn lan_share(&self) -> bool {
+        self.stored.lan_share
+    }
+
+    pub fn lan_only(&self) -> bool {
+        self.stored.lan_only
+    }
+
+    pub fn lan_roots(&self) -> &[SharedRoot] {
+        &self.stored.lan_roots
+    }
+
+    pub fn set_lan_share(&mut self, enabled: bool) {
+        self.stored.lan_share = enabled;
+        self.save();
+    }
+
+    pub fn set_lan_only(&mut self, enabled: bool) {
+        self.stored.lan_only = enabled;
+        self.save();
+    }
+
+    pub fn set_lan_roots(&mut self, roots: Vec<SharedRoot>) {
+        let mut seen = std::collections::HashSet::new();
+        self.stored.lan_roots = roots
+            .into_iter()
+            .filter(|root| seen.insert(root.path.clone()))
+            .collect();
+        self.save();
     }
 
     pub fn set_background(&mut self, path: Option<String>) {

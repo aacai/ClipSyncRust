@@ -24,6 +24,7 @@ pub struct JobContext {
     pub lan_peers: Vec<LanPeer>,
     pub lan_self: Option<clipsync_core::lan::LanInfo>,
     pub lan_dir: PathBuf,
+    pub lan_only: bool,
 }
 
 /// 这间房已经挂上托管方的那几份：链接还活着就复用，同一份内容不传第二遍。
@@ -242,6 +243,8 @@ pub fn perform_upload(
                 std::fs::write(context.lan_dir.join(&blob_name), &encrypted.cipher)
                     .map_err(|error| format!("写入局域网文件失败：{error}"))?;
                 (link, now_millis() + LAN_LINK_TTL_MS)
+            } else if context.lan_only {
+                return Err(format!("局域网不可用，文件未发送：{safe}"));
             } else {
                 let uploaded = context
                     .client
@@ -376,6 +379,7 @@ mod tests {
             lan_peers: Vec::new(),
             lan_self: None,
             lan_dir: std::env::temp_dir(),
+            lan_only: false,
         }
     }
 
@@ -529,6 +533,7 @@ mod tests {
             lan_peers: Vec::new(),
             lan_self: None,
             lan_dir: std::env::temp_dir(),
+            lan_only: false,
         };
 
         let first = super::perform_upload(&context, upload_request(), |_, _| {}).expect("upload");
@@ -553,6 +558,7 @@ mod tests {
             lan_peers: Vec::new(),
             lan_self: None,
             lan_dir: std::env::temp_dir(),
+            lan_only: false,
         };
         super::perform_upload(&context, upload_request(), |_, _| {}).expect("upload");
 
@@ -567,6 +573,7 @@ mod tests {
             lan_peers: Vec::new(),
             lan_self: None,
             lan_dir: std::env::temp_dir(),
+            lan_only: false,
         };
         let done = super::perform_upload(&other, upload_request(), |_, _| {}).expect("upload");
 
