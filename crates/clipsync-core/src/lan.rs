@@ -170,6 +170,7 @@ button:hover { color:var(--accent); }
 </html>"#;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+const BLOB_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_HEAD: usize = 16 * 1024;
 const MAX_BODY: usize = 64 * 1024 * 1024 + 4096;
 const BEACON_INTERVAL: Duration = Duration::from_millis(1500);
@@ -464,6 +465,44 @@ impl LanRuntime {
         }
         delivered
     }
+}
+
+pub fn push_blob(peers: &[LanPeer], room_hash: &str, name: &str, bytes: &[u8]) -> usize {
+    if !valid_blob_name(name) || peers.is_empty() {
+        return 0;
+    }
+    let path = format!("/{ROOT}/{room_hash}/{BLOB_SEGMENT}/{name}");
+    let mut delivered = 0;
+    for peer in peers {
+        for host in &peer.addrs {
+            if send_blocking(host, peer.port, &path, "PUT", bytes).is_ok() {
+                delivered += 1;
+                break;
+            }
+        }
+    }
+    delivered
+}
+
+pub fn blob_name_from_link(link: &str) -> Option<&str> {
+    let marker = format!("/{BLOB_SEGMENT}/");
+    let index = link.rfind(&marker)?;
+    let name = link[index + marker.len()..].split('?').next()?.trim();
+    valid_blob_name(name).then_some(name)
+}
+
+pub fn blob_name_for_sha(sha256: &str) -> String {
+    format!("cs-{sha256}.bin")
+}
+
+pub fn read_local_blob(dir: &Path, link: &str, sha256: &str) -> Option<Vec<u8>> {
+    if let Some(name) = blob_name_from_link(link) {
+        if let Ok(bytes) = std::fs::read(dir.join(name)) {
+            return Some(bytes);
+        }
+    }
+    let by_sha = blob_name_for_sha(sha256);
+    std::fs::read(dir.join(by_sha)).ok()
 }
 
 async fn spawn_discovery(
@@ -881,7 +920,7 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
         return None;
     }
     while buffer.len() < head_end + length {
-        let read = timeout(REQUEST_TIMEOUT, stream.read(&mut chunk))
+        let read = timeout(BLOB_TIMEOUT, stream.read(&mut chunk))
             .await
             .ok()?
             .ok()?;
@@ -918,6 +957,48 @@ async fn send(host: &str, port: u16, path: &str, method: &str, body: &[u8]) -> R
     timeout(REQUEST_TIMEOUT, stream.read_to_end(&mut response))
         .await
         .map_err(|_| "超时".to_string())?
+        .map_err(|error| error.to_string())?;
+    let split = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| "响应无头部".to_string())?;
+    let head = String::from_utf8_lossy(&response[..split]);
+    if !head.starts_with("HTTP/1.1 200") {
+        return Err(head.lines().next().unwrap_or("HTTP").to_string());
+    }
+    Ok(response[split + 4..].to_vec())
+}
+
+fn send_blocking(host: &str, port: u16, path: &str, method: &str, body: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream as StdTcpStream;
+
+    let addr = SocketAddr::new(
+        host.parse()
+            .map_err(|error| format!("地址无效：{error}"))?,
+        port,
+    );
+    let mut stream = StdTcpStream::connect_timeout(&addr, BLOB_TIMEOUT)
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(BLOB_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(BLOB_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    let header = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(header.as_bytes())
+        .map_err(|error| error.to_string())?;
+    stream
+        .write_all(body)
+        .map_err(|error| error.to_string())?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
         .map_err(|error| error.to_string())?;
     let split = response
         .windows(4)

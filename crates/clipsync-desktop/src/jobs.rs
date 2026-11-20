@@ -8,7 +8,9 @@ use clipsync_core::files::{
     decrypt_file, encrypt_file_with_sha, max_mb, sanitize_file_name, upload_file_name,
     validate_outgoing_file, RejectReason, MAX_FILE_BYTES,
 };
-use clipsync_core::lan::{LanPeer, BLOB_SEGMENT, LAN_LINK_TTL_MS};
+use clipsync_core::lan::{
+    blob_name_for_sha, push_blob, read_local_blob, LanPeer, BLOB_SEGMENT, LAN_LINK_TTL_MS,
+};
 use clipsync_core::protocol::{now_millis, random_mid, ROOT};
 use clipsync_core::RoomCrypto;
 
@@ -221,16 +223,35 @@ pub fn perform_upload(
                 &sha,
             )
             .map_err(|error| format!("加密失败：{error}"))?;
-            let blob_name = upload_file_name();
+            let cloud_name = upload_file_name();
+            let lan_blob = blob_name_for_sha(&sha);
             let lan_base = context.lan_self.as_ref().and_then(|info| {
                 info.addrs
                     .first()
                     .map(|host| format!("http://{host}:{}", info.port))
             });
-            let lan_link = if !context.lan_peers.is_empty() {
+            let lan_ready = if !context.lan_peers.is_empty() {
+                let wrote = std::fs::create_dir_all(&context.lan_dir)
+                    .and_then(|_| {
+                        std::fs::write(context.lan_dir.join(&lan_blob), &encrypted.cipher)
+                    })
+                    .is_ok();
+                if wrote {
+                    push_blob(
+                        &context.lan_peers,
+                        &context.room_hash,
+                        &lan_blob,
+                        &encrypted.cipher,
+                    );
+                }
+                wrote
+            } else {
+                false
+            };
+            let lan_link = if lan_ready {
                 lan_base.map(|base| {
                     format!(
-                        "{base}/{ROOT}/{}/{BLOB_SEGMENT}/{blob_name}",
+                        "{base}/{ROOT}/{}/{BLOB_SEGMENT}/{lan_blob}",
                         context.room_hash
                     )
                 })
@@ -238,17 +259,13 @@ pub fn perform_upload(
                 None
             };
             let (link, expires_at) = if let Some(link) = lan_link {
-                std::fs::create_dir_all(&context.lan_dir)
-                    .map_err(|error| format!("建立局域网目录失败：{error}"))?;
-                std::fs::write(context.lan_dir.join(&blob_name), &encrypted.cipher)
-                    .map_err(|error| format!("写入局域网文件失败：{error}"))?;
                 (link, now_millis() + LAN_LINK_TTL_MS)
             } else if context.lan_only {
                 return Err(format!("局域网不可用，文件未发送：{safe}"));
             } else {
                 let uploaded = context
                     .client
-                    .upload(&blob_name, &encrypted.cipher, on_progress)?;
+                    .upload(&cloud_name, &encrypted.cipher, on_progress)?;
                 (uploaded.url, uploaded.expires_at)
             };
             context.live.put(&key, &link, expires_at);
@@ -299,7 +316,15 @@ pub fn perform_download(
             display_name(&request.name)
         ));
     }
-    let cipher = context.client.download(&request.link, on_progress)?;
+    let cipher = match read_local_blob(&context.lan_dir, &request.link, &request.sha256) {
+        Some(bytes) => {
+            let total = bytes.len() as i64;
+            let mut on_progress = on_progress;
+            on_progress(total, total);
+            bytes
+        }
+        None => context.client.download(&request.link, on_progress)?,
+    };
     let plain = decrypt_file(
         &context.crypto,
         &context.clip_topic,
