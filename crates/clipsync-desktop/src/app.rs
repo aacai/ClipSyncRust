@@ -728,10 +728,11 @@ impl ClipSyncApp {
             }
             let placed = self.clipboard.write(&clip.text);
             if added.inserted {
-                if placed {
-                    self.notify(format!("收到 {sender} 的文本，已进剪贴板"));
-                } else {
-                    self.notify_error(format!("收到 {sender} 的文本，但写入剪贴板失败"));
+                match placed {
+                    Ok(()) => self.notify(format!("收到 {sender} 的文本，已进剪贴板")),
+                    Err(error) => self.notify_error(format!(
+                        "收到 {sender} 的文本，但写入剪贴板失败：{error}"
+                    )),
                 }
             }
         }
@@ -872,10 +873,9 @@ impl ClipSyncApp {
             self.notify(format!("已收到文件 {name}"));
             return;
         }
-        if self.clipboard.write_files(&[PathBuf::from(path)]) {
-            self.notify(format!("{name} 已放进剪贴板，可直接粘贴"));
-        } else {
-            self.notify_error("写入剪贴板失败");
+        match self.clipboard.write_files(&[PathBuf::from(path)]) {
+            Ok(()) => self.notify(format!("{name} 已放进剪贴板，可直接粘贴")),
+            Err(error) => self.notify_error(format!("写入剪贴板失败：{error}")),
         }
     }
 
@@ -1860,10 +1860,11 @@ impl ClipSyncApp {
                 let path = PathBuf::from(preview.path());
                 if !path.is_file() {
                     self.notify_error("文件已经不在，无法分享");
-                } else if self.clipboard.write_files(&[path]) {
-                    self.notify("录像已放进剪贴板，可直接粘贴");
                 } else {
-                    self.notify_error("写入剪贴板失败");
+                    match self.clipboard.write_files(&[path]) {
+                        Ok(()) => self.notify("录像已放进剪贴板，可直接粘贴"),
+                        Err(error) => self.notify_error(format!("写入剪贴板失败：{error}")),
+                    }
                 }
             }
             Some(preview::Action::Download) => {
@@ -2568,10 +2569,9 @@ impl ClipSyncApp {
         if text.is_empty() {
             return;
         }
-        if self.clipboard.write(text) {
-            self.notify(message);
-        } else {
-            self.notify_error("写入剪贴板失败");
+        match self.clipboard.write(text) {
+            Ok(()) => self.notify(message),
+            Err(error) => self.notify_error(format!("写入剪贴板失败：{error}")),
         }
     }
 
@@ -2584,10 +2584,9 @@ impl ClipSyncApp {
             return;
         };
         if let Some(path) = live_path(&file) {
-            if self.clipboard.write_files(&[PathBuf::from(path)]) {
-                self.notify("已把文件放进剪贴板，可直接粘贴");
-            } else {
-                self.notify_error("写入剪贴板失败");
+            match self.clipboard.write_files(&[PathBuf::from(path)]) {
+                Ok(()) => self.notify("已把文件放进剪贴板，可直接粘贴"),
+                Err(error) => self.notify_error(format!("写入剪贴板失败：{error}")),
             }
         } else if is_image(&file.mime) {
             self.request_download(id, DownloadAfter::CopyImage);
@@ -3106,10 +3105,9 @@ impl ClipSyncApp {
             return;
         }
         let json = self.history.export_json(&ids);
-        if self.clipboard.write(&json) {
-            self.notify(format!("已把 {} 条导出到剪贴板", ids.len()));
-        } else {
-            self.notify_error("写入剪贴板失败");
+        match self.clipboard.write(&json) {
+            Ok(()) => self.notify(format!("已把 {} 条导出到剪贴板", ids.len())),
+            Err(error) => self.notify_error(format!("写入剪贴板失败：{error}")),
         }
     }
 

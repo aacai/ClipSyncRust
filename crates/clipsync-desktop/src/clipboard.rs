@@ -24,6 +24,10 @@ pub(crate) fn pasteboard_lock() -> std::sync::MutexGuard<'static, ()> {
 const WRITE_ATTEMPTS: usize = 6;
 const WRITE_RETRY: Duration = Duration::from_millis(25);
 
+fn clear_clipboard(clipboard: &mut Clipboard) -> Result<(), String> {
+    clipboard.clear().map_err(|error| format!("清空剪贴板失败：{error}"))
+}
+
 /// How long a text we broadcast stays "ours". Long enough that the room's reply can no
 /// longer overwrite a copy the user just made, short enough that copying the same text
 /// again five minutes later is still a real clip.
@@ -223,11 +227,11 @@ impl ClipboardWatcher {
         self.last_change = pasteboard_change_count();
     }
 
-    pub fn write(&mut self, text: &str) -> bool {
+    pub fn write(&mut self, text: &str) -> Result<(), String> {
         self.filter.wrote(text);
-        let Some(clipboard) = self.clipboard.as_mut() else {
-            return false;
-        };
+        let clipboard = self.clipboard.as_mut().ok_or("剪贴板不可用")?;
+        clear_clipboard(clipboard)?;
+        let mut failure = None;
         let mut placed = false;
         for attempt in 0..WRITE_ATTEMPTS {
             match clipboard.set_text(text) {
@@ -235,11 +239,21 @@ impl ClipboardWatcher {
                     placed = true;
                     break;
                 }
-                Err(_) if attempt + 1 < WRITE_ATTEMPTS => std::thread::sleep(WRITE_RETRY),
-                Err(_) => break,
+                Err(error) => {
+                    failure = Some(format!("写入文本失败：{error}"));
+                    if attempt + 1 < WRITE_ATTEMPTS {
+                        std::thread::sleep(WRITE_RETRY);
+                    }
+                }
             }
         }
-        placed && clipboard.get_text().is_ok_and(|back| back == text)
+        if !placed {
+            return Err(failure.unwrap_or_else(|| "写入文本失败".to_string()));
+        }
+        if !clipboard.get_text().is_ok_and(|back| back == text) {
+            return Err("写入后回读不一致：剪贴板可能仍被旧内容或延迟渲染占用".to_string());
+        }
+        Ok(())
     }
 
     pub fn note_published(&mut self, text: &str) {
@@ -252,23 +266,23 @@ impl ClipboardWatcher {
         self.filter.echoed(text) || self.filter.own_write.as_deref() == Some(text)
     }
 
-    pub fn write_files(&mut self, paths: &[PathBuf]) -> bool {
+    pub fn write_files(&mut self, paths: &[PathBuf]) -> Result<(), String> {
         if paths.is_empty() {
-            return false;
+            return Err("没有可复制的文件".to_string());
         }
-        let Some(clipboard) = self.clipboard.as_mut() else {
-            return false;
-        };
-        if clipboard.set().file_list(paths).is_err() {
-            return false;
-        }
+        let clipboard = self.clipboard.as_mut().ok_or("剪贴板不可用")?;
+        clear_clipboard(clipboard)?;
+        clipboard
+            .set()
+            .file_list(paths)
+            .map_err(|error| format!("写入文件列表失败：{error}"))?;
         let files = read_files(clipboard);
         self.own_files = Some(if files.is_empty() {
             signature_from_paths(paths)
         } else {
             signature_of(&files)
         });
-        true
+        Ok(())
     }
 
     pub fn write_image(&mut self, png: &[u8]) -> Result<(), String> {
@@ -276,6 +290,9 @@ impl ClipboardWatcher {
         let rgba = decoded.to_rgba8();
         let (width, height) = rgba.dimensions();
         let hash = image_hash(rgba.as_raw(), width, height);
+        if let Some(clipboard) = self.clipboard.as_mut() {
+            clear_clipboard(clipboard)?;
+        }
         #[cfg(target_os = "macos")]
         {
             write_macos_image(png)?;
@@ -568,12 +585,12 @@ mod tests {
             return;
         };
         let text = format!("clipsync-write-check-{}", std::process::id());
-        assert!(watcher.write(&text));
+        assert!(watcher.write(&text).is_ok());
         assert_eq!(
             watcher.clipboard.as_mut().and_then(|c| c.get_text().ok()),
             Some(text)
         );
-        assert!(watcher.write(&original));
+        assert!(watcher.write(&original).is_ok());
     }
 
     #[test]
