@@ -92,6 +92,7 @@ struct StoredPreferences {
     auto_copy: bool,
     /// 收到文件自动下载后直接放进剪贴板，用户 Cmd/Ctrl+V 就能粘走。
     auto_paste_file: bool,
+    click_to_copy: bool,
     watch_images: bool,
     watch_files: bool,
     launch_at_login: bool,
@@ -154,6 +155,7 @@ impl Default for StoredPreferences {
             watch_clipboard: true,
             auto_copy: true,
             auto_paste_file: true,
+            click_to_copy: false,
             watch_images: true,
             watch_files: true,
             launch_at_login: false,
@@ -220,6 +222,10 @@ impl Preferences {
 
     pub fn auto_paste_file(&self) -> bool {
         self.stored.auto_paste_file
+    }
+
+    pub fn click_to_copy(&self) -> bool {
+        self.stored.click_to_copy
     }
 
     pub fn watch_images(&self) -> bool {
@@ -402,6 +408,11 @@ impl Preferences {
 
     pub fn set_auto_paste_file(&mut self, enabled: bool) {
         self.stored.auto_paste_file = enabled;
+        self.save();
+    }
+
+    pub fn set_click_to_copy(&mut self, enabled: bool) {
+        self.stored.click_to_copy = enabled;
         self.save();
     }
 
@@ -682,6 +693,7 @@ mod tests {
         assert!(loaded.watch_clipboard());
         assert!(loaded.auto_copy());
         assert!(loaded.auto_paste_file());
+        assert!(!loaded.click_to_copy());
         assert!(loaded.watch_images());
         assert!(loaded.watch_files());
         assert!(!loaded.launch_at_login());
@@ -708,6 +720,7 @@ mod tests {
             loaded.set_watch_clipboard(false);
             loaded.set_auto_copy(false);
             loaded.set_auto_paste_file(false);
+            loaded.set_click_to_copy(true);
             loaded.set_watch_images(false);
             loaded.set_watch_files(false);
             loaded.set_launch_at_login(true);
@@ -724,6 +737,7 @@ mod tests {
         assert!(!loaded.watch_clipboard());
         assert!(!loaded.auto_copy());
         assert!(!loaded.auto_paste_file());
+        assert!(loaded.click_to_copy());
         assert!(!loaded.watch_images());
         assert!(!loaded.watch_files());
         assert!(loaded.launch_at_login());
@@ -751,6 +765,7 @@ mod tests {
         // 老文件里没有这个键，得按 compose 的默认值来，不能当成用户关过
         assert!(loaded.auto_copy());
         assert!(loaded.auto_paste_file());
+        assert!(!loaded.click_to_copy());
         assert_eq!(loaded.screenshot_hotkey(), "Alt+A");
         cleanup(&path);
     }

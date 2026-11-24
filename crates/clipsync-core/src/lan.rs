@@ -287,6 +287,8 @@ pub fn local_addrs() -> Vec<String> {
         if let Some(index) = found.iter().position(|host| host == &via) {
             let primary = found.remove(index);
             found.insert(0, primary);
+        } else {
+            found.insert(0, via);
         }
     }
     found
@@ -319,29 +321,84 @@ fn route_addr() -> Option<String> {
 }
 
 fn get_if_addrs() -> Result<Vec<IpAddr>, String> {
-    let script = if cfg!(windows) {
-        "Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -ne '127.0.0.1'} | Select-Object -ExpandProperty IPAddress"
+    let mut addrs = if cfg!(windows) {
+        get_if_addrs_windows().unwrap_or_default()
     } else {
-        "ifconfig 2>/dev/null | grep -o 'inet [0-9.]*' | awk '{print $2}' || ip -4 addr show 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1"
+        get_if_addrs_unix().unwrap_or_default()
     };
-    let output = if cfg!(windows) {
-        std::process::Command::new("powershell")
-            .arg("-NoProfile")
-            .arg("-Command")
-            .arg(script)
-            .output()
-    } else {
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(script)
-            .output()
+    if addrs.is_empty() {
+        if let Some(via) = route_addr().and_then(|host| host.parse().ok()) {
+            addrs.push(via);
+        }
     }
-    .map_err(|error| error.to_string())?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    Ok(text
-        .lines()
+    Ok(addrs)
+}
+
+fn get_if_addrs_unix() -> Result<Vec<IpAddr>, String> {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("ifconfig 2>/dev/null | grep -o 'inet [0-9.]*' | awk '{print $2}' || ip -4 addr show 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1")
+        .output()
+        .map_err(|error| error.to_string())?;
+    Ok(parse_addr_lines(&String::from_utf8_lossy(&output.stdout)))
+}
+
+fn get_if_addrs_windows() -> Result<Vec<IpAddr>, String> {
+    let powershell = std::process::Command::new("powershell")
+        .arg("-NoProfile")
+        .arg("-Command")
+        .arg("Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -ne '127.0.0.1'} | Select-Object -ExpandProperty IPAddress")
+        .output();
+    let mut addrs = powershell
+        .ok()
+        .map(|output| parse_addr_lines(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default();
+    if addrs.is_empty() {
+        let output = std::process::Command::new("ipconfig")
+            .output()
+            .map_err(|error| error.to_string())?;
+        addrs = parse_windows_ipconfig(&String::from_utf8_lossy(&output.stdout));
+    }
+    Ok(addrs)
+}
+
+fn parse_addr_lines(text: &str) -> Vec<IpAddr> {
+    text.lines()
         .filter_map(|line| line.trim().parse::<IpAddr>().ok())
-        .collect())
+        .collect()
+}
+
+fn parse_windows_ipconfig(text: &str) -> Vec<IpAddr> {
+    text.lines()
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("ipv4") || lower.contains("ip address")
+        })
+        .filter_map(|line| {
+            line.rsplit_once(':')
+                .or_else(|| line.rsplit_once('：'))
+                .map(|(_, value)| value.trim())
+                .and_then(|value| value.parse::<IpAddr>().ok())
+        })
+        .collect()
+}
+
+fn broadcast_targets() -> Vec<SocketAddr> {
+    let mut targets = vec![SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::BROADCAST),
+        LAN_DISCOVERY_PORT,
+    )];
+    for host in local_addrs() {
+        let Ok(ip) = host.parse::<Ipv4Addr>() else {
+            continue;
+        };
+        let o = ip.octets();
+        let directed = Ipv4Addr::new(o[0], o[1], o[2], 255);
+        targets.push(SocketAddr::new(IpAddr::V4(directed), LAN_DISCOVERY_PORT));
+    }
+    targets.sort();
+    targets.dedup();
+    targets
 }
 
 #[derive(Clone)]
@@ -411,7 +468,12 @@ impl LanRuntime {
     }
 
     pub fn info(&self) -> LanInfo {
-        self.inner.info.clone()
+        let mut info = self.inner.info.clone();
+        let addrs = local_addrs();
+        if !addrs.is_empty() {
+            info.addrs = addrs;
+        }
+        info
     }
 
     pub fn room_hash(&self) -> &str {
@@ -524,14 +586,22 @@ async fn spawn_discovery(
         room_hash: room_hash.clone(),
         nonce: info.nonce,
     };
-    let wire = serde_json::to_vec(&beacon).map_err(|error| error.to_string())?;
-    let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), LAN_DISCOVERY_PORT);
     let task = tokio::spawn(async move {
         let mut buf = [0u8; 8192];
+        let mut beacon = beacon;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(BEACON_INTERVAL) => {
-                    let _ = socket.send_to(&wire, target).await;
+                    let addrs = local_addrs();
+                    if !addrs.is_empty() {
+                        beacon.addrs = addrs;
+                    }
+                    let Ok(wire) = serde_json::to_vec(&beacon) else {
+                        continue;
+                    };
+                    for target in broadcast_targets() {
+                        let _ = socket.send_to(&wire, target).await;
+                    }
                 }
                 result = socket.recv_from(&mut buf) => {
                     let Ok((len, from)) = result else { break };

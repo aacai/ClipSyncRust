@@ -129,6 +129,7 @@ pub struct ClipSyncApp {
     watch_clipboard: bool,
     auto_copy: bool,
     auto_paste_file: bool,
+    click_to_copy: bool,
     watch_files: bool,
     watch_images: bool,
     update: UpdateState,
@@ -223,6 +224,7 @@ enum SettingsAction {
     WatchClipboard(bool),
     AutoCopy(bool),
     AutoPasteFile(bool),
+    ClickToCopy(bool),
     WatchImages(bool),
     WatchFiles(bool),
     DeleteExpired(bool),
@@ -389,6 +391,7 @@ enum ToolAction {
 
 enum AppEvent {
     Activate(String),
+    Focus(String),
     TogglePick(String),
     Copy(String),
     Publish(String),
@@ -453,6 +456,7 @@ impl ClipSyncApp {
         let watch_clipboard = preferences.watch_clipboard();
         let auto_copy = preferences.auto_copy();
         let auto_paste_file = preferences.auto_paste_file();
+        let click_to_copy = preferences.click_to_copy();
         let watch_files = preferences.watch_files();
         let watch_images = preferences.watch_images();
         let theme_mode = preferences.theme();
@@ -512,6 +516,7 @@ impl ClipSyncApp {
             watch_clipboard,
             auto_copy,
             auto_paste_file,
+            click_to_copy,
             watch_files,
             watch_images,
             update: UpdateState::Idle,
@@ -1243,6 +1248,11 @@ impl ClipSyncApp {
     fn set_auto_paste_file(&mut self, enabled: bool) {
         self.auto_paste_file = enabled;
         self.preferences.set_auto_paste_file(enabled);
+    }
+
+    fn set_click_to_copy(&mut self, enabled: bool) {
+        self.click_to_copy = enabled;
+        self.preferences.set_click_to_copy(enabled);
     }
 
     fn set_watch_images(&mut self, enabled: bool) {
@@ -2278,6 +2288,7 @@ impl ClipSyncApp {
                             let watch = self.watch_clipboard;
                             let auto_copy = self.auto_copy;
                             let auto_paste_file = self.auto_paste_file;
+                            let click_to_copy = self.click_to_copy;
                             let watch_images = self.watch_images;
                             let watch_files = self.watch_files;
                             settings_group(ui, "剪贴板", |ui| {
@@ -2329,6 +2340,15 @@ impl ClipSyncApp {
                                 ) {
                                     action =
                                         Some(SettingsAction::AutoPasteFile(!auto_paste_file));
+                                }
+                                settings_divider(ui);
+                                if settings_switch_row(
+                                    ui,
+                                    "点击条目即复制",
+                                    "开启后点一下历史条目就写入剪贴板；关闭时只选中该条，仍可用复制按钮或 Cmd/Ctrl+C。Delete/Backspace 删除所选",
+                                    click_to_copy,
+                                ) {
+                                    action = Some(SettingsAction::ClickToCopy(!click_to_copy));
                                 }
                             });
                             ui.add_space(14.0);
@@ -2522,6 +2542,7 @@ impl ClipSyncApp {
             SettingsAction::WatchClipboard(enabled) => self.set_watch_clipboard(enabled),
             SettingsAction::AutoCopy(enabled) => self.set_auto_copy(enabled),
             SettingsAction::AutoPasteFile(enabled) => self.set_auto_paste_file(enabled),
+            SettingsAction::ClickToCopy(enabled) => self.set_click_to_copy(enabled),
             SettingsAction::WatchImages(enabled) => self.set_watch_images(enabled),
             SettingsAction::WatchFiles(enabled) => self.set_watch_files(enabled),
             SettingsAction::DeleteExpired(enabled) => self.set_delete_expired(enabled),
@@ -3490,6 +3511,7 @@ impl ClipSyncApp {
                 self.cursor = Some(id.clone());
                 self.activate_record(&id);
             }
+            AppEvent::Focus(id) => self.cursor = Some(id),
             AppEvent::TogglePick(id) => self.toggle_pick(&id),
             AppEvent::Copy(id) => self.copy_record(&id),
             AppEvent::Publish(id) => self.publish_record(&id),
@@ -3881,7 +3903,14 @@ impl ClipSyncApp {
                                     };
                                     let scroll =
                                         self.nav_scroll.as_deref() == Some(record.id.as_str());
-                                    clip_row(ui, view, now, &mut events, scroll);
+                                    clip_row(
+                                        ui,
+                                        view,
+                                        now,
+                                        &mut events,
+                                        scroll,
+                                        self.click_to_copy,
+                                    );
                                 }
                                 let frame = self.thumb_frame;
                                 self.reclaim_thumbnails(frame);
@@ -4177,16 +4206,32 @@ impl ClipSyncApp {
                     tool = Some(ToolAction::Record);
                 }
             } else {
+                let screenshot_shortcut = self.preferences.screenshot_hotkey().to_string();
+                let record_shortcut = self.preferences.record_hotkey().to_string();
                 let tools = icons::icon_button(ui, Icon::More, true, "工具");
                 egui::Popup::menu(&tools)
                     .width(210.0)
                     .frame(menu_frame())
                     .show(|ui| {
                         ui.set_width(210.0);
-                        if menu_item(ui, Icon::Crop, "立即截屏", true, false) {
+                        if menu_item_shortcut(
+                            ui,
+                            Icon::Crop,
+                            "立即截屏",
+                            &screenshot_shortcut,
+                            true,
+                            false,
+                        ) {
                             tool = Some(ToolAction::Screenshot);
                         }
-                        if menu_item(ui, Icon::Videocam, record_label, !busy, false) {
+                        if menu_item_shortcut(
+                            ui,
+                            Icon::Videocam,
+                            record_label,
+                            &record_shortcut,
+                            !busy,
+                            false,
+                        ) {
                             tool = Some(ToolAction::Record);
                         }
                     });
@@ -6105,7 +6150,14 @@ impl ClipSyncApp {
     }
 }
 
-fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>, scroll_to: bool) {
+fn clip_row(
+    ui: &mut Ui,
+    view: RowView<'_>,
+    now: i64,
+    events: &mut Vec<AppEvent>,
+    scroll_to: bool,
+    click_to_copy: bool,
+) {
     let RowView {
         record,
         position,
@@ -6411,13 +6463,15 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
         },
     );
 
+    let modifier = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
+    let duplicate_shortcut = format!("{modifier}+D");
     let mut menu_choice: Option<MenuAction> = None;
     egui::Popup::menu(&more_response)
         .width(216.0)
         .frame(menu_frame())
         .show(|ui| {
             ui.set_width(216.0);
-            if is_text && menu_item(ui, Icon::Edit, "编辑内容", true, false) {
+            if is_text && menu_item_shortcut(ui, Icon::Edit, "编辑内容", "F2", true, false) {
                 menu_choice = Some(MenuAction::Edit);
             }
             if menu_item(ui, Icon::Note, "写备注", true, false) {
@@ -6429,7 +6483,14 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
             if is_text && menu_item(ui, Icon::Translate, "中英互译", true, false) {
                 menu_choice = Some(MenuAction::Translate);
             }
-            if menu_item(ui, Icon::Duplicate, "生成副本", true, false) {
+            if menu_item_shortcut(
+                ui,
+                Icon::Duplicate,
+                "生成副本",
+                &duplicate_shortcut,
+                true,
+                false,
+            ) {
                 menu_choice = Some(MenuAction::Duplicate);
             }
             if menu_item(ui, Icon::Export, "存到下载目录", true, false) {
@@ -6473,7 +6534,7 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
                 menu_choice = Some(MenuAction::MoveTo);
             }
             menu_separator(ui);
-            if menu_item(ui, Icon::Trash, "删除", true, true) {
+            if menu_item_shortcut(ui, Icon::Trash, "删除", "Delete/Backspace", true, true) {
                 menu_choice = Some(MenuAction::Delete);
             }
         });
@@ -6545,8 +6606,10 @@ fn clip_row(ui: &mut Ui, view: RowView<'_>, now: i64, events: &mut Vec<AppEvent>
     } else if card_response.clicked() && !more_response.clicked() {
         if pick_mode {
             events.push(AppEvent::TogglePick(record.id.clone()));
-        } else {
+        } else if click_to_copy {
             events.push(AppEvent::Activate(record.id.clone()));
+        } else {
+            events.push(AppEvent::Focus(record.id.clone()));
         }
     }
 
@@ -6754,6 +6817,17 @@ fn menu_frame() -> Frame {
 }
 
 fn menu_item(ui: &mut Ui, icon: Icon, label: &str, enabled: bool, danger: bool) -> bool {
+    menu_item_shortcut(ui, icon, label, "", enabled, danger)
+}
+
+fn menu_item_shortcut(
+    ui: &mut Ui,
+    icon: Icon,
+    label: &str,
+    shortcut: &str,
+    enabled: bool,
+    danger: bool,
+) -> bool {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
     let color = if !enabled {
@@ -6796,6 +6870,19 @@ fn menu_item(ui: &mut Ui, icon: Icon, label: &str, enabled: bool, danger: bool) 
         FontId::proportional(12.5),
         color,
     );
+    if !shortcut.is_empty() {
+        ui.painter().text(
+            Pos2::new(rect.right() - 12.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            shortcut,
+            FontId::proportional(11.0),
+            if enabled {
+                theme::p().muted
+            } else {
+                theme::p().faint
+            },
+        );
+    }
     if enabled {
         response.on_hover_cursor(CursorIcon::PointingHand).clicked()
     } else {
@@ -8359,6 +8446,7 @@ mod tests {
                     },
                     0,
                     &mut events,
+                    false,
                     false,
                 );
                 height = ui.min_rect().height();

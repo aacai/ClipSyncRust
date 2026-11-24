@@ -9,7 +9,8 @@ use clipsync_core::files::{
     validate_outgoing_file, RejectReason, MAX_FILE_BYTES,
 };
 use clipsync_core::lan::{
-    blob_name_for_sha, push_blob, read_local_blob, LanPeer, BLOB_SEGMENT, LAN_LINK_TTL_MS,
+    blob_name_for_sha, local_addrs, push_blob, read_local_blob, LanPeer, BLOB_SEGMENT,
+    LAN_LINK_TTL_MS, LAN_PORT,
 };
 use clipsync_core::protocol::{now_millis, random_mid, ROOT};
 use clipsync_core::RoomCrypto;
@@ -225,36 +226,45 @@ pub fn perform_upload(
             .map_err(|error| format!("加密失败：{error}"))?;
             let cloud_name = upload_file_name();
             let lan_blob = blob_name_for_sha(&sha);
-            let lan_base = context.lan_self.as_ref().and_then(|info| {
-                info.addrs
-                    .first()
-                    .map(|host| format!("http://{host}:{}", info.port))
+            let lan_port = context
+                .lan_self
+                .as_ref()
+                .map(|info| info.port)
+                .unwrap_or(LAN_PORT);
+            let lan_host = local_addrs().into_iter().next().or_else(|| {
+                context
+                    .lan_self
+                    .as_ref()
+                    .and_then(|info| info.addrs.first().cloned())
             });
-            let lan_ready = if !context.lan_peers.is_empty() {
-                let wrote = std::fs::create_dir_all(&context.lan_dir)
+            let mut pushed = 0usize;
+            let wrote = if !context.lan_peers.is_empty() {
+                let ok = std::fs::create_dir_all(&context.lan_dir)
                     .and_then(|_| {
                         std::fs::write(context.lan_dir.join(&lan_blob), &encrypted.cipher)
                     })
                     .is_ok();
-                if wrote {
-                    push_blob(
+                if ok {
+                    pushed = push_blob(
                         &context.lan_peers,
                         &context.room_hash,
                         &lan_blob,
                         &encrypted.cipher,
                     );
                 }
-                wrote
+                ok
             } else {
                 false
             };
-            let lan_link = if lan_ready {
-                lan_base.map(|base| {
-                    format!(
-                        "{base}/{ROOT}/{}/{BLOB_SEGMENT}/{lan_blob}",
-                        context.room_hash
-                    )
-                })
+            let lan_link = if wrote {
+                lan_host
+                    .or_else(|| (pushed > 0).then(|| "127.0.0.1".to_string()))
+                    .map(|host| {
+                        format!(
+                            "http://{host}:{lan_port}/{ROOT}/{}/{BLOB_SEGMENT}/{lan_blob}",
+                            context.room_hash
+                        )
+                    })
             } else {
                 None
             };
