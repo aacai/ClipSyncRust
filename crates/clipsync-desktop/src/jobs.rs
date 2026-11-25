@@ -103,6 +103,7 @@ pub struct UploadDone {
     pub expires_at: i64,
     pub local_path: Option<String>,
     pub target: UploadTarget,
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,8 +213,8 @@ pub fn perform_upload(
     }
     let sha = sha256_hex(&request.bytes);
     let key = live_key(&context.clip_topic, &safe, &request.mime, size, &sha);
-    let (link, expires_at) = match context.live.take(&key) {
-        Some(hit) => hit,
+    let (link, expires_at, warning) = match context.live.take(&key) {
+        Some((link, expires_at)) => (link, expires_at, None),
         None => {
             let encrypted = encrypt_file_with_sha(
                 &context.crypto,
@@ -268,18 +269,39 @@ pub fn perform_upload(
             } else {
                 None
             };
-            let (link, expires_at) = if let Some(link) = lan_link {
-                (link, now_millis() + LAN_LINK_TTL_MS)
-            } else if context.lan_only {
-                return Err(format!("局域网不可用，文件未发送：{safe}"));
+            if context.lan_only {
+                let Some(link) = lan_link else {
+                    return Err(format!("局域网不可用，文件未发送：{safe}"));
+                };
+                let expires_at = now_millis() + LAN_LINK_TTL_MS;
+                context.live.put(&key, &link, expires_at);
+                (link, expires_at, None)
             } else {
-                let uploaded = context
+                let cloud = context
                     .client
-                    .upload(&cloud_name, &encrypted.cipher, on_progress)?;
-                (uploaded.url, uploaded.expires_at)
-            };
-            context.live.put(&key, &link, expires_at);
-            (link, expires_at)
+                    .upload(&cloud_name, &encrypted.cipher, on_progress);
+                match cloud {
+                    Ok(uploaded) => {
+                        context
+                            .live
+                            .put(&key, &uploaded.url, uploaded.expires_at);
+                        (uploaded.url, uploaded.expires_at, None)
+                    }
+                    Err(error) => {
+                        if let Some(link) = lan_link {
+                            let expires_at = now_millis() + LAN_LINK_TTL_MS;
+                            context.live.put(&key, &link, expires_at);
+                            (
+                                link,
+                                expires_at,
+                                Some(format!("公网上传失败，已通过局域网发送：{error}")),
+                            )
+                        } else {
+                            return Err(error);
+                        }
+                    }
+                }
+            }
         }
     };
     let (id, ts) = match &request.target {
@@ -305,6 +327,7 @@ pub fn perform_upload(
         expires_at,
         local_path,
         target: request.target,
+        warning,
     })
 }
 

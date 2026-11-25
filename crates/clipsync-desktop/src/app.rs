@@ -761,6 +761,9 @@ impl ClipSyncApp {
                 }
                 JobEvent::Uploaded(done) => {
                     self.transfer = None;
+                    if let Some(warning) = done.warning.clone() {
+                        self.notify_error(warning);
+                    }
                     self.finish_upload(done);
                 }
                 JobEvent::Downloaded(done) => {

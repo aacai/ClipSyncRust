@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_channel::Sender;
 use serde::{Deserialize, Serialize};
@@ -273,25 +273,86 @@ pub fn blob_dir() -> PathBuf {
     std::env::temp_dir().join("clipsync-lan-blobs")
 }
 
+#[derive(Clone, Default)]
+struct LanNet {
+    addrs: Vec<String>,
+    broadcasts: Vec<Ipv4Addr>,
+}
+
 pub fn local_addrs() -> Vec<String> {
-    let mut found: Vec<String> = get_if_addrs()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|addr| match addr {
-            IpAddr::V4(ip) if is_lan_addr(&ip) => Some(ip.to_string()),
-            _ => None,
-        })
-        .collect();
-    found.sort_by_key(|host| std::cmp::Reverse(address_rank(host)));
-    if let Some(via) = route_addr() {
-        if let Some(index) = found.iter().position(|host| host == &via) {
-            let primary = found.remove(index);
-            found.insert(0, primary);
-        } else {
-            found.insert(0, via);
+    lan_net().addrs
+}
+
+fn broadcast_targets_from(net: &LanNet) -> Vec<SocketAddr> {
+    let mut targets = vec![SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::BROADCAST),
+        LAN_DISCOVERY_PORT,
+    )];
+    for bcast in &net.broadcasts {
+        targets.push(SocketAddr::new(IpAddr::V4(*bcast), LAN_DISCOVERY_PORT));
+    }
+    for host in &net.addrs {
+        let Ok(ip) = host.parse::<Ipv4Addr>() else {
+            continue;
+        };
+        let o = ip.octets();
+        targets.push(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(o[0], o[1], o[2], 255)),
+            LAN_DISCOVERY_PORT,
+        ));
+    }
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
+fn lan_net() -> LanNet {
+    static CACHE: Mutex<Option<(Instant, LanNet)>> = Mutex::new(None);
+    const TTL: Duration = Duration::from_secs(5);
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((at, net)) = guard.as_ref() {
+            if at.elapsed() < TTL {
+                return net.clone();
+            }
         }
     }
-    found
+    let net = probe_lan_net();
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((Instant::now(), net.clone()));
+    }
+    net
+}
+
+fn probe_lan_net() -> LanNet {
+    let mut addrs = Vec::new();
+    let mut broadcasts = Vec::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            let if_addrs::IfAddr::V4(v4) = iface.addr else {
+                continue;
+            };
+            if v4.ip.is_loopback() || !is_lan_addr(&v4.ip) {
+                continue;
+            }
+            addrs.push(v4.ip.to_string());
+            if let Some(bcast) = v4.broadcast {
+                broadcasts.push(bcast);
+            }
+        }
+    }
+    addrs.sort_by_key(|host| std::cmp::Reverse(address_rank(host)));
+    addrs.dedup();
+    if let Some(via) = route_addr() {
+        if let Some(index) = addrs.iter().position(|host| host == &via) {
+            let primary = addrs.remove(index);
+            addrs.insert(0, primary);
+        } else {
+            addrs.insert(0, via);
+        }
+    }
+    broadcasts.sort();
+    broadcasts.dedup();
+    LanNet { addrs, broadcasts }
 }
 
 fn is_lan_addr(ip: &std::net::Ipv4Addr) -> bool {
@@ -318,87 +379,6 @@ fn route_addr() -> Option<String> {
         IpAddr::V4(ip) if is_lan_addr(&ip) => Some(ip.to_string()),
         _ => None,
     }
-}
-
-fn get_if_addrs() -> Result<Vec<IpAddr>, String> {
-    let mut addrs = if cfg!(windows) {
-        get_if_addrs_windows().unwrap_or_default()
-    } else {
-        get_if_addrs_unix().unwrap_or_default()
-    };
-    if addrs.is_empty() {
-        if let Some(via) = route_addr().and_then(|host| host.parse().ok()) {
-            addrs.push(via);
-        }
-    }
-    Ok(addrs)
-}
-
-fn get_if_addrs_unix() -> Result<Vec<IpAddr>, String> {
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg("ifconfig 2>/dev/null | grep -o 'inet [0-9.]*' | awk '{print $2}' || ip -4 addr show 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1")
-        .output()
-        .map_err(|error| error.to_string())?;
-    Ok(parse_addr_lines(&String::from_utf8_lossy(&output.stdout)))
-}
-
-fn get_if_addrs_windows() -> Result<Vec<IpAddr>, String> {
-    let powershell = std::process::Command::new("powershell")
-        .arg("-NoProfile")
-        .arg("-Command")
-        .arg("Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -ne '127.0.0.1'} | Select-Object -ExpandProperty IPAddress")
-        .output();
-    let mut addrs = powershell
-        .ok()
-        .map(|output| parse_addr_lines(&String::from_utf8_lossy(&output.stdout)))
-        .unwrap_or_default();
-    if addrs.is_empty() {
-        let output = std::process::Command::new("ipconfig")
-            .output()
-            .map_err(|error| error.to_string())?;
-        addrs = parse_windows_ipconfig(&String::from_utf8_lossy(&output.stdout));
-    }
-    Ok(addrs)
-}
-
-fn parse_addr_lines(text: &str) -> Vec<IpAddr> {
-    text.lines()
-        .filter_map(|line| line.trim().parse::<IpAddr>().ok())
-        .collect()
-}
-
-fn parse_windows_ipconfig(text: &str) -> Vec<IpAddr> {
-    text.lines()
-        .filter(|line| {
-            let lower = line.to_ascii_lowercase();
-            lower.contains("ipv4") || lower.contains("ip address")
-        })
-        .filter_map(|line| {
-            line.rsplit_once(':')
-                .or_else(|| line.rsplit_once('：'))
-                .map(|(_, value)| value.trim())
-                .and_then(|value| value.parse::<IpAddr>().ok())
-        })
-        .collect()
-}
-
-fn broadcast_targets() -> Vec<SocketAddr> {
-    let mut targets = vec![SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::BROADCAST),
-        LAN_DISCOVERY_PORT,
-    )];
-    for host in local_addrs() {
-        let Ok(ip) = host.parse::<Ipv4Addr>() else {
-            continue;
-        };
-        let o = ip.octets();
-        let directed = Ipv4Addr::new(o[0], o[1], o[2], 255);
-        targets.push(SocketAddr::new(IpAddr::V4(directed), LAN_DISCOVERY_PORT));
-    }
-    targets.sort();
-    targets.dedup();
-    targets
 }
 
 #[derive(Clone)]
@@ -589,17 +569,18 @@ async fn spawn_discovery(
     let task = tokio::spawn(async move {
         let mut buf = [0u8; 8192];
         let mut beacon = beacon;
+        let mut ticker = tokio::time::interval(BEACON_INTERVAL);
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(BEACON_INTERVAL) => {
-                    let addrs = local_addrs();
-                    if !addrs.is_empty() {
-                        beacon.addrs = addrs;
+                _ = ticker.tick() => {
+                    let net = lan_net();
+                    if !net.addrs.is_empty() {
+                        beacon.addrs = net.addrs.clone();
                     }
                     let Ok(wire) = serde_json::to_vec(&beacon) else {
                         continue;
                     };
-                    for target in broadcast_targets() {
+                    for target in broadcast_targets_from(&net) {
                         let _ = socket.send_to(&wire, target).await;
                     }
                 }
@@ -1099,6 +1080,16 @@ mod tests {
         let mut raw = [0u8; 4];
         getrandom::fill(&mut raw).expect("os random unavailable");
         std::env::temp_dir().join(format!("cs-lan-{label}-{}", hex::encode(raw)))
+    }
+
+    #[test]
+    fn local_addrs_uses_native_interfaces_without_shelling_out() {
+        let first = super::local_addrs();
+        let second = super::local_addrs();
+        assert_eq!(first, second);
+        for host in first {
+            assert!(host.parse::<std::net::Ipv4Addr>().is_ok());
+        }
     }
 
     #[tokio::test]

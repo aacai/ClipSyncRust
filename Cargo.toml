@@ -39,6 +39,7 @@ sys-locale = "0.3.2"
 global-hotkey = "0.9.0"
 xcap = { version = "0.9.8", features = ["image"] }
 qrcode = { version = "0.14.1", default-features = false }
+if-addrs = "0.13"
 
 [profile.dev]
 opt-level = 3

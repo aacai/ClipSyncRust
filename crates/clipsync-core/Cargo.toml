@@ -20,6 +20,7 @@ mqtt5 = { workspace = true }
 tokio = { workspace = true }
 async-channel = { workspace = true }
 thiserror = { workspace = true }
+if-addrs = { workspace = true }
 
 [dev-dependencies]
 hex = { workspace = true }
