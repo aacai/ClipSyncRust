@@ -8,7 +8,8 @@ use async_channel::Sender;
 use serde::{Deserialize, Serialize};
 use tokio::fs::File;
 use tokio::io::{copy, AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -411,7 +412,7 @@ impl LanRuntime {
         peers: Sender<LanBeacon>,
     ) -> Result<Self, String> {
         let address = SocketAddr::from(([0, 0, 0, 0], config.port));
-        let listener = TcpListener::bind(address)
+        let listener = bind_tcp(address)
             .await
             .map_err(|error| format!("局域网端口 {} 不可用：{error}", config.port))?;
         let port = listener
@@ -547,16 +548,42 @@ pub fn read_local_blob(dir: &Path, link: &str, sha256: &str) -> Option<Vec<u8>> 
     std::fs::read(dir.join(by_sha)).ok()
 }
 
+async fn bind_tcp(address: SocketAddr) -> Result<TcpListener, String> {
+    let socket = TcpSocket::new_v4().map_err(|error| error.to_string())?;
+    socket
+        .set_reuseaddr(true)
+        .map_err(|error| error.to_string())?;
+    socket.bind(address).map_err(|error| error.to_string())?;
+    socket.listen(1024).map_err(|error| error.to_string())
+}
+
+fn bind_udp(port: u16) -> Result<UdpSocket, String> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+        .map_err(|error| error.to_string())?;
+    socket
+        .set_reuse_address(true)
+        .map_err(|error| error.to_string())?;
+    socket
+        .set_broadcast(true)
+        .map_err(|error| error.to_string())?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|error| error.to_string())?;
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    socket
+        .bind(&SockAddr::from(addr))
+        .map_err(|error| error.to_string())?;
+    UdpSocket::from_std(socket.into()).map_err(|error| error.to_string())
+}
+
 async fn spawn_discovery(
     info: LanInfo,
     identity: LanIdentity,
     room_hash: String,
     peers: Sender<LanBeacon>,
 ) -> Result<Arc<ServerTask>, String> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, LAN_DISCOVERY_PORT))
-        .await
+    let socket = bind_udp(LAN_DISCOVERY_PORT)
         .map_err(|error| format!("局域网发现端口不可用：{error}"))?;
-    socket.set_broadcast(true).ok();
     let beacon = LanBeacon {
         id: identity.id.clone(),
         name: identity.name,

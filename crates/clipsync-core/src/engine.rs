@@ -373,8 +373,8 @@ impl<F: LinkFactory> Engine<F> {
         only: bool,
         roots: Vec<SharedRoot>,
         port: u16,
-        heartbeat: &mut Option<Instant>,
-        recovery: &mut Option<Instant>,
+        _heartbeat: &mut Option<Instant>,
+        _recovery: &mut Option<Instant>,
     ) {
         let roots = if share { roots } else { Vec::new() };
         let changed = share != self.lan_share
@@ -390,10 +390,47 @@ impl<F: LinkFactory> Engine<F> {
             config.port = port;
         }
         if changed {
-            if let Some(config) = self.desired.clone() {
-                self.join(config, heartbeat, recovery).await;
+            self.restart_lan().await;
+            if self.is_online() {
+                self.publish_presence(true).await;
             }
         }
+    }
+
+    async fn restart_lan(&mut self) {
+        let had = self.lan.is_some();
+        self.close_lan();
+        if had {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        let Some(config) = self.desired.clone() else {
+            return;
+        };
+        let Some(mut lan) = self.lan_config.clone() else {
+            return;
+        };
+        if !self.lan_share {
+            lan.fs_roots.clear();
+        }
+        let (tx, rx) = async_channel::unbounded();
+        let (peer_tx, peer_rx) = async_channel::unbounded();
+        let identity = LanIdentity {
+            id: config.device_id.clone(),
+            name: config.device_name.clone(),
+            os: config.device_os.clone(),
+        };
+        match LanRuntime::start(lan, identity, self.hash.clone(), tx, peer_tx).await {
+            Ok(runtime) => {
+                let _ = self.events.send(Event::LanSelf(runtime.info()));
+                self.lan = Some(runtime);
+                self.lan_rx = Some(rx);
+                self.lan_peer_rx = Some(peer_rx);
+            }
+            Err(error) => {
+                let _ = self.events.send(Event::LanUnavailable(error));
+            }
+        }
+        self.publish_lan_peers();
     }
 
     async fn join(
@@ -427,36 +464,7 @@ impl<F: LinkFactory> Engine<F> {
         self.safety = crypto.safety_number();
         self.crypto = Some(crypto);
         self.hash = hash;
-        self.lan = None;
-        self.lan_rx = None;
-        self.lan_peer_rx = None;
-        self.lan_seen.clear();
-        self.lan_udp.clear();
-        self.lan_peers.clear();
-        if let Some(mut lan) = self.lan_config.clone() {
-            if !self.lan_share {
-                lan.fs_roots.clear();
-            }
-            let (tx, rx) = async_channel::unbounded();
-            let (peer_tx, peer_rx) = async_channel::unbounded();
-            let identity = LanIdentity {
-                id: config.device_id.clone(),
-                name: config.device_name.clone(),
-                os: config.device_os.clone(),
-            };
-            match LanRuntime::start(lan, identity, self.hash.clone(), tx, peer_tx).await {
-                Ok(runtime) => {
-                    let _ = self.events.send(Event::LanSelf(runtime.info()));
-                    self.lan = Some(runtime);
-                    self.lan_rx = Some(rx);
-                    self.lan_peer_rx = Some(peer_rx);
-                }
-                Err(error) => {
-                    let _ = self.events.send(Event::LanUnavailable(error));
-                }
-            }
-        }
-        self.publish_lan_peers();
+        self.restart_lan().await;
         self.open_link(&config, heartbeat, recovery).await;
     }
 
